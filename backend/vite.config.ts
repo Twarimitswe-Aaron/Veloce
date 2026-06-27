@@ -1,8 +1,7 @@
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 
-/** @type {import('vite').Plugin} */
-const webSocketServer = {
+const webSocketServer: Plugin = {
 	name: 'webSocketServer',
 	configureServer(server) {
 		if (server.httpServer) {
