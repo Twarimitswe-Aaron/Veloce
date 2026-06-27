@@ -4,10 +4,11 @@ import { defineConfig, type Plugin } from 'vite';
 const webSocketServer: Plugin = {
 	name: 'webSocketServer',
 	configureServer(server) {
-		if (server.httpServer) {
+		const httpServer = server.httpServer;
+		if (httpServer) {
 			// Dynamically import the WebSocket logic to attach it to Vite's HTTP server
 			import('./src/lib/server/ws').then((module) => {
-				module.setupWebSocketServer(server.httpServer);
+				module.setupWebSocketServer(httpServer);
 			}).catch((err) => {
 				console.error('Failed to load WebSocket server:', err);
 			});
