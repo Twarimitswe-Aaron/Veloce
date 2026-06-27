@@ -4,7 +4,7 @@ export const isConnected = writable(false);
 
 class VeloceWebSocketClient {
 	private ws: WebSocket | null = null;
-	private url = 'ws://localhost:5173/ws';
+	private url = 'ws://localhost:14921/ws';
 	private reconnectInterval = 3000;
 
 	connect() {

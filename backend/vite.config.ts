@@ -17,5 +17,9 @@ const webSocketServer = {
 };
 
 export default defineConfig({
-	plugins: [sveltekit(), webSocketServer]
+	plugins: [sveltekit(), webSocketServer],
+	server: {
+		port: 14921,
+		strictPort: true, // Fail if port is already in use
+	}
 });
