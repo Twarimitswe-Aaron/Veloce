@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { isConnected, wsClient } from '$lib/wsClient';
 	
-	let downloadUrl = '';
-	let fileName = '';
+	let downloadUrl = $state('');
+	let fileName = $state('');
 
 	function handleDownload() {
 		if (!downloadUrl) return;
