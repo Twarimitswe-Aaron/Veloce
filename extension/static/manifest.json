@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Veloce Download Manager",
+  "version": "1.0.0",
+  "description": "Intercepts web resources and sends them to the local Veloce Engine",
+  "action": {
+    "default_popup": "index.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "webRequest",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
