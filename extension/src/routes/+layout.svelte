@@ -1,4 +1,5 @@
 <script lang="ts">
+	let { children } = $props();
 	import '../app.css';
 	import { onMount } from 'svelte';
 	import { wsClient } from '$lib/wsClient';
