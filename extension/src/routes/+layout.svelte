@@ -1,11 +1,24 @@
 <script lang="ts">
-	import favicon from '$lib/assets/favicon.svg';
+	import '../app.css';
+	import { onMount } from 'svelte';
+	import { wsClient } from '$lib/wsClient';
 
-	let { children } = $props();
+	onMount(() => {
+		// Initialize connection when the extension popup opens
+		wsClient.connect();
+	});
 </script>
 
-<svelte:head>
-	<link rel="icon" href={favicon} />
-</svelte:head>
+<div class="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans">
+	<header class="border-b border-gray-800 bg-gray-900/50 p-4 backdrop-blur">
+		<div class="flex items-center justify-between">
+			<h1 class="text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">
+				⚡ Veloce
+			</h1>
+		</div>
+	</header>
 
-{@render children()}
+	<main class="flex-1 p-4">
+		{@render children()}
+	</main>
+</div>
