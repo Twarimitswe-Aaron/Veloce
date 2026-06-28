@@ -1,8 +1,19 @@
 <script lang="ts">
 	import { isConnected, wsClient } from '$lib/wsClient';
+	import { onMount } from 'svelte';
 	
 	let downloadUrl = $state('');
 	let fileName = $state('');
+	let baseDirectory = $state('');
+	
+	onMount(() => {
+		const saved = localStorage.getItem('veloce_base_dir');
+		if (saved) baseDirectory = saved;
+	});
+	
+	$effect(() => {
+		localStorage.setItem('veloce_base_dir', baseDirectory);
+	});
 
 	function handleDownload() {
 		if (!downloadUrl) return;
@@ -10,7 +21,7 @@
 		// Basic filename extraction if not provided
 		const extractedName = fileName || downloadUrl.split('/').pop()?.split('?')[0] || 'download_file';
 		
-		wsClient.sendDownloadRequest(downloadUrl, extractedName);
+		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory);
 		
 		// Reset form
 		downloadUrl = '';
@@ -55,6 +66,17 @@
 				type="text" 
 				bind:value={fileName} 
 				placeholder="video.mp4" 
+				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
+			/>
+		</div>
+
+		<div class="flex flex-col gap-1.5">
+			<label for="basedir" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Base Save Directory</label>
+			<input 
+				id="basedir"
+				type="text" 
+				bind:value={baseDirectory} 
+				placeholder="Default: ~/Downloads/Veloce" 
 				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
 			/>
 		</div>

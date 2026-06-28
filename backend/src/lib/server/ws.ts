@@ -5,7 +5,8 @@ import { downloads, devices } from './db/schema';
 import { getMacAddress } from './identity';
 import { eq } from 'drizzle-orm';
 import crypto from 'crypto';
-
+import path from 'path';
+import os from 'os';
 export function setupWebSocketServer(server: Server) {
 	const wss = new WebSocketServer({ server, path: '/ws' });
 	
@@ -40,12 +41,36 @@ export function setupWebSocketServer(server: Server) {
 					
 					const downloadId = crypto.randomUUID();
 					
+					// Parse base directory
+					let baseDir = data.payload.baseDirectory;
+					if (!baseDir || baseDir.trim() === '') {
+						baseDir = path.join(os.homedir(), 'Downloads', 'Veloce');
+					}
+					
+					// Categorize based on file extension
+					const ext = path.extname(data.payload.fileName).toLowerCase();
+					let category = 'others';
+					if (['.mp4', '.mkv', '.webm', '.avi', '.mov'].includes(ext)) {
+						category = 'videos';
+					} else if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'].includes(ext)) {
+						category = 'images';
+					} else if (['.mp3', '.wav', '.flac', '.ogg'].includes(ext)) {
+						category = 'audio';
+					} else if (['.pdf', '.doc', '.docx', '.txt'].includes(ext)) {
+						category = 'documents';
+					} else if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) {
+						category = 'archives';
+					}
+					
+					const savePath = path.join(baseDir, category, data.payload.fileName);
+					
 					// 1. Save to Database Queue
 					await db.insert(downloads).values({
 						id: downloadId,
 						deviceId: macAddress,
 						url: data.payload.url,
 						fileName: data.payload.fileName,
+						savePath: savePath,
 						status: 'queued'
 					});
 					

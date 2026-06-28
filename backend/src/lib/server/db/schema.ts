@@ -14,6 +14,7 @@ export const downloads = sqliteTable('downloads', {
 		.references(() => devices.id),
 	url: text('url').notNull(),
 	fileName: text('file_name').notNull(),
+	savePath: text('save_path').notNull(),
 	status: text('status', { enum: ['queued', 'downloading', 'paused', 'completed', 'error'] })
 		.notNull()
 		.default('queued'),
