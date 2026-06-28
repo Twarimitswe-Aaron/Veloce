@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { isConnected, wsClient } from '$lib/wsClient';
+	import { isConnected, wsClient, selectedDirectory } from '$lib/wsClient';
 	import { onMount } from 'svelte';
 	
 	let downloadUrl = $state('');
@@ -13,6 +13,12 @@
 	
 	$effect(() => {
 		localStorage.setItem('veloce_base_dir', baseDirectory);
+	});
+
+	$effect(() => {
+		if ($selectedDirectory) {
+			baseDirectory = $selectedDirectory;
+		}
 	});
 
 	function handleDownload() {
@@ -72,13 +78,23 @@
 
 		<div class="flex flex-col gap-1.5">
 			<label for="basedir" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Base Save Directory</label>
-			<input 
-				id="basedir"
-				type="text" 
-				bind:value={baseDirectory} 
-				placeholder="Default: ~/Downloads/Veloce" 
-				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
-			/>
+			<div class="flex items-center gap-2">
+				<input 
+					id="basedir"
+					type="text" 
+					bind:value={baseDirectory} 
+					placeholder="Default: ~/Downloads/Veloce" 
+					class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
+				/>
+				<button 
+					type="button"
+					onclick={() => wsClient.requestDirectoryPicker()}
+					class="shrink-0 bg-gray-800 hover:bg-gray-700 text-gray-300 p-2.5 rounded-lg border border-gray-700 transition-all focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+					title="Select Folder"
+				>
+					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+				</button>
+			</div>
 		</div>
 
 		<button 

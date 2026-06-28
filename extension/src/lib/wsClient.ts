@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 
 export const isConnected = writable(false);
+export const selectedDirectory = writable<string | null>(null);
 
 class VeloceWebSocketClient {
 	private ws: WebSocket | null = null;
@@ -27,6 +28,9 @@ class VeloceWebSocketClient {
 				
 				if (data.type === 'DOWNLOAD_ACK') {
 					console.log(`✅ Successfully queued download ID: ${data.downloadId}`);
+				} else if (data.type === 'DIRECTORY_SELECTED') {
+					console.log(`📁 User selected directory: ${data.payload.path}`);
+					selectedDirectory.set(data.payload.path);
 				}
 			} catch (e) {
 				console.error('[Veloce Extension] Failed to parse WebSocket message:', e);
@@ -55,6 +59,17 @@ class VeloceWebSocketClient {
 			console.log(`[Veloce Extension] Sent download request for: ${fileName}`);
 		} else {
 			console.error('[Veloce Extension] Cannot send request, Local Coordinator is disconnected.');
+		}
+	}
+
+	requestDirectoryPicker() {
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			this.ws.send(JSON.stringify({
+				type: 'REQUEST_DIRECTORY_PICKER'
+			}));
+			console.log(`[Veloce Extension] Requested native directory picker`);
+		} else {
+			console.error('[Veloce Extension] Cannot request directory picker, Local Coordinator is disconnected.');
 		}
 	}
 }

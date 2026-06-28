@@ -84,6 +84,19 @@ export function setupWebSocketServer(server: Server) {
 					console.log(`✅ Download queued in database with ID: ${downloadId}`);
 					
 					// 3. TODO: Spawn Rust Core Engine Child Process here!
+				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
+					try {
+						const { execSync } = await import('child_process');
+						const result = execSync('zenity --file-selection --directory').toString().trim();
+						if (result) {
+							ws.send(JSON.stringify({
+								type: 'DIRECTORY_SELECTED',
+								payload: { path: result }
+							}));
+						}
+					} catch (e) {
+						console.log('Folder selection cancelled or failed');
+					}
 				}
 			} catch (err) {
 				console.error('❌ Failed to process WebSocket message:', err);
