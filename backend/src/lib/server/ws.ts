@@ -195,7 +195,10 @@ export function setupWebSocketServer(server: Server) {
 									if (availableBytes < 500 * 1024 * 1024) { // 500MB buffer
 										console.error('❌ Insufficient disk space!');
 										await db.update(downloads).set({ status: 'error' }).where(eq(downloads.id, downloadId));
-										ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: 'Insufficient disk space' }));
+										// FIX #8: Guard ws.readyState before sending
+										if (ws.readyState === 1) {
+											ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: 'Insufficient disk space' }));
+										}
 										return;
 									}
 								} catch (e) {
@@ -206,44 +209,73 @@ export function setupWebSocketServer(server: Server) {
 								console.log(`🚀 Spawning Rust Core for ID: ${downloadId}`);
 								await db.update(downloads).set({ status: 'downloading' }).where(eq(downloads.id, downloadId));
 								
-								const coreDir = path.resolve(process.cwd(), '../core_engine');
-								const rustProcess = spawn('cargo', [
-									'run', '--release', '--', 
+								// FIX #1: Spawn the pre-compiled binary directly — not `cargo run`.
+								// `cargo run` adds ~2s startup overhead checking if recompile is needed.
+								const coreDir   = path.resolve(process.cwd(), '../core_engine');
+								const binaryPath = path.join(coreDir, 'target', 'release', 'core_engine');
+								const rustProcess = spawn(binaryPath, [
 									'--id', downloadId,
 									'--url', finalUrl,
 									'--save-path', savePath
-								], { cwd: coreDir });
+								]);
+
 								
+								// FIX #3: Line buffer — a single `data` event may contain multiple
+								// JSON lines OR one JSON object split across two events. Accumulate
+								// until we see a full newline before parsing.
+								let lineBuffer = '';
+								// FIX #2: Track last DB write time — only persist progress every 5s
+								// to avoid constant SQLite write-lock contention.
+								let lastDbWrite = 0;
+
 								rustProcess.stdout.on('data', async (chunk) => {
-									const lines = chunk.toString().split('\n');
+									lineBuffer += chunk.toString();
+									const lines = lineBuffer.split('\n');
+									lineBuffer = lines.pop()!; // keep any incomplete trailing line
 									for (const line of lines) {
 										if (!line.trim()) continue;
 										try {
 											const progress = JSON.parse(line);
 											if (progress.type === 'progress') {
-												await db.update(downloads).set({ 
-													downloadedBytes: progress.downloaded,
-													totalBytes: progress.total
-												}).where(eq(downloads.id, downloadId));
+												// FIX #2: Throttle DB writes — only write once every 5s.
+												// Status changes (completed/error) always write immediately.
+												const now = Date.now();
+												if (now - lastDbWrite > 5000) {
+													lastDbWrite = now;
+													await db.update(downloads).set({ 
+														downloadedBytes: progress.downloaded,
+														totalBytes: progress.total
+													}).where(eq(downloads.id, downloadId));
+												}
 												
-												// Calculate percentage for terminal
-												const percent = ((progress.downloaded / progress.total) * 100).toFixed(1);
-												const dlMb = (progress.downloaded / 1024 / 1024).toFixed(1);
-												const totalMb = (progress.total / 1024 / 1024).toFixed(1);
-												process.stdout.write(`\r[Rust Core] Download Progress: ${percent}% (${dlMb} MB / ${totalMb} MB)`);
+												// FIX #4: Removed dead renderDashboard — indicatif renders
+												// the terminal display directly via stderr passthrough.
 												
 												if (ws.readyState === 1) {
 													ws.send(JSON.stringify({
 														type: 'PROGRESS',
 														downloadId,
 														downloaded: progress.downloaded,
-														total: progress.total
+														total: progress.total,
+														speedBps: progress.speed_bps || 0,
+														etaSecs: progress.eta_secs || 0,
+														elapsedSecs: progress.elapsed_secs || 0,
+														threads: progress.threads || []
 													}));
 												}
 											} else if (progress.type === 'info') {
-												const chunkMb = (progress.chunk_size / 1024 / 1024).toFixed(2);
-												const totalMb = (progress.total_size / 1024 / 1024).toFixed(2);
-												console.log(`\n[Rust Core Info]: Starting ${progress.threads} parallel threads. Chunk size: ${chunkMb} MB. Total size: ${totalMb} MB.`);
+												const chunkMb = (progress.chunk_size_bytes / 1024 / 1024).toFixed(2);
+												const totalMb = (progress.total_size_bytes / 1024 / 1024).toFixed(2);
+												console.log(`\n[Veloce] Starting ${progress.threads} threads | chunk: ${chunkMb} MB | total: ${totalMb} MB`);
+											} else if (progress.type === 'already_exists') {
+												console.log(`\n[Veloce] File already fully downloaded — skipping!`);
+												await db.update(downloads).set({ status: 'completed' }).where(eq(downloads.id, downloadId));
+												if (ws.readyState === 1) {
+													ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status: 'completed' }));
+												}
+											} else if (progress.type === 'done') {
+												const totalMb = (progress.total / 1024 / 1024).toFixed(1);
+												console.log(`\n✅ [Veloce] Download complete! ${totalMb} MB in ${progress.elapsed_secs?.toFixed(1)}s @ avg ${progress.avg_speed_mbps?.toFixed(2)} MB/s`);
 											}
 										} catch (e) {
 											// Non-JSON output (like cargo build logs)
@@ -253,7 +285,7 @@ export function setupWebSocketServer(server: Server) {
 								});
 
 								rustProcess.stderr.on('data', (data) => {
-									console.error(`\n[Rust Core Error]: ${data.toString().trim()}`);
+									process.stderr.write(data); // raw passthrough for indicatif ANSI
 								});
 
 								rustProcess.on('close', async (code) => {

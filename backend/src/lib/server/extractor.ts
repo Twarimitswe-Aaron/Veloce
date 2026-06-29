@@ -26,11 +26,18 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
 
     // 2. yt-dlp Extractor for everything else
     return new Promise((resolve) => {
-        // Use the locally downloaded yt-dlp binary
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
         const ytdlp = spawn(ytdlpPath, ['--cookies-from-browser', 'chrome', '-f', 'b', '-g', url]);
         
         let output = '';
+
+        // FIX #5: Kill yt-dlp after 30s to prevent infinite hang when
+        // Chrome is locked, cookies are inaccessible, or network stalls.
+        const timeout = setTimeout(() => {
+            ytdlp.kill();
+            console.error(`[yt-dlp] Timed out after 30s for: ${url}`);
+            resolve(null);
+        }, 30_000);
         
         ytdlp.stdout.on('data', (data) => {
             output += data.toString();
@@ -41,6 +48,7 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         });
         
         ytdlp.on('close', (code) => {
+            clearTimeout(timeout);
             if (code === 0 && output.trim()) {
                 resolve(output.trim().split('\n')[0]);
             } else {
@@ -50,6 +58,7 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         });
         
         ytdlp.on('error', (err) => {
+            clearTimeout(timeout);
             console.error('yt-dlp error (is it installed?):', err);
             resolve(null);
         });
