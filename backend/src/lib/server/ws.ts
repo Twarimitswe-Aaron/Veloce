@@ -58,19 +58,42 @@ export function setupWebSocketServer(server: Server) {
 						baseDir = path.join(os.homedir(), 'Downloads', 'Veloce');
 					}
 					
-					// Categorize based on file extension
-					const ext = path.extname(data.payload.fileName).toLowerCase();
+					// Categorize based on file extension and domain
+					let ext = path.extname(data.payload.fileName).toLowerCase();
 					let category = 'others';
-					if (['.mp4', '.mkv', '.webm', '.avi', '.mov'].includes(ext)) {
-						category = 'videos';
-					} else if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'].includes(ext)) {
-						category = 'images';
-					} else if (['.mp3', '.wav', '.flac', '.ogg'].includes(ext)) {
-						category = 'audio';
-					} else if (['.pdf', '.doc', '.docx', '.txt'].includes(ext)) {
-						category = 'documents';
-					} else if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) {
-						category = 'archives';
+
+					// 1. Detect known video/social platforms from URL
+					try {
+						const urlObj = new URL(data.payload.url);
+						const hostname = urlObj.hostname.toLowerCase();
+						
+						const videoDomains = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv'];
+						
+						if (videoDomains.some(d => hostname.includes(d))) {
+							category = 'videos';
+							// If the filename has no extension, append .mp4 as a safe default for video sites
+							if (!ext) {
+								ext = '.mp4';
+								data.payload.fileName += ext;
+							}
+						}
+					} catch(e) {
+						// Ignore invalid URLs
+					}
+
+					// 2. If not caught by domain logic, fallback to extension-based categorization
+					if (category === 'others') {
+						if (['.mp4', '.mkv', '.webm', '.avi', '.mov'].includes(ext)) {
+							category = 'videos';
+						} else if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'].includes(ext)) {
+							category = 'images';
+						} else if (['.mp3', '.wav', '.flac', '.ogg'].includes(ext)) {
+							category = 'audio';
+						} else if (['.pdf', '.doc', '.docx', '.txt'].includes(ext)) {
+							category = 'documents';
+						} else if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) {
+							category = 'archives';
+						}
 					}
 					
 					const savePath = path.join(baseDir, category, data.payload.fileName);
