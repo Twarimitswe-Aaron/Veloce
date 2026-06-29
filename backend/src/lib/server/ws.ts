@@ -3,10 +3,13 @@ import type { Server } from 'http';
 import { db } from './db';
 import { downloads, devices } from './db/schema';
 import { getMacAddress } from './identity';
-import { eq } from 'drizzle-orm';
+import { eq, or } from 'drizzle-orm';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
+import { statfs } from 'fs/promises';
+import { spawn } from 'child_process';
+import { extractMediaUrl } from './extractor';
 export function setupWebSocketServer(server: Server) {
 	const wss = new WebSocketServer({ server, path: '/ws' });
 	
@@ -50,8 +53,19 @@ export function setupWebSocketServer(server: Server) {
 				if (data.type === 'NEW_DOWNLOAD') {
 					console.log('📥 Received new download request:', data.payload);
 					
-					const downloadId = crypto.randomUUID();
-					
+					// 1. URL Normalization
+					let rawUrl = data.payload.url;
+					try {
+						const urlObj = new URL(rawUrl);
+						const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'igsh', 'fbclid', 'gclid', 'si'];
+						for (const param of trackingParams) {
+							urlObj.searchParams.delete(param);
+						}
+						rawUrl = urlObj.toString();
+					} catch (e) {
+						console.error('Invalid URL during normalization:', e);
+					}
+
 					// Parse base directory
 					let baseDir = data.payload.baseDirectory;
 					if (!baseDir || baseDir.trim() === '') {
@@ -98,26 +112,132 @@ export function setupWebSocketServer(server: Server) {
 					
 					const savePath = path.join(baseDir, category, data.payload.fileName);
 					
-					// 1. Save to Database Queue
-					await db.insert(downloads).values({
-						id: downloadId,
-						deviceId: macAddress,
-						url: data.payload.url,
-						fileName: data.payload.fileName,
-						savePath: savePath,
-						status: 'queued'
-					});
+					// 2. Database Deduplication Check
+					const existing = await db.select().from(downloads)
+						.where(
+							or(
+								eq(downloads.url, rawUrl),
+								eq(downloads.savePath, savePath)
+							)
+						);
 					
-					// 2. Acknowledge receipt back to the Extension
-					ws.send(JSON.stringify({ 
-						type: 'DOWNLOAD_ACK', 
-						downloadId,
-						status: 'queued'
-					}));
-					
-					console.log(`✅ Download queued in database with ID: ${downloadId}`);
-					
-					// 3. TODO: Spawn Rust Core Engine Child Process here!
+					const activeDownload = existing.find(d => ['queued', 'downloading', 'completed'].includes(d.status));
+					if (activeDownload) {
+						console.log(`♻️  Duplicate found! Attaching to existing download ID: ${activeDownload.id}`);
+						ws.send(JSON.stringify({ 
+							type: 'DOWNLOAD_ACK', 
+							downloadId: activeDownload.id,
+							status: activeDownload.status
+						}));
+						// We skip inserting a new record and spawning Rust.
+						// Note: We need a return here, but we are inside an if-statement block.
+					} else {
+						// Proceed with new download
+						const downloadId = crypto.randomUUID();
+						
+						// 3. Save to Database Queue
+						await db.insert(downloads).values({
+							id: downloadId,
+							deviceId: macAddress,
+							url: rawUrl,
+							fileName: data.payload.fileName,
+							savePath: savePath,
+							status: 'queued'
+						});
+						
+						// 4. Acknowledge receipt back to the Extension
+						ws.send(JSON.stringify({ 
+							type: 'DOWNLOAD_ACK', 
+							downloadId,
+							status: 'queued'
+						}));
+						
+						console.log(`✅ Download queued in database with ID: ${downloadId}`);
+						
+						// 5. Implement Background yt-dlp, Disk Space Check, and Spawn Rust Core Engine
+						(async () => {
+							try {
+								let finalUrl = rawUrl;
+								
+								// 5a. yt-dlp extraction for video sites
+								if (category === 'videos') {
+									console.log(`🔍 Extracting direct URL for ${rawUrl}...`);
+									const directUrl = await extractMediaUrl(rawUrl);
+									if (directUrl) {
+										finalUrl = directUrl;
+										console.log(`🎯 Extracted direct URL successfully`);
+										await db.update(downloads).set({ url: finalUrl }).where(eq(downloads.id, downloadId));
+									}
+								}
+
+								// 5b. Disk Space Check
+								try {
+									const stat = await statfs(baseDir);
+									const availableBytes = stat.bfree * stat.bsize;
+									if (availableBytes < 500 * 1024 * 1024) { // 500MB buffer
+										console.error('❌ Insufficient disk space!');
+										await db.update(downloads).set({ status: 'error' }).where(eq(downloads.id, downloadId));
+										ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: 'Insufficient disk space' }));
+										return;
+									}
+								} catch (e) {
+									console.error('Failed to check disk space', e);
+								}
+
+								// 5c. Spawn Rust Core Engine
+								console.log(`🚀 Spawning Rust Core for ID: ${downloadId}`);
+								await db.update(downloads).set({ status: 'downloading' }).where(eq(downloads.id, downloadId));
+								
+								const coreDir = path.resolve(process.cwd(), '../core_engine');
+								const rustProcess = spawn('cargo', [
+									'run', '--release', '--', 
+									'--id', downloadId,
+									'--url', finalUrl,
+									'--save-path', savePath
+								], { cwd: coreDir });
+								
+								rustProcess.stdout.on('data', async (chunk) => {
+									const lines = chunk.toString().split('\n');
+									for (const line of lines) {
+										if (!line.trim()) continue;
+										try {
+											const progress = JSON.parse(line);
+											if (progress.type === 'progress') {
+												await db.update(downloads).set({ 
+													downloadedBytes: progress.downloaded,
+													totalBytes: progress.total
+												}).where(eq(downloads.id, downloadId));
+												
+												if (ws.readyState === 1) {
+													ws.send(JSON.stringify({
+														type: 'PROGRESS',
+														downloadId,
+														downloaded: progress.downloaded,
+														total: progress.total
+													}));
+												}
+											}
+										} catch (e) {
+											// Non-JSON output (like cargo build logs)
+											console.log(`[Rust Core]: ${line}`);
+										}
+									}
+								});
+
+								rustProcess.on('close', async (code) => {
+									console.log(`[Rust Core] Exited with code ${code}`);
+									const finalStatus = code === 0 ? 'completed' : 'error';
+									await db.update(downloads).set({ status: finalStatus }).where(eq(downloads.id, downloadId));
+									if (ws.readyState === 1) {
+										ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status: finalStatus }));
+									}
+								});
+
+							} catch (e) {
+								console.error('❌ Background processing failed:', e);
+							}
+						})();
+					}
 				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
 					console.log('🔄 Directory picker requested by frontend');
 					try {
