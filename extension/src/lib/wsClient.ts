@@ -63,13 +63,15 @@ class VeloceWebSocketClient {
 	}
 
 	requestDirectoryPicker() {
+		console.log('[Veloce Extension] requestDirectoryPicker called');
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			console.log('[Veloce Extension] Sending REQUEST_DIRECTORY_PICKER to backend...');
 			this.ws.send(JSON.stringify({
 				type: 'REQUEST_DIRECTORY_PICKER'
 			}));
 			console.log(`[Veloce Extension] Requested native directory picker`);
 		} else {
-			console.error('[Veloce Extension] Cannot request directory picker, Local Coordinator is disconnected.');
+			console.error(`[Veloce Extension] Cannot request directory picker, Local Coordinator is disconnected. ws: ${this.ws ? 'exists' : 'null'}, readyState: ${this.ws?.readyState}`);
 		}
 	}
 }

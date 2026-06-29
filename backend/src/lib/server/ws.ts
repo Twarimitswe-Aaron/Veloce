@@ -27,6 +27,17 @@ export function setupWebSocketServer(server: Server) {
 				});
 			} else {
 				await db.update(devices).set({ lastActive: new Date() }).where(eq(devices.id, macAddress));
+				
+				const settings = deviceResult[0].settings as any;
+				if (settings && settings.baseDirectory) {
+					if (ws.readyState === 1) {
+						console.log(`📤 Sending restored directory on connection: ${settings.baseDirectory}`);
+						ws.send(JSON.stringify({
+							type: 'DIRECTORY_SELECTED',
+							payload: { path: settings.baseDirectory }
+						}));
+					}
+				}
 			}
 		} catch (err) {
 			console.error('Failed to initialize device identity:', err);
@@ -85,17 +96,31 @@ export function setupWebSocketServer(server: Server) {
 					
 					// 3. TODO: Spawn Rust Core Engine Child Process here!
 				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
+					console.log('🔄 Directory picker requested by frontend');
 					try {
 						const { execSync } = await import('child_process');
-						const result = execSync('zenity --file-selection --directory').toString().trim();
+						console.log('🔄 Executing zenity command...');
+						// Suppress stderr to avoid GTK warnings causing issues, and ensure we get only stdout
+						const result = execSync('zenity --file-selection --directory 2>/dev/null').toString().trim();
+						console.log('✅ Zenity returned:', result);
 						if (result) {
-							ws.send(JSON.stringify({
-								type: 'DIRECTORY_SELECTED',
-								payload: { path: result }
-							}));
+							// Persist to database so it survives popup reloads
+							await db.update(devices).set({ 
+								settings: { baseDirectory: result } 
+							}).where(eq(devices.id, macAddress));
+
+							if (ws.readyState === 1) {
+								console.log('📤 Sending DIRECTORY_SELECTED back to frontend');
+								ws.send(JSON.stringify({
+									type: 'DIRECTORY_SELECTED',
+									payload: { path: result }
+								}));
+							} else {
+								console.log('⚠️ WebSocket closed before we could send the directory back');
+							}
 						}
 					} catch (e) {
-						console.log('Folder selection cancelled or failed');
+						console.error('❌ Folder selection error:', e);
 					}
 				}
 			} catch (err) {
