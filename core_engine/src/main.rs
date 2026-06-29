@@ -88,23 +88,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    // If file exists but no sidecar → partial/corrupt. Remove and restart.
-    if path.exists() {
-        let existing = std::fs::metadata(&args.save_path)?.len();
-        eprintln!("⚠️  Partial file ({} / {} bytes). Restarting...", existing, total_size);
-        std::fs::remove_file(&args.save_path)?;
-    }
+    let threads = args.threads;
+    let chunk_size = total_size / threads;
 
-    // Pre-allocate file to prevent fragmentation during parallel writes
-    {
+    let state_file = format!("{}.veloce_state", args.save_path);
+    let mut initial_downloads = vec![0u64; threads as usize];
+    
+    // Resume if file and state exist
+    if path.exists() && Path::new(&state_file).exists() {
+        if let Ok(content) = std::fs::read_to_string(&state_file) {
+            if let Ok(state) = serde_json::from_str::<Vec<u64>>(&content) {
+                if state.len() == threads as usize {
+                    initial_downloads = state;
+                    eprintln!("🔄 Resuming from saved state...");
+                }
+            }
+        }
+    } else {
+        // If file exists but no valid state, remove and restart
+        if path.exists() {
+            let existing = std::fs::metadata(&args.save_path)?.len();
+            eprintln!("⚠️  Partial file without state ({} / {} bytes). Restarting...", existing, total_size);
+            std::fs::remove_file(&args.save_path)?;
+        }
+        
+        // Pre-allocate file to prevent fragmentation
         let file = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(&args.save_path)?;
         file.set_len(total_size)?;
     }
-
-    let threads = args.threads;
-    let chunk_size = total_size / threads;
 
     println!("{}", json!({
         "type": "info",
@@ -132,22 +145,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (0..threads).map(|i| {
             let start = i * chunk_size;
             let end   = if i == threads - 1 { total_size - 1 } else { (i + 1) * chunk_size - 1 };
+            let initial = initial_downloads[i as usize];
             let chunk_total = end - start + 1;
 
             let bar = mp.add(ProgressBar::new(chunk_total));
             bar.set_style(chunk_style.clone());
             bar.set_prefix(format!("{}", i));
+            bar.set_position(initial);
 
             (Arc::new(ChunkState {
-                downloaded: AtomicU64::new(0),
+                downloaded: AtomicU64::new(initial),
                 total:      chunk_total,
-                done:       AtomicBool::new(false),
+                done:       AtomicBool::new(initial == chunk_total),
             }), bar)
         }).collect()
     );
 
-    // Global lock-free counter
-    let global_dl = Arc::new(AtomicU64::new(0));
+    let global_sum: u64 = initial_downloads.iter().sum();
+    let global_dl = Arc::new(AtomicU64::new(global_sum));
+    header_bar.set_position(global_sum);
     let mut handles = vec![];
 
     // Spawn ALL chunks simultaneously as async tasks.
@@ -168,14 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handles.push(tokio::spawn(async move {
             let mut retry = 0u8;
             loop {
-                // FIX #6: On retry, reset this chunk's downloaded counter and subtract
-                // its contribution from the global counter to avoid double-counting.
-                if retry > 0 {
-                    let prev = state.downloaded.swap(0, Ordering::Relaxed);
-                    global_dl.fetch_sub(prev, Ordering::Relaxed);
-                    bar.set_position(0);
-                }
-
+                let attempt_start = state.downloaded.load(Ordering::Relaxed);
+                
                 let result = download_chunk(
                     &client, &url, &save_path,
                     range_start, range_end,
@@ -194,6 +204,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             bar.abandon_with_message(format!("FAILED: {e}"));
                             break;
                         }
+                        
+                        let current = state.downloaded.load(Ordering::Relaxed);
+                        let failed_bytes = current - attempt_start;
+                        state.downloaded.fetch_sub(failed_bytes, Ordering::Relaxed);
+                        global_dl.fetch_sub(failed_bytes, Ordering::Relaxed);
+                        bar.set_position(attempt_start);
+
                         eprintln!("[T{i}] retry {retry}/5: {e}");
                         tokio::time::sleep(Duration::from_millis(400 * retry as u64)).await;
                     }
@@ -228,14 +245,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             hbar_clone.set_position(current);
 
+            // Collect per-thread snapshot
+            let mut state_arr = vec![0u64; threads as usize];
             let thread_data: Vec<serde_json::Value> = states_json.iter().enumerate().map(|(i, (s, _))| {
+                let dl = s.downloaded.load(Ordering::Relaxed);
+                state_arr[i] = dl;
                 json!({
                     "id": i,
-                    "downloaded": s.downloaded.load(Ordering::Relaxed),
+                    "downloaded": dl,
                     "total": s.total,
                     "done": s.done.load(Ordering::Relaxed)
                 })
             }).collect();
+
+            // Persist state to disk
+            if let Ok(json_str) = serde_json::to_string(&state_arr) {
+                let _ = std::fs::write(&state_file, json_str);
+            }
 
             println!("{}", json!({
                 "type":         "progress",
@@ -270,8 +296,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // FIX #7: Write sidecar to mark this download as truly complete
+    // On completion, clean up state file
     std::fs::write(&sidecar, "done")?;
+    let state_file = format!("{}.veloce_state", args.save_path);
+    let _ = std::fs::remove_file(&state_file);
 
     println!("{}", json!({"type":"done","total":total_size,"elapsed_secs":elapsed,"avg_speed_mbps":avg_mbps}));
     Ok(())
@@ -281,15 +309,22 @@ async fn download_chunk(
     client: &reqwest::Client,
     url: &str,
     save_path: &str,
-    start: u64,
-    end: u64,
+    chunk_start: u64,
+    chunk_end: u64,
     global_downloaded: &AtomicU64,
     thread_downloaded: &AtomicU64,
     bar: &ProgressBar,
 ) -> anyhow::Result<()> {
+    let already = thread_downloaded.load(Ordering::Relaxed);
+    let start = chunk_start + already;
+    
+    if start > chunk_end {
+        return Ok(());
+    }
+
     let res = client
         .get(url)
-        .header(RANGE, format!("bytes={}-{}", start, end))
+        .header(RANGE, format!("bytes={}-{}", start, chunk_end))
         .send().await?;
 
     let status = res.status();

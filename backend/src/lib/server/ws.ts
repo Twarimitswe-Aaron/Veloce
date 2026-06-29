@@ -217,7 +217,11 @@ export function setupWebSocketServer(server: Server) {
 									'--id', downloadId,
 									'--url', finalUrl,
 									'--save-path', savePath
-								]);
+								], {
+									// Pass stdout as a pipe so we can parse JSON.
+									// Inherit stderr directly to the terminal so `indicatif` detects a true TTY and renders ANSI bars.
+									stdio: ['ignore', 'pipe', 'inherit']
+								});
 
 								
 								// FIX #3: Line buffer — a single `data` event may contain multiple
@@ -282,10 +286,6 @@ export function setupWebSocketServer(server: Server) {
 											console.log(`\n[Rust Core]: ${line}`);
 										}
 									}
-								});
-
-								rustProcess.stderr.on('data', (data) => {
-									process.stderr.write(data); // raw passthrough for indicatif ANSI
 								});
 
 								rustProcess.on('close', async (code) => {
