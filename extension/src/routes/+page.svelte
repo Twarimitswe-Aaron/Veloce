@@ -5,6 +5,7 @@
 	let downloadUrl = $state('');
 	let fileName = $state('');
 	let baseDirectory = $state('');
+	let threadCount = $state(64);
 	
 	onMount(() => {
 		const saved = localStorage.getItem('veloce_base_dir');
@@ -43,7 +44,7 @@
 			}
 		}
 		
-		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory);
+		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory, threadCount);
 		
 		// Reset form
 		downloadUrl = '';
@@ -112,6 +113,23 @@
 					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
 				</button>
 			</div>
+		</div>
+
+		<div class="flex flex-col gap-1.5">
+			<label for="threads" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Concurrent Threads</label>
+			<select 
+				id="threads"
+				bind:value={threadCount} 
+				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all text-gray-300 appearance-none"
+			>
+				<option value={1}>1 Thread (Safest)</option>
+				<option value={2}>2 Threads</option>
+				<option value={4}>4 Threads</option>
+				<option value={8}>8 Threads</option>
+				<option value={16}>16 Threads</option>
+				<option value={32}>32 Threads</option>
+				<option value={64}>64 Threads (Maximum)</option>
+			</select>
 		</div>
 
 		<button 

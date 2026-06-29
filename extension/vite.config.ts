@@ -7,6 +7,9 @@ export default defineConfig({
 		tailwindcss(),
 		sveltekit()
 	],
+	build: {
+		modulePreload: false
+	},
 	server: {
 		port: 31415,
 		strictPort: true

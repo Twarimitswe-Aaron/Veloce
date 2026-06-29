@@ -66,6 +66,8 @@ export function setupWebSocketServer(server: Server) {
 						console.error('Invalid URL during normalization:', e);
 					}
 
+					const threads = data.payload.threads || 64;
+
 					// Parse base directory
 					let baseDir = data.payload.baseDirectory;
 					if (!baseDir || baseDir.trim() === '') {
@@ -216,7 +218,8 @@ export function setupWebSocketServer(server: Server) {
 								const rustProcess = spawn(binaryPath, [
 									'--id', downloadId,
 									'--url', finalUrl,
-									'--save-path', savePath
+									'--save-path', savePath,
+									'--threads', threads.toString()
 								], {
 									// Pass stdout as a pipe so we can parse JSON.
 									// Inherit stderr directly to the terminal so `indicatif` detects a true TTY and renders ANSI bars.

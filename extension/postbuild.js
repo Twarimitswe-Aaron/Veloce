@@ -31,8 +31,11 @@ function extractInlineScripts(htmlFilePath) {
         return `<script type="module" src="/${scriptName}"></script>`;
     });
 
+    // Remove all <link rel="modulepreload"> tags which trigger CSP violations in Chrome MV3
+    html = html.replace(/<link[^>]*rel="modulepreload"[^>]*>/gi, '');
+
     fs.writeFileSync(htmlFilePath, html);
-    console.log(`Extracted inline scripts from ${htmlFilePath}`);
+    console.log(`Extracted inline scripts and removed modulepreloads from ${htmlFilePath}`);
 }
 
 const files = fs.readdirSync(buildDir);

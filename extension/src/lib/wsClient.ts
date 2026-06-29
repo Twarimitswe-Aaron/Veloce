@@ -50,11 +50,11 @@ class VeloceWebSocketClient {
 		};
 	}
 
-	sendDownloadRequest(url: string, fileName: string, baseDirectory?: string) {
+	sendDownloadRequest(url: string, fileName: string, baseDirectory?: string, threads: number = 64) {
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify({
 				type: 'NEW_DOWNLOAD',
-				payload: { url, fileName, baseDirectory }
+				payload: { url, fileName, baseDirectory, threads }
 			}));
 			console.log(`[Veloce Extension] Sent download request for: ${fileName}`);
 		} else {

@@ -5,7 +5,7 @@ use serde_json::json;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::Duration;
@@ -52,10 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true)
             .no_gzip()
+            // Force HTTP/1.1. If we allow HTTP/2, all 32 threads might multiplex 
+            // over a SINGLE TCP connection, causing extreme server-side throttling.
+            .http1_only()
             .pool_max_idle_per_host(args.threads as usize)
             .timeout(Duration::from_secs(120))
             .build()?
-    );
+    );  
 
     // HEAD request to discover file size
     let head_res = client.head(&args.url).send().await?;
@@ -164,6 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let global_sum: u64 = initial_downloads.iter().sum();
     let global_dl = Arc::new(AtomicU64::new(global_sum));
     header_bar.set_position(global_sum);
+    
+    let max_threads = Arc::new(AtomicUsize::new(args.threads as usize));
+    let active_threads = Arc::new(AtomicUsize::new(0));
     let mut handles = vec![];
 
     // Spawn ALL chunks simultaneously as async tasks.
@@ -176,6 +182,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let url       = args.url.clone();
         let save_path = args.save_path.clone();
         let global_dl = Arc::clone(&global_dl);
+        let max_t = Arc::clone(&max_threads);
+        let act_t = Arc::clone(&active_threads);
         let (state, bar) = {
             let e = &chunk_states[i as usize];
             (Arc::clone(&e.0), e.1.clone())
@@ -184,13 +192,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handles.push(tokio::spawn(async move {
             let mut retry = 0u8;
             loop {
-                let attempt_start = state.downloaded.load(Ordering::Relaxed);
-                
+                // Wait for an available concurrency slot
+                loop {
+                    let max = max_t.load(Ordering::Relaxed);
+                    let act = act_t.load(Ordering::Relaxed);
+                    if act < max {
+                        if act_t.compare_exchange(act, act + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            break;
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+
                 let result = download_chunk(
                     &client, &url, &save_path,
                     range_start, range_end,
                     &global_dl, &state.downloaded, &bar,
                 ).await;
+
+                // Release concurrency slot
+                act_t.fetch_sub(1, Ordering::SeqCst);
 
                 match result {
                     Ok(()) => {
@@ -200,18 +222,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         retry += 1;
-                        if retry >= 5 {
+                        if retry >= 10 {
                             bar.abandon_with_message(format!("FAILED: {e}"));
                             break;
                         }
                         
-                        let current = state.downloaded.load(Ordering::Relaxed);
-                        let failed_bytes = current - attempt_start;
-                        state.downloaded.fetch_sub(failed_bytes, Ordering::Relaxed);
-                        global_dl.fetch_sub(failed_bytes, Ordering::Relaxed);
-                        bar.set_position(attempt_start);
+                        // Dynamically halve the max allowed threads to reduce server load
+                        let mut current_max = max_t.load(Ordering::SeqCst);
+                        while current_max > 1 {
+                            let new_max = std::cmp::max(1, current_max / 2);
+                            if max_t.compare_exchange(current_max, new_max, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                eprintln!("[T{i}] Server dropped connection! Reduced active threads to {}", new_max);
+                                break;
+                            }
+                            current_max = max_t.load(Ordering::SeqCst);
+                        }
 
-                        eprintln!("[T{i}] retry {retry}/5: {e}");
+                        eprintln!("[T{i}] retry {retry}/10: {e}");
                         tokio::time::sleep(Duration::from_millis(400 * retry as u64)).await;
                     }
                 }
@@ -342,8 +369,17 @@ async fn download_chunk(
     use futures::StreamExt;
     let mut stream = res.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
+    while let Some(chunk_res) = stream.next().await {
+        let bytes = match chunk_res {
+            Ok(b) => b,
+            Err(e) => {
+                // If connection drops, flush everything we have so far to disk
+                // before returning the error. This prevents losing progress!
+                let _ = writer.flush().await;
+                return Err(e.into());
+            }
+        };
+        
         writer.write_all(&bytes).await?;
         let n = bytes.len() as u64;
         global_downloaded.fetch_add(n, Ordering::Relaxed);
