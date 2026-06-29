@@ -64,6 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start download tasks
     let chunk_size = total_size / (args.threads as u64);
+    
+    // Print info for backend to display
+    println!("{}", json!({
+        "type": "info",
+        "threads": args.threads,
+        "chunk_size": chunk_size,
+        "total_size": total_size
+    }));
+
     let mut handles = vec![];
     
     let downloaded_bytes = Arc::new(Mutex::new(0u64));
@@ -100,10 +109,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             use futures::StreamExt;
             while let Some(chunk) = stream.next().await {
-                if let Ok(bytes) = chunk {
-                    file.write_all(&bytes).await.unwrap();
-                    let mut dl = downloaded_bytes.lock().await;
-                    *dl += bytes.len() as u64;
+                match chunk {
+                    Ok(bytes) => {
+                        file.write_all(&bytes).await.unwrap();
+                        let mut dl = downloaded_bytes.lock().await;
+                        *dl += bytes.len() as u64;
+                    },
+                    Err(e) => {
+                        eprintln!("Thread {} stream error: {}", i, e);
+                        break;
+                    }
                 }
             }
         }));
@@ -133,12 +148,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let _ = reporter.await;
 
-    // Final emit
+    // Final emit of ACTUAL downloaded bytes
+    let final_downloaded = *downloaded_bytes.lock().await;
     println!("{}", json!({
         "type": "progress",
-        "downloaded": total_size,
+        "downloaded": final_downloaded,
         "total": total_size
     }));
+
+    if final_downloaded < total_size {
+        eprintln!("Download incomplete! Only got {} / {} bytes", final_downloaded, total_size);
+        std::process::exit(1);
+    }
 
     Ok(())
 }

@@ -81,9 +81,9 @@ export function setupWebSocketServer(server: Server) {
 						const urlObj = new URL(data.payload.url);
 						const hostname = urlObj.hostname.toLowerCase();
 						
-						const videoDomains = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv'];
+						const extractorDomains = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'];
 						
-						if (videoDomains.some(d => hostname.includes(d))) {
+						if (extractorDomains.some(d => hostname.includes(d))) {
 							category = 'videos';
 							// If the filename has no extension, append .mp4 as a safe default for video sites
 							if (!ext) {
@@ -110,7 +110,7 @@ export function setupWebSocketServer(server: Server) {
 						}
 					}
 					
-					const savePath = path.join(baseDir, category, data.payload.fileName);
+					let savePath = path.join(baseDir, category, data.payload.fileName);
 					
 					// 2. Database Deduplication Check
 					const existing = await db.select().from(downloads)
@@ -159,13 +159,31 @@ export function setupWebSocketServer(server: Server) {
 							try {
 								let finalUrl = rawUrl;
 								
-								// 5a. yt-dlp extraction for video sites
+								// 5a. yt-dlp extraction for video sites and file hosts
 								if (category === 'videos') {
 									console.log(`🔍 Extracting direct URL for ${rawUrl}...`);
 									const directUrl = await extractMediaUrl(rawUrl);
 									if (directUrl) {
 										finalUrl = directUrl;
 										console.log(`🎯 Extracted direct URL successfully`);
+										
+										// Try to get a better filename from the direct URL if the current one is generic
+										if (data.payload.fileName.startsWith('file') || data.payload.fileName.startsWith('download_file')) {
+											try {
+												const u = new URL(finalUrl);
+												const parts = u.pathname.split('/').filter(p => p.length > 0);
+												let betterName = parts.pop();
+												if (betterName && betterName.includes('.')) {
+													// decode URL encoding (like %20 or +)
+													betterName = decodeURIComponent(betterName.replace(/\+/g, ' '));
+													data.payload.fileName = betterName;
+													// Update savePath with the better filename
+													savePath = path.join(baseDir, category, betterName);
+													await db.update(downloads).set({ fileName: betterName, savePath }).where(eq(downloads.id, downloadId));
+												}
+											} catch(e) {}
+										}
+
 										await db.update(downloads).set({ url: finalUrl }).where(eq(downloads.id, downloadId));
 									}
 								}
@@ -208,6 +226,12 @@ export function setupWebSocketServer(server: Server) {
 													totalBytes: progress.total
 												}).where(eq(downloads.id, downloadId));
 												
+												// Calculate percentage for terminal
+												const percent = ((progress.downloaded / progress.total) * 100).toFixed(1);
+												const dlMb = (progress.downloaded / 1024 / 1024).toFixed(1);
+												const totalMb = (progress.total / 1024 / 1024).toFixed(1);
+												process.stdout.write(`\r[Rust Core] Download Progress: ${percent}% (${dlMb} MB / ${totalMb} MB)`);
+												
 												if (ws.readyState === 1) {
 													ws.send(JSON.stringify({
 														type: 'PROGRESS',
@@ -216,16 +240,24 @@ export function setupWebSocketServer(server: Server) {
 														total: progress.total
 													}));
 												}
+											} else if (progress.type === 'info') {
+												const chunkMb = (progress.chunk_size / 1024 / 1024).toFixed(2);
+												const totalMb = (progress.total_size / 1024 / 1024).toFixed(2);
+												console.log(`\n[Rust Core Info]: Starting ${progress.threads} parallel threads. Chunk size: ${chunkMb} MB. Total size: ${totalMb} MB.`);
 											}
 										} catch (e) {
 											// Non-JSON output (like cargo build logs)
-											console.log(`[Rust Core]: ${line}`);
+											console.log(`\n[Rust Core]: ${line}`);
 										}
 									}
 								});
 
+								rustProcess.stderr.on('data', (data) => {
+									console.error(`\n[Rust Core Error]: ${data.toString().trim()}`);
+								});
+
 								rustProcess.on('close', async (code) => {
-									console.log(`[Rust Core] Exited with code ${code}`);
+									console.log(`\n[Rust Core] Exited with code ${code}`);
 									const finalStatus = code === 0 ? 'completed' : 'error';
 									await db.update(downloads).set({ status: finalStatus }).where(eq(downloads.id, downloadId));
 									if (ws.readyState === 1) {
