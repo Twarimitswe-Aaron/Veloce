@@ -63,6 +63,8 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
             '-f', 'b/best',
             '--no-playlist',
             '-g',
+            // `--` ensures a URL beginning with "-" can never be parsed as a flag.
+            '--',
             url
         ]);
 

@@ -1,5 +1,6 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, type Plugin } from 'vite';
+import { config } from './src/lib/server/config';
 
 const webSocketServer: Plugin = {
 	name: 'webSocketServer',
@@ -19,7 +20,7 @@ const webSocketServer: Plugin = {
 export default defineConfig({
 	plugins: [sveltekit(), webSocketServer],
 	server: {
-		port: 14921,
+		port: config.port,
 		strictPort: true, // Fail if port is already in use
 	}
 });

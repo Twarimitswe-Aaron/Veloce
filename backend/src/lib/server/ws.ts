@@ -3,7 +3,7 @@ import type { Server } from 'http';
 import { db } from './db';
 import { downloads, devices } from './db/schema';
 import { getMacAddress } from './identity';
-import { eq, or, sql, inArray } from 'drizzle-orm';
+import { eq, sql, inArray } from 'drizzle-orm';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
@@ -130,6 +130,25 @@ function completedFileStillExists(savePath: string): boolean {
 	return existsSync(`${savePath}.veloce_done`) || existsSync(savePath);
 }
 
+/**
+ * Avoid silently overwriting an unrelated existing file: if `savePath` is taken
+ * (on disk or by another DB row), append " (1)", " (2)", … like classic IDMs.
+ */
+async function uniqueSavePath(savePath: string): Promise<string> {
+	const dir = path.dirname(savePath);
+	const ext = path.extname(savePath);
+	const stem = path.basename(savePath, ext);
+	let candidate = savePath;
+	for (let i = 1; ; i++) {
+		const taken =
+			existsSync(candidate) ||
+			existsSync(`${candidate}.veloce_state`) ||
+			(await db.select().from(downloads).where(eq(downloads.savePath, candidate))).length > 0;
+		if (!taken) return candidate;
+		candidate = path.join(dir, `${stem} (${i})${ext}`);
+	}
+}
+
 async function cleanupFiles(savePath: string) {
 	await unlink(savePath).catch(() => {});
 	await unlink(`${savePath}.veloce_state`).catch(() => {});
@@ -174,7 +193,7 @@ function pickDirectory(): string | null {
 }
 
 // ── Scheduler: cap concurrent engine processes ───────────────────────────────
-const MAX_CONCURRENT_DOWNLOADS = 3;
+const MAX_CONCURRENT_DOWNLOADS = config.maxConcurrentDownloads;
 let activeDownloads = 0;
 const pendingJobs: Array<() => Promise<void>> = [];
 
@@ -280,7 +299,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		const binaryPath = path.join(coreDir, 'target', 'release', 'core_engine');
 		const rustProcess = spawn(
 			binaryPath,
-			['--id', id, '--url', finalUrl, '--save-path', savePath, '--threads', spec.threads.toString()],
+			[
+				'--id', id,
+				'--url', finalUrl,
+				'--save-path', savePath,
+				'--threads', spec.threads.toString(),
+				'--max-rate', config.maxRateBytes.toString()
+			],
 			{ stdio: ['ignore', 'pipe', 'inherit'] }
 		);
 		running.set(id, { proc: rustProcess, intent: 'normal' });
@@ -478,6 +503,13 @@ export function setupWebSocketServer(server: Server) {
 				if (data.type === 'NEW_DOWNLOAD') {
 					console.log('📥 Received new download request:', data.payload);
 
+					// Validate the URL up front (scheme + SSRF guard).
+					const safety = isSafeDownloadUrl(data.payload.url ?? '');
+					if (!safety.ok) {
+						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: safety.reason }));
+						return;
+					}
+
 					// Normalize URL (strip tracking params).
 					let rawUrl = data.payload.url;
 					try {
@@ -490,11 +522,11 @@ export function setupWebSocketServer(server: Server) {
 						console.error('Invalid URL during normalization');
 					}
 
-					const threads = data.payload.threads || 8;
+					const threads = data.payload.threads || config.defaultThreads;
 
 					let baseDir = data.payload.baseDirectory;
 					if (!baseDir || baseDir.trim() === '') {
-						baseDir = path.join(os.homedir(), 'Downloads', 'Veloce');
+						baseDir = config.baseDir || path.join(os.homedir(), 'Downloads', 'Veloce');
 					}
 
 					// Categorize by domain, then extension.
@@ -522,17 +554,17 @@ export function setupWebSocketServer(server: Server) {
 						else if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) category = 'archives';
 					}
 
-					const savePath = safeJoin(baseDir, category, rawName);
-					if (!savePath) {
+					const desiredPath = safeJoin(baseDir, category, rawName);
+					if (!desiredPath) {
 						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: 'Invalid file path' }));
 						return;
 					}
 
-					// Dedup: in-flight rows, or completed rows whose bytes still exist.
-					const existing = await db.select().from(downloads)
-						.where(or(eq(downloads.url, rawUrl), eq(downloads.savePath, savePath)));
-					const activeDownload = existing.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
-					const completedOnDisk = existing.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
+					// Dedup is keyed on the SOURCE url (same link = same download).
+					// In-flight rows always dedup; completed rows only if bytes remain.
+					const sameSource = await db.select().from(downloads).where(eq(downloads.url, rawUrl));
+					const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
+					const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
 					const duplicate = activeDownload ?? completedOnDisk;
 
 					if (duplicate) {
@@ -541,22 +573,27 @@ export function setupWebSocketServer(server: Server) {
 						return;
 					}
 
+					// Not a duplicate source — make sure we don't clobber an unrelated
+					// existing file/row that happens to share the name.
+					const savePath = await uniqueSavePath(desiredPath);
+					const finalName = path.basename(savePath);
+
 					const downloadId = crypto.randomUUID();
 					await db.insert(downloads).values({
 						id: downloadId,
 						deviceId: macAddress,
 						url: rawUrl,
-						fileName: rawName,
+						fileName: finalName,
 						savePath,
 						status: 'queued'
 					});
-					broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: rawName, status: 'queued' });
+					broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: finalName, status: 'queued' });
 					console.log(`✅ Download queued with ID: ${downloadId}`);
 
 					scheduleDownload(() => runDownloadJob({
 						id: downloadId,
 						pageUrl: rawUrl,
-						fileName: rawName,
+						fileName: finalName,
 						savePath,
 						category,
 						threads,
