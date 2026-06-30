@@ -1,6 +1,7 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::{CONTENT_LENGTH, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::SeekFrom;
 use std::path::Path;
@@ -33,6 +34,38 @@ struct ChunkState {
     downloaded: AtomicU64,
     total:      u64,
     done:       AtomicBool,
+}
+
+/// On-disk resume metadata written next to the file as `{save_path}.veloce_state`.
+/// We persist `threads` and `total_size` alongside per-chunk byte offsets so a
+/// resume stays correct even if the caller later changes the thread count, and
+/// so we never resume against a different file that happens to share the path.
+#[derive(Serialize, Deserialize)]
+struct ResumeState {
+    threads:    u64,
+    total_size: u64,
+    downloaded: Vec<u64>,
+}
+
+/// Probe whether the server honors HTTP range requests.
+/// We send a 1-byte range and require a `206 Partial Content` reply. A `200`
+/// means the server ignored the range and would hand every chunk the full body,
+/// which would corrupt a multi-threaded download — so we fall back to 1 thread.
+async fn supports_ranges(client: &reqwest::Client, url: &str) -> bool {
+    match client.get(url).header(RANGE, "bytes=0-0").send().await {
+        Ok(res) => {
+            if res.status().as_u16() == 206 {
+                return true;
+            }
+            // Some servers reply 200 but still advertise byte ranges; trust the header.
+            res.headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
 }
 
 #[tokio::main]
@@ -91,36 +124,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    let threads = args.threads;
-    let chunk_size = total_size / threads;
-
     let state_file = format!("{}.veloce_state", args.save_path);
-    let mut initial_downloads = vec![0u64; threads as usize];
-    
-    // Resume if file and state exist
-    if path.exists() && Path::new(&state_file).exists() {
-        if let Ok(content) = std::fs::read_to_string(&state_file) {
-            if let Ok(state) = serde_json::from_str::<Vec<u64>>(&content) {
-                if state.len() == threads as usize {
-                    initial_downloads = state;
-                    eprintln!("🔄 Resuming from saved state...");
-                }
-            }
-        }
+
+    // Try to load a valid resume state: same file size, internally consistent.
+    let resume_state: Option<ResumeState> = if path.exists() && Path::new(&state_file).exists() {
+        std::fs::read_to_string(&state_file)
+            .ok()
+            .and_then(|c| serde_json::from_str::<ResumeState>(&c).ok())
+            .filter(|s| {
+                s.total_size == total_size
+                    && s.threads > 0
+                    && s.downloaded.len() == s.threads as usize
+            })
     } else {
-        // If file exists but no valid state, remove and restart
+        None
+    };
+
+    let threads;
+    let initial_downloads: Vec<u64>;
+
+    if let Some(state) = resume_state {
+        // Adopt the saved thread count so progress survives a changed --threads value.
+        threads = state.threads;
+        initial_downloads = state.downloaded;
+        eprintln!("🔄 Resuming from saved state ({} threads)...", threads);
+    } else {
+        // Fresh download. Discard any stale partial file/state first.
         if path.exists() {
             let existing = std::fs::metadata(&args.save_path)?.len();
-            eprintln!("⚠️  Partial file without state ({} / {} bytes). Restarting...", existing, total_size);
+            eprintln!("⚠️  Partial file without valid state ({} / {} bytes). Restarting...", existing, total_size);
             std::fs::remove_file(&args.save_path)?;
         }
-        
-        // Pre-allocate file to prevent fragmentation
+        let _ = std::fs::remove_file(&state_file);
+
+        // Decide thread count: only segment if the server honors range requests.
+        let requested = args.threads.max(1);
+        let mut effective = if requested > 1 && !supports_ranges(&client, &args.url).await {
+            eprintln!("⚠️  Server does not support range requests — falling back to a single thread.");
+            1
+        } else {
+            requested
+        };
+        // Never create more chunks than there are bytes (avoids zero-sized chunks).
+        if effective > total_size {
+            effective = total_size.max(1);
+        }
+        threads = effective;
+        initial_downloads = vec![0u64; threads as usize];
+
+        // Pre-allocate file to prevent fragmentation.
         let file = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(&args.save_path)?;
         file.set_len(total_size)?;
     }
+
+    let chunk_size = total_size / threads;
 
     println!("{}", json!({
         "type": "info",
@@ -285,8 +344,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }).collect();
 
-            // Persist state to disk
-            if let Ok(json_str) = serde_json::to_string(&state_arr) {
+            // Persist resume state to disk (threads + size + per-chunk offsets).
+            let resume = ResumeState {
+                threads,
+                total_size,
+                downloaded: state_arr,
+            };
+            if let Ok(json_str) = serde_json::to_string(&resume) {
                 let _ = std::fs::write(&state_file, json_str);
             }
 

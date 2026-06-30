@@ -2,6 +2,40 @@ import { writable } from 'svelte/store';
 
 export const isConnected = writable(false);
 export const selectedDirectory = writable<string | null>(null);
+export const pickerError = writable<string | null>(null);
+
+export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'error';
+
+export interface DownloadItem {
+	id: string;
+	fileName: string;
+	status: DownloadStatus;
+	downloaded: number;
+	total: number;
+	speedBps: number;
+	etaSecs: number;
+	error?: string;
+	updatedAt: number;
+}
+
+// Map of downloadId -> live download state, surfaced to the popup UI.
+export const downloads = writable<Record<string, DownloadItem>>({});
+
+function upsertDownload(id: string, patch: Partial<DownloadItem>) {
+	downloads.update((map) => {
+		const prev = map[id] ?? {
+			id,
+			fileName: 'Unknown file',
+			status: 'queued' as DownloadStatus,
+			downloaded: 0,
+			total: 0,
+			speedBps: 0,
+			etaSecs: 0,
+			updatedAt: Date.now()
+		};
+		return { ...map, [id]: { ...prev, ...patch, updatedAt: Date.now() } };
+	});
+}
 
 class VeloceWebSocketClient {
 	private ws: WebSocket | null = null;
@@ -25,12 +59,47 @@ class VeloceWebSocketClient {
 			try {
 				const data = JSON.parse(event.data);
 				console.log('[Veloce Extension] Received message:', data);
-				
-				if (data.type === 'DOWNLOAD_ACK') {
-					console.log(`✅ Successfully queued download ID: ${data.downloadId}`);
-				} else if (data.type === 'DIRECTORY_SELECTED') {
-					console.log(`📁 User selected directory: ${data.payload.path}`);
-					selectedDirectory.set(data.payload.path);
+
+				switch (data.type) {
+					case 'DOWNLOAD_ACK':
+						upsertDownload(data.downloadId, {
+							fileName: data.fileName ?? 'Unknown file',
+							status: data.status ?? 'queued'
+						});
+						break;
+
+					case 'PROGRESS':
+						upsertDownload(data.downloadId, {
+							status: 'downloading',
+							downloaded: data.downloaded ?? 0,
+							total: data.total ?? 0,
+							speedBps: data.speedBps ?? 0,
+							etaSecs: data.etaSecs ?? 0
+						});
+						break;
+
+					case 'DOWNLOAD_COMPLETED':
+						upsertDownload(data.downloadId, {
+							status: (data.status as DownloadStatus) ?? 'completed'
+						});
+						break;
+
+					case 'DOWNLOAD_ERROR':
+						upsertDownload(data.downloadId, {
+							status: 'error',
+							error: data.error ?? 'Download failed'
+						});
+						break;
+
+					case 'DIRECTORY_SELECTED':
+						console.log(`📁 User selected directory: ${data.payload.path}`);
+						pickerError.set(null);
+						selectedDirectory.set(data.payload.path);
+						break;
+
+					case 'DIRECTORY_PICKER_UNAVAILABLE':
+						pickerError.set(data.error ?? 'Folder picker unavailable. Type the path manually.');
+						break;
 				}
 			} catch (e) {
 				console.error('[Veloce Extension] Failed to parse WebSocket message:', e);
@@ -50,7 +119,7 @@ class VeloceWebSocketClient {
 		};
 	}
 
-	sendDownloadRequest(url: string, fileName: string, baseDirectory?: string, threads: number = 64) {
+	sendDownloadRequest(url: string, fileName: string, baseDirectory?: string, threads: number = 8) {
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify({
 				type: 'NEW_DOWNLOAD',
@@ -65,13 +134,10 @@ class VeloceWebSocketClient {
 	requestDirectoryPicker() {
 		console.log('[Veloce Extension] requestDirectoryPicker called');
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-			console.log('[Veloce Extension] Sending REQUEST_DIRECTORY_PICKER to backend...');
-			this.ws.send(JSON.stringify({
-				type: 'REQUEST_DIRECTORY_PICKER'
-			}));
-			console.log(`[Veloce Extension] Requested native directory picker`);
+			this.ws.send(JSON.stringify({ type: 'REQUEST_DIRECTORY_PICKER' }));
+			console.log('[Veloce Extension] Requested native directory picker');
 		} else {
-			console.error(`[Veloce Extension] Cannot request directory picker, Local Coordinator is disconnected. ws: ${this.ws ? 'exists' : 'null'}, readyState: ${this.ws?.readyState}`);
+			console.error('[Veloce Extension] Cannot request directory picker, Local Coordinator is disconnected.');
 		}
 	}
 }

@@ -21,7 +21,7 @@ Veloce is a high-performance, segmented Internet Download Manager (IDM) designed
 ## 📚 Learning Concepts Explained
 
 ### WebSockets vs Native Messaging
-To let the browser extension talk to your computer's native file system, we use **WebSockets**. The Local Coordinator runs a tiny server on your PC (e.g., `ws://localhost:8080`). The browser extension simply connects to this address. It's much easier to set up than "Native Messaging" (which requires hacking the OS registry).
+To let the browser extension talk to your computer's native file system, we use **WebSockets**. The Local Coordinator runs a tiny server on your PC at `ws://localhost:14921/ws`. The browser extension simply connects to this address. It's much easier to set up than "Native Messaging" (which requires hacking the OS registry).
 
 ### Child Process
 Instead of compiling the complex Rust Engine into a JavaScript module (FFI), the SvelteKit backend runs the compiled Rust executable (`veloce_core.exe`) exactly like you would run a command in the terminal. This is called spawning a **Child Process**. If the Rust engine crashes due to a bad network request, your SvelteKit dashboard stays safely alive and can restart it.

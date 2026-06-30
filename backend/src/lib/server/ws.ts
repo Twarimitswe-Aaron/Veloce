@@ -8,8 +8,47 @@ import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
 import { statfs } from 'fs/promises';
-import { spawn } from 'child_process';
+import { existsSync } from 'fs';
+import { spawn, execSync } from 'child_process';
 import { extractMediaUrl } from './extractor';
+
+/**
+ * A completed DB row is only truly "done" if the bytes are still on disk.
+ * We trust the engine's `.veloce_done` sidecar, but also accept the plain file
+ * existing (e.g. user moved/renamed sidecar) as good enough to skip re-download.
+ */
+function completedFileStillExists(savePath: string): boolean {
+	return existsSync(`${savePath}.veloce_done`) || existsSync(savePath);
+}
+
+/**
+ * Open a native folder picker, trying GTK (zenity) then KDE (kdialog).
+ * Returns the chosen absolute path, or null if the user cancelled or no
+ * picker is installed (e.g. headless servers).
+ */
+function pickDirectory(): string | null {
+	const candidates = [
+		'zenity --file-selection --directory 2>/dev/null',
+		'kdialog --getexistingdirectory "$HOME" 2>/dev/null'
+	];
+	for (const cmd of candidates) {
+		try {
+			const out = execSync(cmd).toString().trim();
+			if (out) {
+				console.log(`✅ Directory picker returned: ${out}`);
+				return out;
+			}
+			// Empty output with exit 0 means the user cancelled — stop trying.
+			return null;
+		} catch (e: any) {
+			// Non-zero exit: user cancelled (code 1) vs picker missing (code 127).
+			if (e?.status === 1) return null;
+			// Otherwise fall through and try the next picker.
+		}
+	}
+	console.error('❌ No graphical folder picker available (tried zenity, kdialog).');
+	return null;
+}
 export function setupWebSocketServer(server: Server) {
 	const wss = new WebSocketServer({ server, path: '/ws' });
 	
@@ -123,16 +162,24 @@ export function setupWebSocketServer(server: Server) {
 							)
 						);
 					
-					const activeDownload = existing.find(d => ['queued', 'downloading', 'completed'].includes(d.status));
-					if (activeDownload) {
-						console.log(`♻️  Duplicate found! Attaching to existing download ID: ${activeDownload.id}`);
+					// An in-flight job (queued/downloading) is always a true duplicate.
+					const activeDownload = existing.find(d => ['queued', 'downloading'].includes(d.status));
+					// A completed job is only a duplicate if the bytes are still on disk;
+					// otherwise the user deleted the file and wants it again.
+					const completedOnDisk = existing.find(
+						d => d.status === 'completed' && completedFileStillExists(d.savePath)
+					);
+					const duplicate = activeDownload ?? completedOnDisk;
+
+					if (duplicate) {
+						console.log(`♻️  Duplicate found! Attaching to existing download ID: ${duplicate.id}`);
 						ws.send(JSON.stringify({ 
 							type: 'DOWNLOAD_ACK', 
-							downloadId: activeDownload.id,
-							status: activeDownload.status
+							downloadId: duplicate.id,
+							fileName: duplicate.fileName,
+							status: duplicate.status
 						}));
-						// We skip inserting a new record and spawning Rust.
-						// Note: We need a return here, but we are inside an if-statement block.
+						// Skip inserting a new record and spawning Rust.
 					} else {
 						// Proceed with new download
 						const downloadId = crypto.randomUUID();
@@ -151,6 +198,7 @@ export function setupWebSocketServer(server: Server) {
 						ws.send(JSON.stringify({ 
 							type: 'DOWNLOAD_ACK', 
 							downloadId,
+							fileName: data.payload.fileName,
 							status: 'queued'
 						}));
 						
@@ -187,6 +235,19 @@ export function setupWebSocketServer(server: Server) {
 										}
 
 										await db.update(downloads).set({ url: finalUrl }).where(eq(downloads.id, downloadId));
+									} else {
+										// Extraction failed: do NOT fall through to downloading the page HTML.
+										// Abort cleanly so the user knows the link could not be resolved.
+										console.error(`❌ Could not extract a direct media URL for ${rawUrl}. Aborting.`);
+										await db.update(downloads).set({ status: 'error' }).where(eq(downloads.id, downloadId));
+										if (ws.readyState === 1) {
+											ws.send(JSON.stringify({
+												type: 'DOWNLOAD_ERROR',
+												downloadId,
+												error: 'Could not extract a downloadable media URL (the site may require login, or yt-dlp/cookies failed).'
+											}));
+										}
+										return;
 									}
 								}
 
@@ -204,7 +265,17 @@ export function setupWebSocketServer(server: Server) {
 										return;
 									}
 								} catch (e) {
-									console.error('Failed to check disk space', e);
+									// If we cannot verify free space, fail closed rather than risk filling the disk.
+									console.error('Failed to check disk space, aborting download', e);
+									await db.update(downloads).set({ status: 'error' }).where(eq(downloads.id, downloadId));
+									if (ws.readyState === 1) {
+										ws.send(JSON.stringify({
+											type: 'DOWNLOAD_ERROR',
+											downloadId,
+											error: 'Could not verify available disk space.'
+										}));
+									}
+									return;
 								}
 
 								// 5c. Spawn Rust Core Engine
@@ -226,7 +297,21 @@ export function setupWebSocketServer(server: Server) {
 									stdio: ['ignore', 'pipe', 'inherit']
 								});
 
-								
+								// Guard so 'already_exists' / 'error' / 'close' can't settle twice.
+								let settled = false;
+								const settle = async (status: 'completed' | 'error', errorMsg?: string) => {
+									if (settled) return;
+									settled = true;
+									await db.update(downloads).set({ status }).where(eq(downloads.id, downloadId));
+									if (ws.readyState === 1) {
+										if (status === 'error') {
+											ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: errorMsg ?? 'Download failed' }));
+										} else {
+											ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status }));
+										}
+									}
+								};
+
 								// FIX #3: Line buffer — a single `data` event may contain multiple
 								// JSON lines OR one JSON object split across two events. Accumulate
 								// until we see a full newline before parsing.
@@ -276,10 +361,7 @@ export function setupWebSocketServer(server: Server) {
 												console.log(`\n[Veloce] Starting ${progress.threads} threads | chunk: ${chunkMb} MB | total: ${totalMb} MB`);
 											} else if (progress.type === 'already_exists') {
 												console.log(`\n[Veloce] File already fully downloaded — skipping!`);
-												await db.update(downloads).set({ status: 'completed' }).where(eq(downloads.id, downloadId));
-												if (ws.readyState === 1) {
-													ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status: 'completed' }));
-												}
+												await settle('completed');
 											} else if (progress.type === 'done') {
 												const totalMb = (progress.total / 1024 / 1024).toFixed(1);
 												console.log(`\n✅ [Veloce] Download complete! ${totalMb} MB in ${progress.elapsed_secs?.toFixed(1)}s @ avg ${progress.avg_speed_mbps?.toFixed(2)} MB/s`);
@@ -291,46 +373,53 @@ export function setupWebSocketServer(server: Server) {
 									}
 								});
 
+								// Fired when the binary cannot even be launched (e.g. not built / ENOENT).
+								rustProcess.on('error', async (err) => {
+									console.error(`❌ Failed to launch core engine at ${binaryPath}:`, err);
+									await settle('error', `Could not start the download engine (${err.message}). Is core_engine built?`);
+								});
+
 								rustProcess.on('close', async (code) => {
 									console.log(`\n[Rust Core] Exited with code ${code}`);
-									const finalStatus = code === 0 ? 'completed' : 'error';
-									await db.update(downloads).set({ status: finalStatus }).where(eq(downloads.id, downloadId));
-									if (ws.readyState === 1) {
-										ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status: finalStatus }));
-									}
+									await settle(code === 0 ? 'completed' : 'error', `Engine exited with code ${code}`);
 								});
 
 							} catch (e) {
 								console.error('❌ Background processing failed:', e);
+								// Never leave a row stuck in queued/downloading on an unexpected throw.
+								try {
+									await db.update(downloads).set({ status: 'error' }).where(eq(downloads.id, downloadId));
+									if (ws.readyState === 1) {
+										ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: 'Internal error while starting download' }));
+									}
+								} catch {}
 							}
 						})();
 					}
 				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
 					console.log('🔄 Directory picker requested by frontend');
-					try {
-						const { execSync } = await import('child_process');
-						console.log('🔄 Executing zenity command...');
-						// Suppress stderr to avoid GTK warnings causing issues, and ensure we get only stdout
-						const result = execSync('zenity --file-selection --directory 2>/dev/null').toString().trim();
-						console.log('✅ Zenity returned:', result);
-						if (result) {
-							// Persist to database so it survives popup reloads
-							await db.update(devices).set({ 
-								settings: { baseDirectory: result } 
-							}).where(eq(devices.id, macAddress));
+					const result = pickDirectory();
+					if (result) {
+						// Persist to database so it survives popup reloads
+						await db.update(devices).set({
+							settings: { baseDirectory: result }
+						}).where(eq(devices.id, macAddress));
 
-							if (ws.readyState === 1) {
-								console.log('📤 Sending DIRECTORY_SELECTED back to frontend');
-								ws.send(JSON.stringify({
-									type: 'DIRECTORY_SELECTED',
-									payload: { path: result }
-								}));
-							} else {
-								console.log('⚠️ WebSocket closed before we could send the directory back');
-							}
+						if (ws.readyState === 1) {
+							console.log('📤 Sending DIRECTORY_SELECTED back to frontend');
+							ws.send(JSON.stringify({
+								type: 'DIRECTORY_SELECTED',
+								payload: { path: result }
+							}));
+						} else {
+							console.log('⚠️ WebSocket closed before we could send the directory back');
 						}
-					} catch (e) {
-						console.error('❌ Folder selection error:', e);
+					} else if (ws.readyState === 1) {
+						// No GUI picker available (headless / missing zenity & kdialog).
+						ws.send(JSON.stringify({
+							type: 'DIRECTORY_PICKER_UNAVAILABLE',
+							error: 'No graphical folder picker found. Install zenity or kdialog, or type the path manually.'
+						}));
 					}
 				}
 			} catch (err) {
