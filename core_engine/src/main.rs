@@ -1,7 +1,7 @@
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::SeekFrom;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 /// Fixed work unit. The file is divided into pieces of this size; idle
@@ -42,6 +43,50 @@ struct Args {
     /// 8 is optimal for most servers — above that many CDNs throttle per-IP.
     #[arg(long, default_value_t = 8)]
     threads: u64,
+
+    /// Global download speed cap in bytes/sec across all connections.
+    /// 0 means unlimited. Lets Veloce share bandwidth politely (an IDM staple).
+    #[arg(long, default_value_t = 0)]
+    max_rate: u64,
+}
+
+/// Global token-bucket rate limiter shared by every connection. A 1-second
+/// burst budget refills continuously at `rate` bytes/sec; workers `acquire`
+/// before writing each chunk, so the *aggregate* throughput never exceeds the
+/// cap regardless of how many connections are active. `rate == 0` disables it.
+struct RateLimiter {
+    rate: u64,
+    state: Mutex<(f64, Instant)>, // (available tokens, last refill)
+}
+
+impl RateLimiter {
+    fn new(rate: u64) -> Self {
+        Self { rate, state: Mutex::new((0.0, Instant::now())) }
+    }
+
+    async fn acquire(&self, mut n: u64) {
+        if self.rate == 0 {
+            return;
+        }
+        let cap = self.rate as f64; // allow up to 1s worth of burst
+        while n > 0 {
+            let mut g = self.state.lock().await;
+            let now = Instant::now();
+            let elapsed = now.duration_since(g.1).as_secs_f64();
+            g.0 = (g.0 + elapsed * self.rate as f64).min(cap);
+            g.1 = now;
+            if g.0 >= 1.0 {
+                let take = g.0.min(n as f64);
+                g.0 -= take;
+                n -= take as u64;
+                drop(g);
+            } else {
+                let wait = (1.0 - g.0) / self.rate as f64;
+                drop(g);
+                tokio::time::sleep(Duration::from_secs_f64(wait.clamp(0.005, 0.2))).await;
+            }
+        }
+    }
 }
 
 /// On-disk resume metadata written next to the file as `{save_path}.veloce_state`.
@@ -87,6 +132,38 @@ fn preallocate(file: &std::fs::File, len: u64) -> std::io::Result<()> {
         }
     }
     file.set_len(len)
+}
+
+/// Bytes available to an unprivileged user on the filesystem holding `path`
+/// (or its nearest existing ancestor). `None` if it cannot be determined.
+fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let mut dir = path.parent().unwrap_or_else(|| Path::new("."));
+        loop {
+            if dir.exists() {
+                let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+                unsafe {
+                    let mut st: libc::statvfs = std::mem::zeroed();
+                    if libc::statvfs(c.as_ptr(), &mut st) == 0 {
+                        return Some(st.f_bavail as u64 * st.f_frsize as u64);
+                    }
+                }
+                return None;
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => return None,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 fn header_string(headers: &reqwest::header::HeaderMap, key: reqwest::header::HeaderName) -> Option<String> {
@@ -266,6 +343,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let num_pieces = total_size.div_ceil(piece_size) as usize;
         completed_init = vec![false; num_pieces];
 
+        // Size-aware disk check: fail fast (before writing anything) if the
+        // volume can't hold the whole file plus a small safety margin.
+        const SAFETY_MARGIN: u64 = 32 * 1024 * 1024;
+        if let Some(avail) = available_space(path) {
+            if avail < total_size.saturating_add(SAFETY_MARGIN) {
+                eprintln!("❌ Insufficient disk space: need {} bytes, have {} available.", total_size, avail);
+                println!("{}", json!({
+                    "type": "fatal",
+                    "error": format!(
+                        "Insufficient disk space: need {:.1} MB, only {:.1} MB free.",
+                        total_size as f64 / 1048576.0,
+                        avail as f64 / 1048576.0
+                    )
+                }));
+                std::process::exit(1);
+            }
+        }
+
         // Reserve disk space up front.
         let file = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
@@ -315,6 +410,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let had_failure = Arc::new(AtomicBool::new(false));
     // Per-connection in-flight byte counters (each worker owns one slot — no contention).
     let worker_partial: Arc<Vec<AtomicU64>> = Arc::new((0..ceiling).map(|_| AtomicU64::new(0)).collect());
+
+    // Shared bandwidth cap (0 = unlimited).
+    let limiter = Arc::new(RateLimiter::new(args.max_rate));
 
     println!("{}", json!({
         "type": "info",
@@ -367,6 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let had_failure = Arc::clone(&had_failure);
         let worker_partial = Arc::clone(&worker_partial);
         let conn_bars = Arc::clone(&conn_bars);
+        let limiter = Arc::clone(&limiter);
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -399,7 +498,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let piece_len = end - start + 1;
                 let bar = &conn_bars[w];
 
-                let res = download_piece(&client, &url, &save_path, start, end, &worker_partial[w], bar, IDLE_TIMEOUT).await;
+                // A strict sub-range MUST come back as 206. If it covers the
+                // whole file (single-piece / no-range mode), a 200 is expected.
+                let expect_partial = piece_len < total_size;
+
+                let res = download_piece(&client, &url, &save_path, start, end, expect_partial, &worker_partial[w], bar, IDLE_TIMEOUT, &limiter).await;
                 active.fetch_sub(1, Ordering::SeqCst);
 
                 let full = res.is_ok() && worker_partial[w].load(Ordering::Relaxed) == piece_len;
@@ -488,8 +591,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     last_modified: last_modified.clone(),
                     completed: snapshot,
                 };
+                // Atomic write: a crash mid-write must never leave a truncated
+                // state file (which would defeat resume). Write to a temp file
+                // then rename — rename is atomic on the same filesystem.
                 if let Ok(json_str) = serde_json::to_string(&resume) {
-                    let _ = tokio::fs::write(&state_file, json_str).await;
+                    let tmp = format!("{state_file}.tmp");
+                    if tokio::fs::write(&tmp, json_str).await.is_ok() {
+                        let _ = tokio::fs::rename(&tmp, &state_file).await;
+                    }
                 }
 
                 println!("{}", json!({
@@ -541,15 +650,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Download one piece [start, end] (inclusive) and write it at `start`.
 /// Resets `worker_partial` to 0 and tracks live bytes there + on the bar.
 /// Aborts only on a per-read idle stall, never on total duration.
+#[allow(clippy::too_many_arguments)]
 async fn download_piece(
     client: &reqwest::Client,
     url: &str,
     save_path: &str,
     start: u64,
     end: u64,
+    expect_partial: bool,
     worker_partial: &AtomicU64,
     bar: &ProgressBar,
     idle_timeout: Duration,
+    limiter: &RateLimiter,
 ) -> anyhow::Result<()> {
     worker_partial.store(0, Ordering::Relaxed);
     let piece_len = end - start + 1;
@@ -562,8 +674,38 @@ async fn download_piece(
         .send()
         .await?;
 
-    if !res.status().is_success() {
-        anyhow::bail!("bad status {}", res.status());
+    let status = res.status();
+    let code = status.as_u16();
+
+    // The server changed the file / can't serve this offset: fail loudly so the
+    // caller can restart from scratch rather than stitch mismatched bytes.
+    if code == 416 {
+        anyhow::bail!("range not satisfiable (416) — file likely changed on the server");
+    }
+
+    // Rate limiting / temporary unavailability: respect Retry-After (capped) and
+    // back off here, which also relieves connection pressure on the origin.
+    if code == 429 || code == 503 {
+        let wait = res
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2)
+            .min(10);
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        anyhow::bail!("server busy ({code}) — backed off {wait}s");
+    }
+
+    // CRITICAL anti-corruption guard: if we asked for a sub-range but the server
+    // ignored Range and returned 200 (the full body), writing it at this piece's
+    // offset would corrupt the file. Abort the piece instead.
+    if expect_partial && code == 200 {
+        anyhow::bail!("server ignored Range (200 for a sub-range) — aborting to avoid corruption");
+    }
+
+    if !status.is_success() {
+        anyhow::bail!("bad status {status}");
     }
 
     let file = tokio::fs::OpenOptions::new().write(true).open(save_path).await?;
@@ -581,8 +723,9 @@ async fn download_piece(
             }
             Ok(None) => break,
             Ok(Some(Ok(bytes))) => {
-                writer.write_all(&bytes).await?;
                 let n = bytes.len() as u64;
+                limiter.acquire(n).await; // enforce the global bandwidth cap
+                writer.write_all(&bytes).await?;
                 worker_partial.fetch_add(n, Ordering::Relaxed);
                 bar.inc(n);
             }

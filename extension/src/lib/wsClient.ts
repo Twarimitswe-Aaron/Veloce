@@ -4,7 +4,7 @@ export const isConnected = writable(false);
 export const selectedDirectory = writable<string | null>(null);
 export const pickerError = writable<string | null>(null);
 
-export type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'error';
+export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
 
 export interface DownloadItem {
 	id: string;
@@ -100,14 +100,34 @@ class VeloceWebSocketClient {
 
 					case 'DOWNLOAD_COMPLETED':
 						upsertDownload(data.downloadId, {
-							status: (data.status as DownloadStatus) ?? 'completed'
+							status: (data.status as DownloadStatus) ?? 'completed',
+							speedBps: 0,
+							etaSecs: 0
+						});
+						break;
+
+					case 'DOWNLOAD_PAUSED':
+						upsertDownload(data.downloadId, {
+							status: 'paused',
+							speedBps: 0,
+							etaSecs: 0
+						});
+						break;
+
+					case 'DOWNLOAD_REMOVED':
+						downloads.update((map) => {
+							const next = { ...map };
+							delete next[data.downloadId];
+							return next;
 						});
 						break;
 
 					case 'DOWNLOAD_ERROR':
 						upsertDownload(data.downloadId, {
 							status: 'error',
-							error: data.error ?? 'Download failed'
+							error: data.error ?? 'Download failed',
+							speedBps: 0,
+							etaSecs: 0
 						});
 						break;
 
@@ -149,6 +169,30 @@ class VeloceWebSocketClient {
 		} else {
 			console.error('[Veloce Extension] Cannot send request, Local Coordinator is disconnected.');
 		}
+	}
+
+	private sendControl(type: string, downloadId: string) {
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			this.ws.send(JSON.stringify({ type, downloadId }));
+		} else {
+			console.error(`[Veloce Extension] Cannot send ${type}, Local Coordinator is disconnected.`);
+		}
+	}
+
+	pauseDownload(id: string) {
+		this.sendControl('PAUSE_DOWNLOAD', id);
+	}
+
+	resumeDownload(id: string) {
+		this.sendControl('RESUME_DOWNLOAD', id);
+	}
+
+	cancelDownload(id: string) {
+		this.sendControl('CANCEL_DOWNLOAD', id);
+	}
+
+	removeDownload(id: string) {
+		this.sendControl('REMOVE_DOWNLOAD', id);
 	}
 
 	requestDirectoryPicker() {

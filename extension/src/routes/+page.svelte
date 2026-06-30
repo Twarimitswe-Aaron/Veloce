@@ -181,6 +181,7 @@
 							{d.status === 'completed' ? 'bg-emerald-500/15 text-emerald-400'
 							: d.status === 'error' ? 'bg-red-500/15 text-red-400'
 							: d.status === 'downloading' ? 'bg-blue-500/15 text-blue-400'
+							: d.status === 'paused' ? 'bg-amber-500/15 text-amber-400'
 							: 'bg-gray-700/40 text-gray-400'}"
 						>
 							{d.status}
@@ -206,6 +207,28 @@
 							{/if}
 						</div>
 					{/if}
+
+					<div class="flex items-center gap-2 pt-0.5">
+						{#if d.status === 'downloading' || d.status === 'queued'}
+							<button type="button" onclick={() => wsClient.pauseDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Pause</button>
+							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-red-600/80 text-gray-300 transition-colors cursor-pointer">Cancel</button>
+						{:else if d.status === 'paused'}
+							<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-blue-600/80 hover:bg-blue-500 text-white transition-colors cursor-pointer">Resume</button>
+							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-red-600/80 text-gray-300 transition-colors cursor-pointer">Cancel</button>
+						{:else if d.status === 'error'}
+							<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-blue-600/80 hover:bg-blue-500 text-white transition-colors cursor-pointer">Retry</button>
+							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Remove</button>
+						{:else if d.status === 'completed'}
+							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
+								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Remove</button>
+						{/if}
+					</div>
 				</div>
 			{/each}
 		</div>
