@@ -35,6 +35,8 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Dynamic work-stealing segmentation** — 4 MiB pieces on a lock-free `crossbeam` queue. Claiming a piece, accounting bytes, and marking completion are all **O(1)**. Fast connections naturally download more pieces; slow ones download fewer.
 *   **Adaptive concurrency** — starts at the requested connection count, **halves** on connection errors to ease server pressure, and **ramps back up** to the ceiling after sustained success (most managers only ratchet down).
 *   **Range-support probe** — sends a `bytes=0-0` probe; if the server ignores ranges it transparently falls back to a single connection (prevents multi-connection file corruption).
+*   **Robust size discovery** — tries `HEAD`, then falls back to a 1-byte ranged `GET` (reading `Content-Range`/`Content-Length`). This makes signed/CDN URLs that don't answer `HEAD` with a length — e.g. Instagram/fbcdn — downloadable.
+*   **Browser User-Agent** — sends a realistic Chrome UA so CDNs that reject default library agents with `403` are handled.
 *   **Idle-stall timeout** — a piece is aborted only if **no bytes arrive for 30 s**, never on a total-time deadline, so legitimately slow transfers are not killed.
 *   **Crash-safe resume** — a `.veloce_state` sidecar stores a per-piece completion bitmap plus the server's `ETag`/`Last-Modified`. On restart only the missing pieces are fetched; if the file changed server-side the resume is rejected to avoid corruption. A `.veloce_done` sidecar marks true completion.
 *   **Real preallocation** — `posix_fallocate` reserves disk blocks up front (falls back to `set_len`), so a full disk fails fast and fragmentation is reduced.
@@ -42,6 +44,8 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 
 ### Coordinator (`backend/`)
 *   **Global download scheduler** — caps concurrent engine processes (default 3); extra jobs queue FIFO and start as slots free.
+*   **Media resolution with cookie fallback** — resolves direct URLs via yt-dlp, trying Chrome → Firefox → no-cookies, so login-gated, extension-less links (e.g. Instagram reels) resolve to a single progressive `mp4`.
+*   **Completion cleanup** — once a download is recorded `completed` in the DB, the engine's `.veloce_done`/`.veloce_state` markers are permanently removed (unlinked, not sent to trash) to keep the download folder clean.
 *   **Fail-closed safety** — aborts (instead of downloading page HTML) when media-URL extraction fails, and aborts when free disk space can't be verified.
 *   **No stuck rows** — handles spawn (`ENOENT`) and exit via a single-settle guard; every job ends as `completed` or `error`.
 *   **Smart dedup** — a `completed` download is only skipped if its bytes still exist on disk; deleted files can be re-fetched.

@@ -7,7 +7,7 @@ import { eq, or, sql } from 'drizzle-orm';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
-import { statfs } from 'fs/promises';
+import { statfs, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import { extractMediaUrl } from './extractor';
@@ -360,6 +360,13 @@ export function setupWebSocketServer(server: Server) {
 									if (settled) return;
 									settled = true;
 									await db.update(downloads).set({ status }).where(eq(downloads.id, downloadId));
+									if (status === 'completed') {
+										// The DB row is now the durable "completed" record, so the
+										// engine's on-disk markers are just clutter. Remove them
+										// permanently (unlink, not move-to-trash).
+										await unlink(`${savePath}.veloce_done`).catch(() => {});
+										await unlink(`${savePath}.veloce_state`).catch(() => {});
+									}
 									if (ws.readyState === 1) {
 										if (status === 'error') {
 											ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId, error: errorMsg ?? 'Download failed' }));

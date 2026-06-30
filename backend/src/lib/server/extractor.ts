@@ -24,21 +24,65 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         return null;
     }
 
-    // 2. yt-dlp Extractor for everything else
+    // 2. yt-dlp Extractor for everything else (YouTube, Instagram, TikTok, ...).
+    //    Many sites (e.g. Instagram reels) need login cookies and the URL has no
+    //    file extension. We try several cookie sources in order and take the
+    //    first that yields a direct media URL.
+    const cookieStrategies: string[][] = [
+        ['--cookies-from-browser', 'chrome'],
+        ['--cookies-from-browser', 'firefox'],
+        [] // no cookies — works for fully public media
+    ];
+
+    for (const cookieArgs of cookieStrategies) {
+        const label = cookieArgs.length ? cookieArgs[1] : 'no-cookies';
+        const directUrl = await runYtDlp(url, cookieArgs);
+        if (directUrl) {
+            console.log(`[Extractor] Resolved via yt-dlp (${label})`);
+            return directUrl;
+        }
+        console.error(`[Extractor] yt-dlp attempt failed (${label}) for ${url}`);
+    }
+
+    console.error(`[Extractor] All yt-dlp strategies failed for ${url}`);
+    return null;
+}
+
+/**
+ * Run yt-dlp once with a given cookie strategy and return the first direct
+ * media URL, or null on failure/timeout. Uses `-f b` (best progressive stream)
+ * so the engine receives a single downloadable URL with audio+video combined.
+ */
+function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
     return new Promise((resolve) => {
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
-        const ytdlp = spawn(ytdlpPath, ['--cookies-from-browser', 'chrome', '-f', 'b', '-g', url]);
-        
-        let output = '';
+        const ytdlp = spawn(ytdlpPath, [
+            ...cookieArgs,
+            // Best SINGLE progressive file (audio+video in one URL). We avoid
+            // split video+audio formats because the engine downloads one URL.
+            '-f', 'b/best',
+            '--no-playlist',
+            '-g',
+            url
+        ]);
 
-        // FIX #5: Kill yt-dlp after 30s to prevent infinite hang when
-        // Chrome is locked, cookies are inaccessible, or network stalls.
+        let output = '';
+        let settled = false;
+        const done = (result: string | null) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            resolve(result);
+        };
+
+        // Kill yt-dlp after 30s to avoid hanging when a browser is locked,
+        // cookies are inaccessible, or the network stalls.
         const timeout = setTimeout(() => {
             ytdlp.kill();
             console.error(`[yt-dlp] Timed out after 30s for: ${url}`);
-            resolve(null);
+            done(null);
         }, 30_000);
-        
+
         ytdlp.stdout.on('data', (data) => {
             output += data.toString();
         });
@@ -46,21 +90,19 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         ytdlp.stderr.on('data', (data) => {
             console.error(`[yt-dlp log]: ${data.toString().trim()}`);
         });
-        
+
         ytdlp.on('close', (code) => {
-            clearTimeout(timeout);
             if (code === 0 && output.trim()) {
-                resolve(output.trim().split('\n')[0]);
+                // With merged formats yt-dlp may print multiple URLs; take the first.
+                done(output.trim().split('\n')[0]);
             } else {
-                console.error(`yt-dlp failed for url ${url}`);
-                resolve(null);
+                done(null);
             }
         });
-        
+
         ytdlp.on('error', (err) => {
-            clearTimeout(timeout);
             console.error('yt-dlp error (is it installed?):', err);
-            resolve(null);
+            done(null);
         });
     });
 }

@@ -1,7 +1,7 @@
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, ETAG, LAST_MODIFIED, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::SeekFrom;
@@ -93,6 +93,63 @@ fn header_string(headers: &reqwest::header::HeaderMap, key: reqwest::header::Hea
     headers.get(key).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
 }
 
+fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+}
+
+/// Extract the total size from a `Content-Range: bytes 0-0/12345` header.
+fn parse_total_from_content_range(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let v = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    v.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|s| *s > 0)
+}
+
+/// Discover `(total_size, etag, last_modified, ranges_supported_hint)`.
+/// HEAD is tried first; if it fails or omits a usable `Content-Length` (very
+/// common for signed CDN URLs such as Instagram/fbcdn), we fall back to a
+/// 1-byte ranged GET and read the size from `Content-Range`/`Content-Length`.
+async fn discover(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<(u64, Option<String>, Option<String>, Option<bool>)> {
+    if let Ok(head) = client.head(url).send().await {
+        if head.status().is_success() {
+            if let Some(len) = parse_content_length(head.headers()) {
+                let etag = header_string(head.headers(), ETAG);
+                let lm = header_string(head.headers(), LAST_MODIFIED);
+                let ar = head
+                    .headers()
+                    .get(ACCEPT_RANGES)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("bytes"));
+                return Ok((len, etag, lm, ar));
+            }
+        }
+    }
+
+    // Fallback: a ranged GET reveals size even when HEAD is unhelpful.
+    let res = client.get(url).header(RANGE, "bytes=0-0").send().await?;
+    let status = res.status();
+    let etag = header_string(res.headers(), ETAG);
+    let lm = header_string(res.headers(), LAST_MODIFIED);
+
+    if status.as_u16() == 206 {
+        if let Some(total) = parse_total_from_content_range(res.headers()) {
+            return Ok((total, etag, lm, Some(true)));
+        }
+    }
+    if status.is_success() {
+        if let Some(len) = parse_content_length(res.headers()) {
+            // A 200 response to a range request means ranges are ignored.
+            return Ok((len, etag, lm, Some(false)));
+        }
+    }
+    anyhow::bail!("could not determine file size (status {status})");
+}
+
 /// Resume is only valid if the file identity matches. We compare any validators
 /// both sides actually provided; unknown validators are treated as compatible.
 fn validators_match(state: &ResumeState, etag: &Option<String>, last_modified: &Option<String>) -> bool {
@@ -125,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // governed by a per-read idle timeout, never a total-request deadline.
     let client = Arc::new(
         reqwest::Client::builder()
+            // A browser-like User-Agent — many CDNs (Instagram/fbcdn, Cloudflare,
+            // etc.) reject default library agents with 403.
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .tcp_keepalive(Duration::from_secs(30))
             .tcp_nodelay(true)
             .no_gzip()
@@ -134,28 +194,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
     );
 
-    // Discover size + validators via HEAD.
-    let head_res = client.head(&args.url).send().await?;
-    if !head_res.status().is_success() {
-        eprintln!("HEAD failed: {}", head_res.status());
-        std::process::exit(1);
-    }
-
-    let total_size = match head_res
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(s) if s > 0 => s,
-        _ => {
-            eprintln!("No Content-Length.");
+    // Discover size + validators (HEAD, falling back to a ranged GET).
+    let (total_size, etag, last_modified, ranges_hint) = match discover(&client, &args.url).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Discovery failed: {e}");
             std::process::exit(1);
         }
     };
-
-    let etag = header_string(head_res.headers(), ETAG);
-    let last_modified = header_string(head_res.headers(), LAST_MODIFIED);
 
     // Already complete? The sidecar is authoritative (a pre-allocated file
     // always equals total_size even when empty).
@@ -206,7 +252,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // If the server ignores ranges, a single piece covering the whole file
         // is the only safe layout (every ranged GET would return the full body).
-        let ranges_ok = args.threads > 1 && supports_ranges(&client, &args.url).await;
+        // Reuse the hint from discovery; only probe again if it was inconclusive.
+        let ranges_ok = args.threads > 1
+            && match ranges_hint {
+                Some(v) => v,
+                None => supports_ranges(&client, &args.url).await,
+            };
         if !ranges_ok {
             eprintln!("⚠️  Server does not support range requests — using a single connection.");
         }
