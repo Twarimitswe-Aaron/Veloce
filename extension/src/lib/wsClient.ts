@@ -61,6 +61,26 @@ class VeloceWebSocketClient {
 				console.log('[Veloce Extension] Received message:', data);
 
 				switch (data.type) {
+					case 'DOWNLOAD_SNAPSHOT':
+						// Rebuild the list from the backend's view (popup reopened).
+						if (Array.isArray(data.downloads)) {
+							const map: Record<string, DownloadItem> = {};
+							for (const d of data.downloads) {
+								map[d.downloadId] = {
+									id: d.downloadId,
+									fileName: d.fileName ?? 'Unknown file',
+									status: (d.status as DownloadStatus) ?? 'queued',
+									downloaded: d.downloaded ?? 0,
+									total: d.total ?? 0,
+									speedBps: 0,
+									etaSecs: 0,
+									updatedAt: Date.now()
+								};
+							}
+							downloads.set(map);
+						}
+						break;
+
 					case 'DOWNLOAD_ACK':
 						upsertDownload(data.downloadId, {
 							fileName: data.fileName ?? 'Unknown file',

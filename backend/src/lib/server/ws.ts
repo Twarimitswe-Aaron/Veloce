@@ -3,7 +3,7 @@ import type { Server } from 'http';
 import { db } from './db';
 import { downloads, devices } from './db/schema';
 import { getMacAddress } from './identity';
-import { eq, or } from 'drizzle-orm';
+import { eq, or, sql } from 'drizzle-orm';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
@@ -49,6 +49,35 @@ function pickDirectory(): string | null {
 	console.error('❌ No graphical folder picker available (tried zenity, kdialog).');
 	return null;
 }
+
+/**
+ * Global download scheduler (per backend process). Caps how many engine
+ * processes run at once so multiple downloads don't fight for bandwidth,
+ * sockets, and disk. Jobs queued beyond the cap wait their turn (FIFO).
+ */
+const MAX_CONCURRENT_DOWNLOADS = 3;
+let activeDownloads = 0;
+const pendingJobs: Array<() => Promise<void>> = [];
+
+function pumpScheduler() {
+	while (activeDownloads < MAX_CONCURRENT_DOWNLOADS && pendingJobs.length > 0) {
+		const job = pendingJobs.shift()!;
+		activeDownloads++;
+		job()
+			.catch((e) => console.error('❌ Scheduled download job failed:', e))
+			.finally(() => {
+				activeDownloads--;
+				pumpScheduler();
+			});
+	}
+}
+
+/** Queue a download job; it runs when a concurrency slot frees up. */
+function scheduleDownload(job: () => Promise<void>) {
+	pendingJobs.push(job);
+	pumpScheduler();
+}
+
 export function setupWebSocketServer(server: Server) {
 	const wss = new WebSocketServer({ server, path: '/ws' });
 	
@@ -83,6 +112,29 @@ export function setupWebSocketServer(server: Server) {
 			}
 		} catch (err) {
 			console.error('Failed to initialize device identity:', err);
+		}
+
+		// Rehydrate the popup: send a snapshot of recent/active downloads so the
+		// UI survives the popup being closed and reopened mid-download.
+		try {
+			const recent = await db.select().from(downloads)
+				.where(eq(downloads.deviceId, macAddress))
+				.orderBy(sql`rowid desc`)
+				.limit(20);
+			if (ws.readyState === 1 && recent.length > 0) {
+				ws.send(JSON.stringify({
+					type: 'DOWNLOAD_SNAPSHOT',
+					downloads: recent.map((d) => ({
+						downloadId: d.id,
+						fileName: d.fileName,
+						status: d.status,
+						downloaded: d.downloadedBytes ?? 0,
+						total: d.totalBytes ?? 0
+					}))
+				}));
+			}
+		} catch (err) {
+			console.error('Failed to send download snapshot:', err);
 		}
 
 		ws.on('message', async (message) => {
@@ -204,8 +256,9 @@ export function setupWebSocketServer(server: Server) {
 						
 						console.log(`✅ Download queued in database with ID: ${downloadId}`);
 						
-						// 5. Implement Background yt-dlp, Disk Space Check, and Spawn Rust Core Engine
-						(async () => {
+						// 5. Schedule background yt-dlp, disk-space check, and engine spawn.
+						//    The job holds a concurrency slot until the engine process exits.
+						scheduleDownload(async () => {
 							try {
 								let finalUrl = rawUrl;
 								
@@ -297,6 +350,10 @@ export function setupWebSocketServer(server: Server) {
 									stdio: ['ignore', 'pipe', 'inherit']
 								});
 
+								// Resolves the scheduler job (frees the slot) once the engine settles.
+								let resolveProc!: () => void;
+								const procDone = new Promise<void>((r) => { resolveProc = r; });
+
 								// Guard so 'already_exists' / 'error' / 'close' can't settle twice.
 								let settled = false;
 								const settle = async (status: 'completed' | 'error', errorMsg?: string) => {
@@ -310,6 +367,7 @@ export function setupWebSocketServer(server: Server) {
 											ws.send(JSON.stringify({ type: 'DOWNLOAD_COMPLETED', downloadId, status }));
 										}
 									}
+									resolveProc();
 								};
 
 								// FIX #3: Line buffer — a single `data` event may contain multiple
@@ -384,6 +442,9 @@ export function setupWebSocketServer(server: Server) {
 									await settle(code === 0 ? 'completed' : 'error', `Engine exited with code ${code}`);
 								});
 
+								// Hold the scheduler slot until the engine process settles.
+								await procDone;
+
 							} catch (e) {
 								console.error('❌ Background processing failed:', e);
 								// Never leave a row stuck in queued/downloading on an unexpected throw.
@@ -394,7 +455,7 @@ export function setupWebSocketServer(server: Server) {
 									}
 								} catch {}
 							}
-						})();
+						});
 					}
 				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
 					console.log('🔄 Directory picker requested by frontend');
