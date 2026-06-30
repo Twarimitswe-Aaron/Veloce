@@ -132,6 +132,51 @@
 		return raw;
 	}
 
+	/** Canonical key so /p/X/, /p/X, and query variants dedupe to one badge. */
+	function normalizeBadgeKey(url) {
+		try {
+			const u = new URL(url);
+			u.hash = '';
+			if (VIDEO_SITES.test(u.hostname) && /\/(p|reel|tv)\//.test(u.pathname)) {
+				const path = u.pathname.replace(/\/+$/, '');
+				return `${u.origin}${path}`;
+			}
+			return `${u.origin}${u.pathname}${u.search}`;
+		} catch {
+			return url;
+		}
+	}
+
+	/** One badge per feed card / post — not per carousel slide or nested media node. */
+	function findBadgeRoot(anchor) {
+		if (!anchor?.closest) return anchor;
+
+		const tag = anchor.tagName?.toLowerCase();
+		if (tag === 'a') {
+			const href = anchor.href || '';
+			if (anchor.hasAttribute('download') || FILE_EXT.test(href)) {
+				return anchor;
+			}
+		}
+
+		const semantic = anchor.closest('article, [role="article"], [data-testid="tweet"]');
+		if (semantic) return semantic;
+
+		if (VIDEO_SITES.test(location.hostname)) {
+			let node = anchor;
+			let candidate = anchor;
+			for (let i = 0; i < 18 && node; i++) {
+				const postLinks = node.querySelectorAll?.('a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]');
+				if (postLinks?.length >= 1) candidate = node;
+				if (postLinks?.length === 1 && node.offsetHeight > 80) return node;
+				node = node.parentElement;
+			}
+			return candidate;
+		}
+
+		return anchor;
+	}
+
 	const host = document.createElement('div');
 	host.id = 'veloce-host';
 	document.documentElement.appendChild(host);
@@ -200,6 +245,22 @@
 			color: rgba(255,255,255,0.75);
 			line-height: 1.4;
 		}
+		.menu-loading {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+		}
+		.menu-spinner {
+			width: 12px;
+			height: 12px;
+			flex-shrink: 0;
+			border: 2px solid rgba(255,255,255,0.25);
+			border-top-color: #ffffff;
+			animation: veloce-spin 0.65s linear infinite;
+		}
+		@keyframes veloce-spin {
+			to { transform: rotate(360deg); }
+		}
 		.menu-close {
 			display: block;
 			width: 100%;
@@ -215,7 +276,9 @@
 	`;
 	shadow.appendChild(style);
 
-	const badges = new Map(); // resolvedUrl -> { el, anchor, rawUrl }
+	const badges = new Map(); // badgeKey -> { el, anchor, root, rawUrl, resolvedUrl }
+	const badgeKeys = new Set();
+	const badgeRoots = new WeakSet();
 	let openMenu = null;
 
 	function closeMenu() {
@@ -241,9 +304,27 @@
 		return s;
 	}
 
+	function removeBadge(key) {
+		const entry = badges.get(key);
+		if (!entry) return;
+		entry.el.remove();
+		badges.delete(key);
+		badgeKeys.delete(key);
+	}
+
+	function pruneBadges() {
+		for (const [key, entry] of badges) {
+			if (!entry.root?.isConnected) removeBadge(key);
+		}
+	}
+
 	function placeBadge(resolvedUrl, anchor, rawUrl) {
-		if (badges.has(resolvedUrl)) return;
-		vlog('Badge placed', { resolvedUrl, rawUrl, anchor: describeAnchor(anchor) });
+		const badgeKey = normalizeBadgeKey(resolvedUrl);
+		const root = findBadgeRoot(anchor);
+
+		if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
+
+		vlog('Badge placed', { badgeKey, resolvedUrl, rawUrl, anchor: describeAnchor(anchor) });
 		const el = document.createElement('div');
 		el.className = 'badge';
 		el.appendChild(iconSvg());
@@ -255,16 +336,22 @@
 			e.preventDefault();
 			e.stopPropagation();
 			console.group('%c[Veloce] Badge clicked', 'color:#7ec8ff;font-weight:bold');
-			vlog('Badge click', { rawUrl, resolvedUrl, anchor: describeAnchor(anchor) });
+			vlog('Badge click', { rawUrl, resolvedUrl, badgeKey, anchor: describeAnchor(anchor) });
 			openFormatMenu(rawUrl, anchor, el);
 			console.groupEnd();
 		});
 
 		shadow.appendChild(el);
-		badges.set(resolvedUrl, { el, anchor, rawUrl });
+		badgeKeys.add(badgeKey);
+		badgeRoots.add(root);
+		badges.set(badgeKey, { el, anchor, root, rawUrl, resolvedUrl });
+
+		try {
+			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FORMATS', url: resolvedUrl });
+		} catch { /* ignore */ }
 
 		const updatePos = () => {
-			const rect = anchor.getBoundingClientRect();
+			const rect = root.getBoundingClientRect();
 			if (rect.width === 0 && rect.height === 0) {
 				el.style.display = 'none';
 				return;
@@ -275,7 +362,7 @@
 		};
 		updatePos();
 		const ro = new ResizeObserver(updatePos);
-		ro.observe(anchor);
+		ro.observe(root);
 		window.addEventListener('scroll', updatePos, { passive: true });
 		window.addEventListener('resize', updatePos, { passive: true });
 	}
@@ -293,6 +380,78 @@
 		}
 		menu.style.top = `${top}px`;
 		menu.style.left = `${Math.max(8, left)}px`;
+	}
+
+	function showLoadingStatus(menu, closeBtn, rawUrl) {
+		const status = document.createElement('div');
+		status.className = 'menu-status menu-loading';
+
+		const spinner = document.createElement('div');
+		spinner.className = 'menu-spinner';
+		status.appendChild(spinner);
+
+		const text = document.createElement('span');
+		text.textContent = isBrowserOnlyUrl(rawUrl) ? 'Resolving post URL…' : 'Loading formats…';
+		status.appendChild(text);
+
+		menu.insertBefore(status, closeBtn);
+
+		const t0 = Date.now();
+		const timer = setInterval(() => {
+			const secs = Math.floor((Date.now() - t0) / 1000);
+			if (secs > 0) {
+				text.textContent = isBrowserOnlyUrl(rawUrl)
+					? `Resolving post URL… ${secs}s`
+					: `Loading formats… ${secs}s`;
+			}
+		}, 400);
+
+		return {
+			stop() {
+				clearInterval(timer);
+				status.remove();
+			},
+			setInstant() {
+				clearInterval(timer);
+				text.textContent = 'Ready';
+			}
+		};
+	}
+
+	function renderFormatButtons(menu, closeBtn, formats, url) {
+		for (const fmt of formats) {
+			const btn = document.createElement('button');
+			btn.className = 'menu-item';
+			btn.textContent = fmt.label;
+			btn.addEventListener('click', (e) => {
+				e.stopPropagation();
+				closeMenu();
+				const stem = fmt.label.split(' — ')[0] || 'download';
+				const fileName = `${stem}${fmt.ext || '.mp4'}`.replace(/[\\/:*?"<>|]/g, '_');
+				chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
+					const payload = {
+						url,
+						directUrl: fmt.url,
+						fileName,
+						ext: fmt.ext,
+						baseDirectory: cfg.veloce_base_dir || undefined,
+						threads: 8
+					};
+					console.group('%c[Veloce] Format selected → download', 'color:#7ec8ff;font-weight:bold');
+					vlog('Download config', {
+						selectedFormat: fmt.label,
+						payload,
+						intercept: cfg.veloce_intercept !== false,
+						saveDir: cfg.veloce_base_dir || '(coordinator default)'
+					});
+					chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (ack) => {
+						vlog('NEW_DOWNLOAD ack', ack);
+						console.groupEnd();
+					});
+				});
+			});
+			menu.insertBefore(btn, closeBtn);
+		}
 	}
 
 	function openFormatMenu(rawUrl, anchor, badgeEl) {
@@ -327,17 +486,23 @@
 			return;
 		}
 
-		const status = document.createElement('div');
-		status.className = 'menu-status';
-		status.textContent = isBrowserOnlyUrl(rawUrl)
-			? 'Resolving via post URL…'
-			: 'Loading formats…';
-		menu.insertBefore(status, closeBtn);
+		let busyPort = null;
+		try {
+			busyPort = chrome.runtime.connect({ name: 'veloce-busy' });
+		} catch { /* ignore */ }
+
+		const loading = showLoadingStatus(menu, closeBtn, rawUrl);
 
 		vlog('LIST_FORMATS → backend', { requestUrl: url, rawUrl });
 		chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url }, (resp) => {
+			if (busyPort) {
+				try { busyPort.disconnect(); } catch { /* ignore */ }
+				busyPort = null;
+			}
 			if (!openMenu) return;
-			status.remove();
+
+			if (resp?.cached) loading.setInstant();
+			loading.stop();
 
 			vlog('LIST_FORMATS ← response', resp);
 
@@ -356,51 +521,21 @@
 				url: f.url?.slice?.(0, 120)
 			})));
 
-			for (const fmt of resp.formats) {
-				const btn = document.createElement('button');
-				btn.className = 'menu-item';
-				btn.textContent = fmt.label;
-				btn.addEventListener('click', (e) => {
-					e.stopPropagation();
-					closeMenu();
-					const stem = fmt.label.split(' — ')[0] || 'download';
-					const fileName = `${stem}${fmt.ext || '.mp4'}`.replace(/[\\/:*?"<>|]/g, '_');
-					chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
-						const payload = {
-							url,
-							directUrl: fmt.url,
-							fileName,
-							ext: fmt.ext,
-							baseDirectory: cfg.veloce_base_dir || undefined,
-							threads: 8
-						};
-						console.group('%c[Veloce] Format selected → download', 'color:#7ec8ff;font-weight:bold');
-						vlog('Download config', {
-							selectedFormat: fmt.label,
-							payload,
-							intercept: cfg.veloce_intercept !== false,
-							saveDir: cfg.veloce_base_dir || '(coordinator default)'
-						});
-						chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (ack) => {
-							vlog('NEW_DOWNLOAD ack', ack);
-							console.groupEnd();
-						});
-					});
-				});
-				menu.insertBefore(btn, closeBtn);
-			}
+			renderFormatButtons(menu, closeBtn, resp.formats, url);
 		});
 	}
 
 	function scan() {
-		const seen = new Set();
+		pruneBadges();
 
 		function tryBadge(rawUrl, anchor) {
 			const url = resolveDownloadUrl(rawUrl, anchor);
-			if (!url || seen.has(url)) return;
-			seen.add(url);
+			if (!url) return;
+			const badgeKey = normalizeBadgeKey(url);
+			const root = findBadgeRoot(anchor);
+			if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
 			if (debugOn) {
-				vlog('Scan match', { rawUrl, resolvedUrl: url, anchor: describeAnchor(anchor) });
+				vlog('Scan match', { rawUrl, resolvedUrl: url, badgeKey, anchor: describeAnchor(anchor) });
 			}
 			placeBadge(url, anchor, rawUrl);
 		}
@@ -419,10 +554,6 @@
 		document.querySelectorAll('video, audio').forEach((el) => {
 			const src = el.currentSrc || el.src;
 			if (src) tryBadge(src, el);
-		});
-
-		document.querySelectorAll('video source[src], audio source[src]').forEach((el) => {
-			if (el.src) tryBadge(el.src, el.parentElement || el);
 		});
 	}
 

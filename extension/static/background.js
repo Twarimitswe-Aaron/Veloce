@@ -15,6 +15,7 @@ const pendingFormatRequests = new Map(); // requestId -> { sendResponse, url? }
 
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const formatCache = new Map(); // url -> { formats, ts }
+const inflightFormatUrls = new Set();
 
 function getFormatCache(url) {
 	const hit = formatCache.get(url);
@@ -27,9 +28,25 @@ function setFormatCache(url, formats) {
 }
 
 function prefetchFormats(url) {
-	if (!url || getFormatCache(url)) return;
+	if (!url || getFormatCache(url) || inflightFormatUrls.has(url)) return;
 	vlog('prefetch formats', url);
-	void requestFormatsFromCoordinator(url, () => {});
+	inflightFormatUrls.add(url);
+	void requestFormatsFromCoordinator(url, (data) => {
+		inflightFormatUrls.delete(url);
+		if (data.formats?.length) setFormatCache(url, data.formats);
+	});
+}
+
+async function waitForInflightFormats(url, maxMs = 25000) {
+	if (!inflightFormatUrls.has(url)) return getFormatCache(url);
+	const start = Date.now();
+	while (Date.now() - start < maxMs) {
+		const hit = getFormatCache(url);
+		if (hit?.length) return hit;
+		if (!inflightFormatUrls.has(url)) break;
+		await new Promise((r) => setTimeout(r, 200));
+	}
+	return getFormatCache(url);
 }
 
 let debugOn = true;
@@ -131,6 +148,7 @@ function handleWsMessage(data) {
 			});
 			if (pending) {
 				pendingFormatRequests.delete(data.requestId);
+				if (pending.url) inflightFormatUrls.delete(pending.url);
 				if (data.type === 'FORMATS_LIST' && pending.url && data.formats?.length) {
 					setFormatCache(pending.url, data.formats);
 				}
@@ -222,14 +240,17 @@ async function requestFormatsFromCoordinator(url, sendResponse) {
 	}
 
 	const requestId = crypto.randomUUID();
+	inflightFormatUrls.add(url);
 	pendingFormatRequests.set(requestId, { sendResponse, url });
 	if (!wsSend({ type: 'LIST_FORMATS', requestId, payload: { url } })) {
+		inflightFormatUrls.delete(url);
 		pendingFormatRequests.delete(requestId);
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
 		return;
 	}
 	setTimeout(() => {
 		if (pendingFormatRequests.has(requestId)) {
+			inflightFormatUrls.delete(url);
 			pendingFormatRequests.delete(requestId);
 			sendResponse({ type: 'FORMATS_ERROR', error: 'Format list timed out' });
 		}
@@ -237,7 +258,10 @@ async function requestFormatsFromCoordinator(url, sendResponse) {
 }
 
 async function listFormats(url, sendResponse, sender) {
-	const cached = getFormatCache(url);
+	let cached = getFormatCache(url);
+	if (!cached?.length) {
+		cached = await waitForInflightFormats(url);
+	}
 	if (cached?.length) {
 		vlog('format cache hit (extension)', url);
 		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
@@ -313,6 +337,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 			listFormats(msg.url, sendResponse, _sender);
 			return true;
 
+		case 'VELOCE_PREFETCH_FORMATS':
+			prefetchFormats(msg.url);
+			return false;
+
 		case 'VELOCE_CONTROL':
 			(async () => {
 				await ensureConnected();
@@ -343,7 +371,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-	if (port.name === 'veloce-popup') {
+	if (port.name === 'veloce-popup' || port.name === 'veloce-busy') {
 		connectWs();
 	}
 });
