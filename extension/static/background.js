@@ -24,15 +24,16 @@ function getFormatCache(url) {
 }
 
 function setFormatCache(url, formats) {
-	if (formats?.length) formatCache.set(url, { formats, ts: Date.now() });
+	if (formats?.length) {
+		formatCache.set(url, { formats, ts: Date.now() });
+		broadcastToExtension({ type: 'VELOCE_FORMATS_READY', url, formats });
+	}
 }
 
 function prefetchFormats(url) {
+	connectWs();
 	if (!url || getFormatCache(url) || inflightFormatUrls.has(url)) return;
-	vlog('prefetch formats', url);
-	inflightFormatUrls.add(url);
 	void requestFormatsFromCoordinator(url, (data) => {
-		inflightFormatUrls.delete(url);
 		if (data.formats?.length) setFormatCache(url, data.formats);
 	});
 }
@@ -47,16 +48,6 @@ async function waitForInflightFormats(url, maxMs = 25000) {
 		await new Promise((r) => setTimeout(r, 200));
 	}
 	return getFormatCache(url);
-}
-
-let debugOn = true;
-chrome.storage.local.get('veloce_debug', (r) => {
-	debugOn = r.veloce_debug !== false;
-});
-
-function vlog(...args) {
-	if (!debugOn) return;
-	console.log('%c[Veloce SW]', 'color:#7ec8ff;font-weight:bold', ...args);
 }
 
 function broadcastToExtension(msg) {
@@ -141,11 +132,6 @@ function handleWsMessage(data) {
 		case 'FORMATS_LIST':
 		case 'FORMATS_ERROR': {
 			const pending = pendingFormatRequests.get(data.requestId);
-			vlog(`WS ← ${data.type}`, {
-				requestId: data.requestId,
-				formatCount: data.formats?.length,
-				error: data.error
-			});
 			if (pending) {
 				pendingFormatRequests.delete(data.requestId);
 				if (pending.url) inflightFormatUrls.delete(pending.url);
@@ -168,7 +154,6 @@ function connectWs() {
 
 	ws.onopen = () => {
 		reconnectDelay = RECONNECT_BASE_MS;
-		console.log('[Veloce] Connected to Local Coordinator');
 		setConnected(true);
 	};
 
@@ -181,12 +166,8 @@ function connectWs() {
 	};
 
 	ws.onclose = () => {
-		const wasConnected = connected;
 		ws = null;
 		setConnected(false);
-		if (wasConnected) {
-			console.log('[Veloce] Disconnected — retrying…');
-		}
 		clearTimeout(reconnectTimer);
 		reconnectTimer = setTimeout(() => {
 			connectWs();
@@ -223,7 +204,6 @@ function wsSend(obj) {
 }
 
 async function startDownload(payload) {
-	vlog('WS → NEW_DOWNLOAD', payload);
 	const ok = await ensureConnected();
 	if (!ok || !wsSend({ type: 'NEW_DOWNLOAD', payload })) {
 		console.error('[Veloce] Cannot download — coordinator offline');
@@ -263,12 +243,10 @@ async function listFormats(url, sendResponse, sender) {
 		cached = await waitForInflightFormats(url);
 	}
 	if (cached?.length) {
-		vlog('format cache hit (extension)', url);
 		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
 		return;
 	}
 
-	vlog('WS → LIST_FORMATS', { url, tabId: sender?.tab?.id, page: sender?.tab?.url });
 	await requestFormatsFromCoordinator(url, sendResponse);
 }
 
@@ -339,6 +317,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 		case 'VELOCE_PREFETCH_FORMATS':
 			prefetchFormats(msg.url);
+			return false;
+
+		case 'VELOCE_WARMUP':
+			connectWs();
 			return false;
 
 		case 'VELOCE_CONTROL':

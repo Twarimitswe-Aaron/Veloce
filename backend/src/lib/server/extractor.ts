@@ -50,13 +50,9 @@ function setCached(url: string, formats: MediaFormat[]) {
  */
 export async function listFormats(url: string): Promise<MediaFormat[]> {
 	const cached = getCached(url);
-	if (cached) {
-		console.log('[Veloce] listFormats cache hit:', url);
-		return cached;
-	}
+	if (cached) return cached;
 
 	if (inflight.has(url)) {
-		console.log('[Veloce] listFormats joining in-flight:', url);
 		return inflight.get(url)!;
 	}
 
@@ -66,8 +62,6 @@ export async function listFormats(url: string): Promise<MediaFormat[]> {
 }
 
 async function listFormatsUncached(url: string): Promise<MediaFormat[]> {
-	const t0 = Date.now();
-
 	if (url.includes('mediafire.com')) {
 		const direct = await extractMediaUrl(url);
 		if (!direct) return [];
@@ -92,7 +86,6 @@ async function listFormatsUncached(url: string): Promise<MediaFormat[]> {
 
 	// Race strategies: no-cookies is fast for public posts; chrome cookies help private/login walls.
 	const formats = await raceFormatStrategies(url);
-	console.log(`[Veloce] listFormats done in ${Date.now() - t0}ms (${formats.length} formats)`);
 	setCached(url, formats);
 	return formats;
 }

@@ -10,56 +10,6 @@
 	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
 	const CDN_IMAGE = /fbcdn\.net|cdninstagram\.com/i;
 
-	let debugOn = true;
-	chrome.storage.local.get('veloce_debug', (r) => {
-		debugOn = r.veloce_debug !== false;
-		if (debugOn) {
-			console.log(
-				'%c[Veloce]%c Debug logging on — badge clicks, URL resolution, and downloads log here. Disable: chrome.storage.local.set({ veloce_debug: false })',
-				'color:#7ec8ff;font-weight:bold',
-				'color:inherit'
-			);
-		}
-	});
-
-	function vlog(...args) {
-		if (!debugOn) return;
-		console.log('%c[Veloce]', 'color:#7ec8ff;font-weight:bold', ...args);
-	}
-
-	function vwarn(...args) {
-		if (!debugOn) return;
-		console.warn('%c[Veloce]', 'color:#ffb347;font-weight:bold', ...args);
-	}
-
-	function describeAnchor(anchor) {
-		if (!anchor) return null;
-		const tag = anchor.tagName?.toLowerCase() || '?';
-		const rect = anchor.getBoundingClientRect?.();
-		return {
-			tag,
-			id: anchor.id || undefined,
-			class: anchor.className?.toString?.().slice(0, 80) || undefined,
-			rect: rect ? { top: Math.round(rect.top), left: Math.round(rect.left), w: Math.round(rect.width), h: Math.round(rect.height) } : undefined
-		};
-	}
-
-	function logResolution(rawUrl, anchor) {
-		const post = anchor ? findPostUrl(anchor) : null;
-		const resolved = resolveDownloadUrl(rawUrl, anchor);
-		vlog('URL resolution', {
-			page: location.href,
-			rawUrl,
-			rawProtocol: (() => { try { return new URL(rawUrl).protocol; } catch { return '?'; } })(),
-			anchor: describeAnchor(anchor),
-			foundPostUrl: post,
-			resolvedUrl: resolved,
-			onVideoSite: VIDEO_SITES.test(location.hostname),
-			onPostPage: /\/(p|reel|tv)\//.test(location.pathname)
-		});
-		return resolved;
-	}
-
 	function isHttpUrl(url) {
 		try {
 			const p = new URL(url).protocol;
@@ -205,6 +155,15 @@
 			white-space: nowrap;
 		}
 		.badge:hover { background: #002a55; }
+		.badge-loading { opacity: 0.7; }
+		.badge-ready { opacity: 1; }
+		.badge-ready::after {
+			content: '';
+			width: 5px;
+			height: 5px;
+			background: #7ec8ff;
+			margin-left: 2px;
+		}
 		.badge svg { width: 12px; height: 12px; flex-shrink: 0; }
 		.menu {
 			position: fixed;
@@ -276,16 +235,82 @@
 	`;
 	shadow.appendChild(style);
 
-	const badges = new Map(); // badgeKey -> { el, anchor, root, rawUrl, resolvedUrl }
+	const badges = new Map(); // badgeKey -> { el, anchor, root, rawUrl, resolvedUrl, labelEl }
 	const badgeKeys = new Set();
 	const badgeRoots = new WeakSet();
+	const localFormatCache = new Map(); // badgeKey -> formats[]
+	const prefetchStarted = new Set(); // badgeKey
 	let openMenu = null;
+	let pendingMenuUrl = null;
+
+	function markBadgeReady(badgeKey) {
+		const entry = badges.get(badgeKey);
+		if (!entry) return;
+		entry.el.classList.remove('badge-loading');
+		entry.el.classList.add('badge-ready');
+		if (entry.labelEl) entry.labelEl.textContent = 'Veloce';
+	}
+
+	function storeFormats(url, formats) {
+		if (!formats?.length) return;
+		const key = normalizeBadgeKey(url);
+		localFormatCache.set(key, formats);
+		markBadgeReady(key);
+	}
+
+	function eagerPrefetch(url) {
+		const key = normalizeBadgeKey(url);
+		if (localFormatCache.has(key) || prefetchStarted.has(key)) return;
+		prefetchStarted.add(key);
+		try {
+			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FORMATS', url });
+		} catch { /* ignore */ }
+	}
+
+	// Prefetch as media scrolls near the viewport — before the user clicks.
+	const viewportPrefetch = new IntersectionObserver((entries) => {
+		for (const entry of entries) {
+			if (!entry.isIntersecting) continue;
+			const el = entry.target;
+			const tag = el.tagName?.toLowerCase();
+			const raw = tag === 'a' ? el.href : (el.currentSrc || el.src);
+			if (!raw) continue;
+			const resolved = resolveDownloadUrl(raw, el);
+			if (resolved) eagerPrefetch(resolved);
+		}
+	}, { rootMargin: '240px', threshold: 0.05 });
+
+	function observeForPrefetch(el) {
+		if (!el || el.__velocePrefetchObserved) return;
+		el.__velocePrefetchObserved = true;
+		viewportPrefetch.observe(el);
+	}
+
+	if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+		chrome.runtime.onMessage.addListener((msg) => {
+			if (msg.type === 'VELOCE_FORMATS_READY' && msg.url && msg.formats?.length) {
+				storeFormats(msg.url, msg.formats);
+				if (openMenu && pendingMenuUrl === normalizeBadgeKey(msg.url)) {
+					const closeBtn = openMenu.querySelector('.menu-close');
+					const loading = openMenu.querySelector('.menu-loading');
+					if (loading) loading.remove();
+					showFormatsInMenu(openMenu, closeBtn, msg.formats, msg.url, null);
+					pendingMenuUrl = null;
+				}
+			}
+		});
+	}
+
+	try {
+		chrome.runtime.sendMessage({ type: 'VELOCE_WARMUP' });
+	} catch { /* ignore */ }
 
 	function closeMenu() {
 		if (openMenu) {
 			openMenu.remove();
 			openMenu = null;
 		}
+		pendingMenuUrl = null;
 	}
 
 	document.addEventListener('click', (e) => {
@@ -324,31 +349,27 @@
 
 		if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
 
-		vlog('Badge placed', { badgeKey, resolvedUrl, rawUrl, anchor: describeAnchor(anchor) });
 		const el = document.createElement('div');
-		el.className = 'badge';
+		el.className = 'badge badge-loading';
 		el.appendChild(iconSvg());
 		const label = document.createElement('span');
-		label.textContent = 'Veloce';
+		label.textContent = '…';
 		el.appendChild(label);
 
 		el.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			console.group('%c[Veloce] Badge clicked', 'color:#7ec8ff;font-weight:bold');
-			vlog('Badge click', { rawUrl, resolvedUrl, badgeKey, anchor: describeAnchor(anchor) });
 			openFormatMenu(rawUrl, anchor, el);
-			console.groupEnd();
 		});
 
 		shadow.appendChild(el);
 		badgeKeys.add(badgeKey);
 		badgeRoots.add(root);
-		badges.set(badgeKey, { el, anchor, root, rawUrl, resolvedUrl });
+		badges.set(badgeKey, { el, anchor, root, rawUrl, resolvedUrl, labelEl: label });
 
-		try {
-			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FORMATS', url: resolvedUrl });
-		} catch { /* ignore */ }
+		if (localFormatCache.has(badgeKey)) {
+			markBadgeReady(badgeKey);
+		}
 
 		const updatePos = () => {
 			const rect = root.getBoundingClientRect();
@@ -437,25 +458,21 @@
 						baseDirectory: cfg.veloce_base_dir || undefined,
 						threads: 8
 					};
-					console.group('%c[Veloce] Format selected → download', 'color:#7ec8ff;font-weight:bold');
-					vlog('Download config', {
-						selectedFormat: fmt.label,
-						payload,
-						intercept: cfg.veloce_intercept !== false,
-						saveDir: cfg.veloce_base_dir || '(coordinator default)'
-					});
-					chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (ack) => {
-						vlog('NEW_DOWNLOAD ack', ack);
-						console.groupEnd();
-					});
+					chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload });
+				});
 				});
 			});
 			menu.insertBefore(btn, closeBtn);
 		}
 	}
 
+	function showFormatsInMenu(menu, closeBtn, formats, url, loading) {
+		if (loading) loading.stop();
+		renderFormatButtons(menu, closeBtn, formats, url);
+	}
+
 	function openFormatMenu(rawUrl, anchor, badgeEl) {
-		const url = debugOn ? logResolution(rawUrl, anchor) : resolveDownloadUrl(rawUrl, anchor);
+		const url = resolveDownloadUrl(rawUrl, anchor);
 		closeMenu();
 		const menu = document.createElement('div');
 		menu.className = 'menu';
@@ -476,7 +493,6 @@
 		positionMenu(menu, badgeEl);
 
 		if (!url) {
-			vwarn('No downloadable URL', { rawUrl, anchor: describeAnchor(anchor) });
 			const err = document.createElement('div');
 			err.className = 'menu-status';
 			err.textContent = isBrowserOnlyUrl(rawUrl)
@@ -486,14 +502,23 @@
 			return;
 		}
 
+		const badgeKey = normalizeBadgeKey(url);
+		const cached = localFormatCache.get(badgeKey);
+		if (cached?.length) {
+			showFormatsInMenu(menu, closeBtn, cached, url, null);
+			return;
+		}
+
+		// Still loading from eager prefetch — keep menu open with spinner briefly.
 		let busyPort = null;
 		try {
 			busyPort = chrome.runtime.connect({ name: 'veloce-busy' });
 		} catch { /* ignore */ }
 
 		const loading = showLoadingStatus(menu, closeBtn, rawUrl);
+		pendingMenuUrl = badgeKey;
+		eagerPrefetch(url);
 
-		vlog('LIST_FORMATS → backend', { requestUrl: url, rawUrl });
 		chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url }, (resp) => {
 			if (busyPort) {
 				try { busyPort.disconnect(); } catch { /* ignore */ }
@@ -501,13 +526,11 @@
 			}
 			if (!openMenu) return;
 
+			if (resp?.formats?.length) storeFormats(url, resp.formats);
 			if (resp?.cached) loading.setInstant();
 			loading.stop();
 
-			vlog('LIST_FORMATS ← response', resp);
-
 			if (!resp || resp.type === 'FORMATS_ERROR' || !resp.formats?.length) {
-				vwarn('Format list failed', { url, error: resp?.error, resp });
 				const err = document.createElement('div');
 				err.className = 'menu-status';
 				err.textContent = resp?.error || 'No formats found. Is the backend running?';
@@ -515,13 +538,8 @@
 				return;
 			}
 
-			vlog(`Formats received (${resp.formats.length})`, resp.formats.map((f) => ({
-				label: f.label,
-				ext: f.ext,
-				url: f.url?.slice?.(0, 120)
-			})));
-
-			renderFormatButtons(menu, closeBtn, resp.formats, url);
+			showFormatsInMenu(menu, closeBtn, resp.formats, url, null);
+			pendingMenuUrl = null;
 		});
 	}
 
@@ -533,10 +551,11 @@
 			if (!url) return;
 			const badgeKey = normalizeBadgeKey(url);
 			const root = findBadgeRoot(anchor);
+
+			observeForPrefetch(anchor);
+			eagerPrefetch(url);
+
 			if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
-			if (debugOn) {
-				vlog('Scan match', { rawUrl, resolvedUrl: url, badgeKey, anchor: describeAnchor(anchor) });
-			}
 			placeBadge(url, anchor, rawUrl);
 		}
 
@@ -546,6 +565,9 @@
 				if (!href || href.startsWith('javascript:') || !isHttpUrl(href)) return;
 				if (CDN_IMAGE.test(href) && /\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(href)) return;
 				if (a.hasAttribute('download') || FILE_EXT.test(href)) {
+					observeForPrefetch(a);
+					const resolved = resolveDownloadUrl(href, a);
+					if (resolved) eagerPrefetch(resolved);
 					tryBadge(href, a);
 				}
 			} catch { /* ignore */ }
@@ -553,7 +575,10 @@
 
 		document.querySelectorAll('video, audio').forEach((el) => {
 			const src = el.currentSrc || el.src;
-			if (src) tryBadge(src, el);
+			if (src) {
+				observeForPrefetch(el);
+				tryBadge(src, el);
+			}
 		});
 	}
 
@@ -565,7 +590,6 @@
 		if (!a.hasAttribute('download') && !FILE_EXT.test(href)) return;
 
 		chrome.runtime.sendMessage({ type: 'VELOCE_GET_STATE' }, (state) => {
-			vlog('Link intercept click', { href, connected: state?.connected, state });
 			if (!state?.connected) return;
 			e.preventDefault();
 			e.stopPropagation();
@@ -574,8 +598,7 @@
 	}, true);
 
 	scan();
-	vlog('Content script loaded', { page: location.href, hostname: location.hostname });
 	const observer = new MutationObserver(() => scan());
 	observer.observe(document.documentElement, { childList: true, subtree: true });
-	setInterval(scan, 4000);
+	setInterval(scan, 2000);
 })();

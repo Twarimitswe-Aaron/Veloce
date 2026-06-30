@@ -627,9 +627,7 @@ export function setupWebSocketServer(server: Server) {
 					}));
 				} else if (data.type === 'LIST_FORMATS') {
 					const pageUrl = data.payload?.url ?? '';
-					console.log('[Veloce] LIST_FORMATS received', { requestId: data.requestId, pageUrl });
 					if (/^(blob:|data:|mediastream:)/i.test(pageUrl)) {
-						console.warn('[Veloce] LIST_FORMATS rejected — browser-only URL', pageUrl);
 						ws.send(JSON.stringify({
 							type: 'FORMATS_ERROR',
 							requestId: data.requestId,
@@ -644,10 +642,6 @@ export function setupWebSocketServer(server: Server) {
 					}
 					try {
 						const formats = await listFormats(pageUrl);
-						console.log(`[Veloce] LIST_FORMATS ok — ${formats.length} format(s)`, {
-							requestId: data.requestId,
-							labels: formats.map((f) => f.label)
-						});
 						ws.send(JSON.stringify({ type: 'FORMATS_LIST', requestId: data.requestId, formats }));
 					} catch (e) {
 						console.error('LIST_FORMATS failed:', e);
