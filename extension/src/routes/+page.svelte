@@ -1,16 +1,26 @@
 <script lang="ts">
-	import { isConnected, wsClient, selectedDirectory, downloads, pickerError, type DownloadItem } from '$lib/wsClient';
+	import {
+		isConnected,
+		wsClient,
+		selectedDirectory,
+		downloads,
+		pickerError,
+		interceptEnabled,
+		type DownloadItem
+	} from '$lib/wsClient';
 	import { onMount } from 'svelte';
-	
+
 	let downloadUrl = $state('');
 	let fileName = $state('');
 	let baseDirectory = $state('');
 	let threadCount = $state(8);
 
-	// Newest downloads first.
 	let downloadList = $derived(
 		Object.values($downloads).sort((a, b) => b.updatedAt - a.updatedAt)
 	);
+
+	const inputClass =
+		'w-full bg-[#000d1f] border border-white/30 px-3 py-2 text-sm text-white placeholder:text-white/35 focus:outline-none focus:border-white';
 
 	function pct(d: DownloadItem): number {
 		if (!d.total) return 0;
@@ -19,7 +29,7 @@
 
 	function formatBytes(bytes: number): string {
 		if (!bytes) return '0 B';
-		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		const units = ['B', 'KB', 'MB', 'GB'];
 		const i = Math.floor(Math.log(bytes) / Math.log(1024));
 		return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 	}
@@ -30,203 +40,170 @@
 		if (secs < 3600) return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
 		return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 	}
-	
+
 	onMount(() => {
 		const saved = localStorage.getItem('veloce_base_dir');
 		if (saved) baseDirectory = saved;
-
-		const savedUrl = localStorage.getItem('veloce_last_url');
-		if (savedUrl) downloadUrl = savedUrl;
 	});
-	
+
 	$effect(() => {
 		localStorage.setItem('veloce_base_dir', baseDirectory);
 	});
 
 	$effect(() => {
-		localStorage.setItem('veloce_last_url', downloadUrl);
-	});
-
-	$effect(() => {
-		if ($selectedDirectory) {
-			baseDirectory = $selectedDirectory;
-		}
+		if ($selectedDirectory) baseDirectory = $selectedDirectory;
 	});
 
 	function handleDownload() {
 		if (!downloadUrl) return;
-		
-		// Basic filename extraction if not provided
 		let extractedName = fileName;
-		if (!extractedName && downloadUrl) {
+		if (!extractedName) {
 			try {
-				const u = new URL(downloadUrl);
-				const parts = u.pathname.split('/').filter(p => p.length > 0);
+				const parts = new URL(downloadUrl).pathname.split('/').filter((p) => p.length > 0);
 				extractedName = parts.pop() || 'download_file';
-			} catch (e) {
+			} catch {
 				extractedName = 'download_file';
 			}
 		}
-		
 		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory, threadCount);
-		
-		// Reset form
 		downloadUrl = '';
 		fileName = '';
 	}
 </script>
 
-<div class="flex flex-col gap-6">
-	<!-- Connection Status -->
-	<div class="flex items-center gap-3 p-3 rounded-xl bg-gray-900 border {$isConnected ? 'border-emerald-500/30' : 'border-red-500/30'}">
-		<div class="relative flex h-3 w-3">
-			{#if $isConnected}
-				<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-				<span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-			{:else}
-				<span class="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
-			{/if}
+<div class="flex flex-col gap-5">
+	<!-- Status -->
+	<div class="flex items-center justify-between border border-white/25 px-3 py-2">
+		<div class="flex items-center gap-2">
+			<span
+				class="inline-block w-2 h-2"
+				style="background: {$isConnected ? '#fff' : '#ff4444'}"
+			></span>
+			<span class="text-xs font-medium">
+				{$isConnected ? 'Coordinator online' : 'Coordinator offline'}
+			</span>
 		</div>
-		<div class="flex flex-col">
-			<span class="text-sm font-medium text-gray-200">Local Coordinator</span>
-			<span class="text-xs text-gray-500">{$isConnected ? 'Connected & Ready' : 'Offline - Start Backend'}</span>
-		</div>
+		<label class="flex items-center gap-2 text-[10px] uppercase tracking-wider opacity-70 cursor-pointer">
+			<input
+				type="checkbox"
+				checked={$interceptEnabled}
+				onchange={(e) => wsClient.setInterceptEnabled((e.target as HTMLInputElement).checked)}
+				class="accent-white"
+			/>
+			Intercept
+		</label>
 	</div>
 
-	<!-- Manual Download Form -->
-	<div class="flex flex-col gap-4">
-		<div class="flex flex-col gap-1.5">
-			<label for="url" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Resource URL</label>
-			<input 
-				id="url"
-				type="url" 
-				bind:value={downloadUrl} 
-				placeholder="https://example.com/video.mp4" 
-				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
-			/>
+	{#if !$isConnected}
+		<p class="text-xs opacity-60 leading-relaxed">
+			Start the backend (<code class="opacity-80">cd backend && npm run dev</code>) then reload this popup.
+			When online, page badges and native download clicks are routed to Veloce.
+		</p>
+	{/if}
+
+	<!-- Form -->
+	<div class="flex flex-col gap-3">
+		<div>
+			<label for="url" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">URL</label>
+			<input id="url" type="url" bind:value={downloadUrl} placeholder="https://…" class={inputClass} />
 		</div>
 
-		<div class="flex flex-col gap-1.5">
-			<label for="filename" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">File Name (Optional)</label>
-			<input 
-				id="filename"
-				type="text" 
-				bind:value={fileName} 
-				placeholder="video.mp4" 
-				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
-			/>
+		<div>
+			<label for="filename" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Filename</label>
+			<input id="filename" type="text" bind:value={fileName} placeholder="optional" class={inputClass} />
 		</div>
 
-		<div class="flex flex-col gap-1.5">
-			<label for="basedir" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Base Save Directory</label>
-			<div class="flex items-center gap-2">
-				<input 
+		<div>
+			<label for="basedir" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Save to</label>
+			<div class="flex gap-2">
+				<input
 					id="basedir"
-					type="text" 
-					bind:value={baseDirectory} 
-					placeholder="Default: ~/Downloads/Veloce" 
-					class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all placeholder:text-gray-600"
+					type="text"
+					bind:value={baseDirectory}
+					placeholder="~/Downloads/Veloce"
+					class={inputClass}
 				/>
-				<button 
+				<button
 					type="button"
 					onclick={() => wsClient.requestDirectoryPicker()}
-					class="shrink-0 bg-gray-800 hover:bg-gray-700 text-gray-300 p-2.5 rounded-lg border border-gray-700 transition-all focus:outline-none focus:ring-2 focus:ring-blue-500/50 cursor-pointer"
-					title="Select Folder"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-				</button>
+					class="shrink-0 border border-white/30 px-2 text-white hover:bg-[#002a55] cursor-pointer"
+					title="Pick folder"
+				>…</button>
 			</div>
 			{#if $pickerError}
-				<span class="text-xs text-amber-400">{$pickerError}</span>
+				<p class="text-[11px] mt-1 opacity-70">{$pickerError}</p>
 			{/if}
 		</div>
 
-		<div class="flex flex-col gap-1.5">
-			<label for="threads" class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Concurrent Threads</label>
-			<select 
-				id="threads"
-				bind:value={threadCount} 
-				class="w-full bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all text-gray-300 appearance-none"
-			>
-				<option value={1}>1 Thread (Safest)</option>
-				<option value={2}>2 Threads</option>
-				<option value={4}>4 Threads</option>
-				<option value={8}>8 Threads (Recommended)</option>
-				<option value={16}>16 Threads</option>
-				<option value={32}>32 Threads</option>
-				<option value={64}>64 Threads (Maximum)</option>
+		<div>
+			<label for="threads" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Connections</label>
+			<select id="threads" bind:value={threadCount} class={inputClass}>
+				<option value={1}>1</option>
+				<option value={4}>4</option>
+				<option value={8}>8</option>
+				<option value={16}>16</option>
+				<option value={32}>32</option>
 			</select>
 		</div>
 
-		<button 
+		<button
 			disabled={!$isConnected || !downloadUrl}
 			onclick={handleDownload}
-			class="mt-2 w-full flex items-center justify-center gap-2 bg-linear-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-medium py-2.5 px-4 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-lg shadow-blue-900/20"
+			class="w-full border border-white py-2 text-sm font-medium hover:bg-[#002a55] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
 		>
-			<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-			Send to Veloce
+			Download
 		</button>
 	</div>
 
-	<!-- Live Downloads -->
+	<!-- Queue -->
 	{#if downloadList.length > 0}
-		<div class="flex flex-col gap-3">
-			<span class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Downloads</span>
+		<div class="flex flex-col gap-2">
+			<span class="text-[10px] uppercase tracking-widest opacity-60">Queue ({downloadList.length})</span>
 			{#each downloadList as d (d.id)}
-				<div class="flex flex-col gap-2 p-3 rounded-xl bg-gray-900 border border-gray-800">
-					<div class="flex items-center justify-between gap-2">
-						<span class="text-sm text-gray-200 truncate" title={d.fileName}>{d.fileName}</span>
-						<span
-							class="shrink-0 text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full
-							{d.status === 'completed' ? 'bg-emerald-500/15 text-emerald-400'
-							: d.status === 'error' ? 'bg-red-500/15 text-red-400'
-							: d.status === 'downloading' ? 'bg-blue-500/15 text-blue-400'
-							: d.status === 'paused' ? 'bg-amber-500/15 text-amber-400'
-							: 'bg-gray-700/40 text-gray-400'}"
-						>
-							{d.status}
-						</span>
+				<div class="border border-white/20 p-2 flex flex-col gap-1.5">
+					<div class="flex justify-between gap-2 items-start">
+						<span class="text-xs truncate flex-1" title={d.fileName}>{d.fileName}</span>
+						<span class="text-[9px] uppercase tracking-wider opacity-70 shrink-0">{d.status}</span>
 					</div>
 
 					{#if d.status === 'error'}
-						<span class="text-xs text-red-400">{d.error}</span>
+						<p class="text-[11px] opacity-80">{d.error}</p>
 					{:else}
-						<div class="h-2 w-full overflow-hidden rounded-full bg-gray-800">
+						<div class="h-1 w-full bg-white/15">
 							<div
-								class="h-full rounded-full transition-all duration-300
-								{d.status === 'completed' ? 'bg-emerald-500' : 'bg-linear-to-r from-blue-500 to-indigo-500'}"
+								class="h-full bg-white transition-all duration-200"
 								style="width: {d.status === 'completed' ? 100 : pct(d)}%"
 							></div>
 						</div>
-						<div class="flex items-center justify-between text-[11px] text-gray-500">
-							<span>{formatBytes(d.downloaded)} / {d.total ? formatBytes(d.total) : '—'}</span>
+						<div class="flex justify-between text-[10px] opacity-60">
+							<span>{formatBytes(d.downloaded)}{d.total ? ` / ${formatBytes(d.total)}` : ''}</span>
 							{#if d.status === 'downloading'}
-								<span>{formatBytes(d.speedBps)}/s · ETA {formatEta(d.etaSecs)}</span>
+								<span>{formatBytes(d.speedBps)}/s · {formatEta(d.etaSecs)}</span>
 							{:else}
 								<span>{d.status === 'completed' ? 'Done' : `${pct(d)}%`}</span>
 							{/if}
 						</div>
 					{/if}
 
-					<div class="flex items-center gap-2 pt-0.5">
+					<div class="flex gap-1 flex-wrap">
 						{#if d.status === 'downloading' || d.status === 'queued'}
 							<button type="button" onclick={() => wsClient.pauseDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Pause</button>
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Pause</button>
 							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-red-600/80 text-gray-300 transition-colors cursor-pointer">Cancel</button>
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Cancel</button>
 						{:else if d.status === 'paused'}
 							<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-blue-600/80 hover:bg-blue-500 text-white transition-colors cursor-pointer">Resume</button>
+								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Resume</button>
 							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-red-600/80 text-gray-300 transition-colors cursor-pointer">Cancel</button>
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Cancel</button>
 						{:else if d.status === 'error'}
 							<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-blue-600/80 hover:bg-blue-500 text-white transition-colors cursor-pointer">Retry</button>
+								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Retry</button>
 							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Remove</button>
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
 						{:else if d.status === 'completed'}
 							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
-								class="text-[11px] font-medium px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer">Remove</button>
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
 						{/if}
 					</div>
 				</div>

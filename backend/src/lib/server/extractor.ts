@@ -1,5 +1,240 @@
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
+
+export interface MediaFormat {
+	id: string;
+	label: string;
+	url: string;
+	ext: string;
+	filesize?: number;
+}
+
+const EXTRACTOR_DOMAINS = [
+	'youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com',
+	'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'
+];
+
+const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
+const formatCache = new Map<string, { formats: MediaFormat[]; ts: number }>();
+const inflight = new Map<string, Promise<MediaFormat[]>>();
+
+export function isExtractorDomain(url: string): boolean {
+	try {
+		const hostname = new URL(url).hostname.toLowerCase();
+		return EXTRACTOR_DOMAINS.some((d) => hostname.includes(d));
+	} catch {
+		return false;
+	}
+}
+
+function formatBytes(n: number): string {
+	if (!n) return '';
+	const units = ['B', 'KB', 'MB', 'GB'];
+	const i = Math.floor(Math.log(n) / Math.log(1024));
+	return `${(n / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+}
+
+function getCached(url: string): MediaFormat[] | null {
+	const hit = formatCache.get(url);
+	if (hit && Date.now() - hit.ts < FORMAT_CACHE_TTL_MS) return hit.formats;
+	return null;
+}
+
+function setCached(url: string, formats: MediaFormat[]) {
+	if (formats.length > 0) formatCache.set(url, { formats, ts: Date.now() });
+}
+
+/**
+ * List downloadable formats for a URL. Video/social pages go through yt-dlp;
+ * direct file links return a single "Direct" entry.
+ */
+export async function listFormats(url: string): Promise<MediaFormat[]> {
+	const cached = getCached(url);
+	if (cached) {
+		console.log('[Veloce] listFormats cache hit:', url);
+		return cached;
+	}
+
+	if (inflight.has(url)) {
+		console.log('[Veloce] listFormats joining in-flight:', url);
+		return inflight.get(url)!;
+	}
+
+	const work = listFormatsUncached(url).finally(() => inflight.delete(url));
+	inflight.set(url, work);
+	return work;
+}
+
+async function listFormatsUncached(url: string): Promise<MediaFormat[]> {
+	const t0 = Date.now();
+
+	if (url.includes('mediafire.com')) {
+		const direct = await extractMediaUrl(url);
+		if (!direct) return [];
+		const name = path.basename(new URL(direct).pathname) || 'download';
+		const formats = [{ id: 'direct', label: `Direct — ${name}`, url: direct, ext: path.extname(name) || '.bin' }];
+		setCached(url, formats);
+		return formats;
+	}
+
+	if (!isExtractorDomain(url)) {
+		try {
+			const u = new URL(url);
+			const name = path.basename(u.pathname) || 'download';
+			const ext = path.extname(name) || '.bin';
+			const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext }];
+			setCached(url, formats);
+			return formats;
+		} catch {
+			return [];
+		}
+	}
+
+	// Race strategies: no-cookies is fast for public posts; chrome cookies help private/login walls.
+	const formats = await raceFormatStrategies(url);
+	console.log(`[Veloce] listFormats done in ${Date.now() - t0}ms (${formats.length} formats)`);
+	setCached(url, formats);
+	return formats;
+}
+
+async function raceFormatStrategies(url: string): Promise<MediaFormat[]> {
+	const runners = [
+		runYtDlpJson(url, [], 10_000),
+		runYtDlpJson(url, ['--cookies-from-browser', 'chrome'], 22_000)
+	];
+
+	return new Promise((resolve) => {
+		let finished = 0;
+		let resolved = false;
+
+		const finishAll = (formats: MediaFormat[]) => {
+			if (!resolved) {
+				resolved = true;
+				for (const r of runners) r.kill();
+				resolve(formats);
+			}
+		};
+
+		for (const r of runners) {
+			r.promise.then((formats) => {
+				if (!resolved && formats.length > 0) {
+					finishAll(formats);
+					return;
+				}
+				finished++;
+				if (finished === runners.length && !resolved) finishAll([]);
+			});
+		}
+	});
+}
+
+function runYtDlpJson(url: string, cookieArgs: string[], timeoutMs: number): { promise: Promise<MediaFormat[]>; kill: () => void } {
+	let proc: ChildProcess | null = null;
+
+	const kill = () => {
+		try {
+			proc?.kill('SIGTERM');
+		} catch { /* ignore */ }
+	};
+
+	const promise = new Promise<MediaFormat[]>((resolve) => {
+		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
+		proc = spawn(ytdlpPath, [
+			...cookieArgs,
+			'--no-playlist',
+			'--no-warnings',
+			'--no-progress',
+			'--socket-timeout', '12',
+			'--retries', '1',
+			'-J',
+			'--',
+			url
+		]);
+
+		let output = '';
+		let settled = false;
+		const done = (result: MediaFormat[]) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolve(result);
+		};
+
+		const timeout = setTimeout(() => {
+			kill();
+			done([]);
+		}, timeoutMs);
+
+		proc.stdout?.on('data', (data) => { output += data.toString(); });
+		proc.stderr?.on('data', (data) => {
+			console.error(`[yt-dlp formats]: ${data.toString().trim()}`);
+		});
+
+		proc.on('close', (code) => {
+			if (code !== 0 || !output.trim()) {
+				done([]);
+				return;
+			}
+			try {
+				done(parseYtDlpFormats(output));
+			} catch (e) {
+				console.error('[Extractor] Failed to parse yt-dlp JSON', e);
+				done([]);
+			}
+		});
+
+		proc.on('error', () => done([]));
+	});
+
+	return { promise, kill };
+}
+
+function parseYtDlpFormats(output: string): MediaFormat[] {
+	const info = JSON.parse(output);
+	const title = (info.title as string) || 'video';
+	const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
+	const raw = (info.formats as any[]) ?? [];
+	const out: MediaFormat[] = [];
+
+	for (const f of raw) {
+		if (!f.url) continue;
+		if (f.ext === 'mhtml' || f.format_note === 'storyboard') continue;
+		const hasVideo = f.vcodec && f.vcodec !== 'none';
+		const hasAudio = f.acodec && f.acodec !== 'none';
+		if (!hasVideo && !hasAudio) continue;
+
+		const res = f.resolution && f.resolution !== 'audio only' ? f.resolution : '';
+		const kind = hasVideo && hasAudio ? 'video+audio' : hasVideo ? 'video' : 'audio';
+		const size = f.filesize || f.filesize_approx;
+		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
+		const ext = f.ext || 'mp4';
+		const label = [res || kind, ext, sizeStr].filter(Boolean).join(' ');
+
+		out.push({
+			id: String(f.format_id),
+			label: label.trim(),
+			url: f.url,
+			ext: ext.startsWith('.') ? ext : `.${ext}`,
+			filesize: size
+		});
+	}
+
+	out.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
+
+	const seen = new Set<string>();
+	const unique = out.filter((f) => {
+		const key = `${f.label}|${f.ext}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+
+	for (const f of unique) {
+		f.label = `${safeTitle} — ${f.label}`;
+	}
+
+	return unique.slice(0, 40);
+}
 
 /**
  * Extracts the direct media URL from a social media link (Instagram, YouTube, etc) using yt-dlp.
@@ -25,13 +260,10 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
     }
 
     // 2. yt-dlp Extractor for everything else (YouTube, Instagram, TikTok, ...).
-    //    Many sites (e.g. Instagram reels) need login cookies and the URL has no
-    //    file extension. We try several cookie sources in order and take the
-    //    first that yields a direct media URL.
     const cookieStrategies: string[][] = [
+        [],
         ['--cookies-from-browser', 'chrome'],
         ['--cookies-from-browser', 'firefox'],
-        [] // no cookies — works for fully public media
     ];
 
     for (const cookieArgs of cookieStrategies) {
@@ -58,12 +290,13 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
         const ytdlp = spawn(ytdlpPath, [
             ...cookieArgs,
-            // Best SINGLE progressive file (audio+video in one URL). We avoid
-            // split video+audio formats because the engine downloads one URL.
             '-f', 'b/best',
             '--no-playlist',
+            '--no-warnings',
+            '--no-progress',
+            '--socket-timeout', '12',
+            '--retries', '1',
             '-g',
-            // `--` ensures a URL beginning with "-" can never be parsed as a flag.
             '--',
             url
         ]);
@@ -77,8 +310,6 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
             resolve(result);
         };
 
-        // Kill yt-dlp after 30s to avoid hanging when a browser is locked,
-        // cookies are inaccessible, or the network stalls.
         const timeout = setTimeout(() => {
             ytdlp.kill();
             console.error(`[yt-dlp] Timed out after 30s for: ${url}`);
@@ -95,7 +326,6 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
 
         ytdlp.on('close', (code) => {
             if (code === 0 && output.trim()) {
-                // With merged formats yt-dlp may print multiple URLs; take the first.
                 done(output.trim().split('\n')[0]);
             } else {
                 done(null);

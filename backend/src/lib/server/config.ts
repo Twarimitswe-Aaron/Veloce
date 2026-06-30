@@ -59,7 +59,7 @@ export const config = {
 	/** Port the Local Coordinator (WebSocket + dev server) listens on. */
 	port: num('VELOCE_PORT', 14921),
 	/** Max engine processes running at once. */
-	maxConcurrentDownloads: num('VELOCE_MAX_CONCURRENT_DOWNLOADS', 3),
+	maxConcurrentDownloads: num('VELOCE_MAX_CONCURRENT_DOWNLOADS', 10),
 	/** Default per-download connection count when the client doesn't specify. */
 	defaultThreads: num('VELOCE_DEFAULT_THREADS', 8),
 	/** Global per-download speed cap in bytes/sec (0 = unlimited), passed to the engine. */

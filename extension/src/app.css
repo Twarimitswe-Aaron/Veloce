@@ -1,8 +1,25 @@
 @import 'tailwindcss';
 
+:root {
+	--veloce-navy: #001833;
+	--veloce-navy-light: #002a55;
+	--veloce-white: #ffffff;
+	--veloce-muted: rgba(255, 255, 255, 0.65);
+}
+
 body {
-  width: 400px;
-  height: 600px;
-  margin: 0;
-  padding: 0;
+	width: 380px;
+	height: 560px;
+	margin: 0;
+	padding: 0;
+	background: var(--veloce-navy);
+	color: var(--veloce-white);
+	font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+	font-size: 13px;
+	line-height: 1.45;
+	-webkit-font-smoothing: antialiased;
+}
+
+input, select, button {
+	font-family: inherit;
 }

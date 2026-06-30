@@ -11,7 +11,7 @@ import { statfs, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import { extractMediaUrl } from './extractor';
+import { extractMediaUrl, listFormats } from './extractor';
 import { config } from './config';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
@@ -28,6 +28,8 @@ interface JobSpec {
 	threads: number;
 	/** Only a brand-new download may be renamed from extraction; resumes must keep the path stable. */
 	allowRename: boolean;
+	/** When set, download this URL directly (skip yt-dlp extraction). */
+	directUrl?: string;
 }
 
 // ── Connected clients (broadcast target) ─────────────────────────────────────
@@ -247,10 +249,11 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	const { id } = spec;
 	let { savePath, fileName } = spec;
 	try {
-		let finalUrl = spec.pageUrl;
+		let finalUrl = spec.directUrl || spec.pageUrl;
 
-		// (Re)extract direct media URL for video/social sites.
-		if (spec.category === VIDEO_CATEGORY) {
+		// (Re)extract direct media URL for video/social sites — unless the caller
+		// already picked a specific format URL from the format picker.
+		if (!spec.directUrl && spec.category === VIDEO_CATEGORY) {
 			console.log(`🔍 Extracting direct URL for ${spec.pageUrl}...`);
 			const directUrl = await extractMediaUrl(spec.pageUrl);
 			if (!directUrl) {
@@ -455,8 +458,8 @@ export function setupWebSocketServer(server: Server) {
 	}
 
 	wss.on('connection', async (ws) => {
-		console.log('Extension connected to Local Coordinator via WebSocket!');
 		clients.add(ws);
+		console.log(`Extension connected to Local Coordinator (${clients.size} client${clients.size === 1 ? '' : 's'})`);
 		const macAddress = getMacAddress();
 
 		try {
@@ -509,6 +512,13 @@ export function setupWebSocketServer(server: Server) {
 						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: safety.reason }));
 						return;
 					}
+					if (data.payload.directUrl) {
+						const directSafety = isSafeDownloadUrl(data.payload.directUrl);
+						if (!directSafety.ok) {
+							ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: directSafety.reason }));
+							return;
+						}
+					}
 
 					// Normalize URL (strip tracking params).
 					let rawUrl = data.payload.url;
@@ -531,6 +541,18 @@ export function setupWebSocketServer(server: Server) {
 
 					// Categorize by domain, then extension.
 					let rawName = sanitizeFileName(data.payload.fileName || 'download_file');
+					if (data.payload.directUrl) {
+						try {
+							const du = new URL(data.payload.directUrl);
+							const fromPath = path.basename(du.pathname);
+							if (fromPath && fromPath.includes('.')) {
+								rawName = sanitizeFileName(fromPath);
+							} else if (data.payload.ext) {
+								const stem = rawName.replace(/\.[^.]+$/, '') || 'download';
+								rawName = sanitizeFileName(`${stem}${data.payload.ext.startsWith('.') ? data.payload.ext : '.' + data.payload.ext}`);
+							}
+						} catch { /* keep rawName */ }
+					}
 					let ext = path.extname(rawName).toLowerCase();
 					let category = 'others';
 					try {
@@ -561,11 +583,14 @@ export function setupWebSocketServer(server: Server) {
 					}
 
 					// Dedup is keyed on the SOURCE url (same link = same download).
-					// In-flight rows always dedup; completed rows only if bytes remain.
-					const sameSource = await db.select().from(downloads).where(eq(downloads.url, rawUrl));
-					const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
-					const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
-					const duplicate = activeDownload ?? completedOnDisk;
+					// When a specific format/direct URL was picked, allow multiple qualities.
+					let duplicate: (typeof downloads.$inferSelect) | undefined;
+					if (!data.payload.directUrl) {
+						const sameSource = await db.select().from(downloads).where(eq(downloads.url, rawUrl));
+						const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
+						const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
+						duplicate = activeDownload ?? completedOnDisk;
+					}
 
 					if (duplicate) {
 						console.log(`♻️  Duplicate found! Attaching to existing download ID: ${duplicate.id}`);
@@ -597,8 +622,37 @@ export function setupWebSocketServer(server: Server) {
 						savePath,
 						category,
 						threads,
-						allowRename: true
+						allowRename: !data.payload.directUrl,
+						directUrl: data.payload.directUrl
 					}));
+				} else if (data.type === 'LIST_FORMATS') {
+					const pageUrl = data.payload?.url ?? '';
+					console.log('[Veloce] LIST_FORMATS received', { requestId: data.requestId, pageUrl });
+					if (/^(blob:|data:|mediastream:)/i.test(pageUrl)) {
+						console.warn('[Veloce] LIST_FORMATS rejected — browser-only URL', pageUrl);
+						ws.send(JSON.stringify({
+							type: 'FORMATS_ERROR',
+							requestId: data.requestId,
+							error: 'Browser-only blob URL — reload the Veloce extension and refresh the page. The badge should resolve to the Instagram post link (/p/…).'
+						}));
+						return;
+					}
+					const safety = isSafeDownloadUrl(pageUrl);
+					if (!safety.ok) {
+						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId: data.requestId, error: safety.reason }));
+						return;
+					}
+					try {
+						const formats = await listFormats(pageUrl);
+						console.log(`[Veloce] LIST_FORMATS ok — ${formats.length} format(s)`, {
+							requestId: data.requestId,
+							labels: formats.map((f) => f.label)
+						});
+						ws.send(JSON.stringify({ type: 'FORMATS_LIST', requestId: data.requestId, formats }));
+					} catch (e) {
+						console.error('LIST_FORMATS failed:', e);
+						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId: data.requestId, error: 'Could not list formats.' }));
+					}
 				} else if (data.type === 'PAUSE_DOWNLOAD') {
 					const r = running.get(data.downloadId);
 					if (r) {
@@ -653,7 +707,7 @@ export function setupWebSocketServer(server: Server) {
 
 		ws.on('close', () => {
 			clients.delete(ws);
-			console.log('Extension disconnected.');
+			console.log(`Extension disconnected (${clients.size} client${clients.size === 1 ? '' : 's'} remaining)`);
 		});
 	});
 }

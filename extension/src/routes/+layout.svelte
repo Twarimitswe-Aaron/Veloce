@@ -5,21 +5,17 @@
 	import { wsClient } from '$lib/wsClient';
 
 	onMount(() => {
-		// Initialize connection when the extension popup opens
 		wsClient.connect();
 	});
 </script>
 
-<div class="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans">
-	<header class="border-b border-gray-800 bg-gray-900/50 p-4 backdrop-blur">
-		<div class="flex items-center justify-between">
-			<h1 class="text-lg font-bold text-transparent bg-clip-text bg-linear-to-r from-blue-400 to-emerald-400">
-				⚡ Veloce
-			</h1>
-		</div>
+<div class="min-h-screen flex flex-col" style="background:#001833;color:#fff">
+	<header class="border-b border-white/25 px-4 py-3">
+		<h1 class="text-base font-semibold tracking-wide">Veloce</h1>
+		<p class="text-[10px] uppercase tracking-widest opacity-60 mt-0.5">Download Manager</p>
 	</header>
 
-	<main class="flex-1 p-4">
+	<main class="flex-1 p-4 overflow-y-auto">
 		{@render children()}
 	</main>
 </div>

@@ -5,14 +5,14 @@ Veloce is a high-performance, segmented Internet Download Manager (IDM) designed
 ## 🏗️ System Architecture
 
 ### 1. `extension/` (Browser Extension)
-*   **Tech Stack:** Svelte 5, Manifest V3, Tailwind
-*   **Role:** The popup UI inside the browser. You paste a URL (or it derives a filename), pick a save directory, choose the connection count, and send the job. It shows a **live download list** with per-file progress, speed, ETA, and errors.
-*   **How it talks:** It connects to the `backend` via a local **WebSocket** and rehydrates its download list on (re)connect, so closing/reopening the popup never loses progress.
+*   **Tech Stack:** Svelte 5, Manifest V3
+*   **Role:** Popup UI **and** in-page capture. A **content script** scans every page for downloadable links, videos, and audio — placing a floating **Veloce** badge on each. Clicking a badge opens a **format picker** (yt-dlp for video sites, direct link otherwise); choosing a format starts the download immediately. When the Local Coordinator is online, **native browser downloads are intercepted** and routed to Veloce instead.
+*   **How it talks:** A persistent **background service worker** owns the WebSocket to `ws://localhost:14921/ws`. The popup and content script message the background; progress is broadcast to any open popup.
 
 ### 2. `backend/` (Local Coordinator)
 *   **Tech Stack:** SvelteKit (Node.js full-stack), Drizzle ORM, libSQL/SQLite
 *   **Role:** The native coordinator that runs on your PC. It receives download payloads from the extension, normalizes/categorizes them, resolves media URLs (yt-dlp / Mediafire), persists the queue and history in SQLite, and spawns the Rust engine.
-*   **How it works:** A **global scheduler** caps how many engine processes run at once (default 3) so concurrent downloads don't fight over bandwidth, sockets, and disk. Each engine runs as a **child process**; if it crashes, the coordinator stays alive and records the failure.
+*   **How it works:** A **global scheduler** caps how many engine processes run at once (default **10**, configurable via `.env`). Additional jobs queue FIFO — you can queue **100+ downloads**; they start as slots free up. Each engine is a **child process**; coordinator crash recovery re-queues interrupted jobs on restart.
 
 ### 3. `core_engine/` (Rust Core)
 *   **Tech Stack:** Rust, Tokio, Reqwest, Crossbeam
@@ -61,9 +61,37 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Resilient folder picker** — tries `zenity`, then `kdialog`, and reports when neither is available.
 
 ### Extension (`extension/`)
-*   **Live progress UI** — consumes `PROGRESS`/`COMPLETED`/`PAUSED`/`ERROR`/`REMOVED` and renders per-file bars, speed, ETA, and status badges.
-*   **Inline controls** — Pause / Resume / Cancel / Retry / Remove buttons per download, contextual to its status.
-*   **State rehydration** — on connect the backend sends a snapshot of recent/active downloads, so the popup can be closed and reopened without losing visibility.
+*   **In-page capture** — content script badges every downloadable `<a>`, `<video>`, `<audio>`, and video/social page; format picker via `LIST_FORMATS` (yt-dlp JSON).
+*   **Download interception** — `chrome.downloads.onCreated` cancels native downloads when coordinator is online (toggle in popup).
+*   **Persistent background WS** — service worker keeps the connection alive when popup is closed.
+*   **Live progress UI** — navy/white popup with queue, speed, ETA, pause/resume/cancel.
+*   **State rehydration** — snapshot on connect survives popup reload.
+
+## 📖 Issues resolved — problem, impact, and how we fixed it
+
+Use this section as study material: each row is a real failure mode, why it matters, and the exact layer that handles it.
+
+| # | Problem | Impact if ignored | How Veloce handles it | Where |
+|---|---|---|---|---|
+| 1 | Server returns `200` instead of `206` for a sub-range | **Silent file corruption** — full body written at wrong offset | Reject `200` on sub-ranges; only allow `200` for single-piece (whole-file) mode | `core_engine` `download_piece` |
+| 2 | `HEAD` missing `Content-Length` (signed CDN URLs) | Download never starts or wrong size | Fallback 1-byte ranged `GET`, read `Content-Range` | `discover()` |
+| 3 | No HTTP range support | Multi-connection corruption | Probe → single connection, one piece = whole file | `supports_ranges` + layout |
+| 4 | Source file changed while resuming | Mixed old/new bytes | `ETag`/`Last-Modified` validation; `416` aborts piece | `ResumeState` + `validators_match` |
+| 5 | `429`/`503` rate limits | Retry storm, IP ban | Honor `Retry-After` (cap 10s); halve concurrency | `download_piece` + adaptive cap |
+| 6 | Slow but active transfer | Premature kill | **Idle** stall only (30s no bytes), no total timeout | `IDLE_TIMEOUT` per read |
+| 7 | Crash mid state-file write | Resume broken, restart from 0 | Atomic write: `.tmp` + `rename` | reporter loop |
+| 8 | Crash mid download | Lost job | Startup reconciliation re-queues `downloading`/`queued` rows | `reconcileInterrupted()` |
+| 9 | Disk full mid-download | Partial mystery file | `statvfs` size check before write; `posix_fallocate` | `available_space` + `preallocate` |
+| 10 | Path traversal in filename | Arbitrary file write | `sanitizeFileName` + `safeJoin` confinement | `ws.ts` |
+| 11 | Malicious site opens `ws://localhost` | Drive downloader / SSRF | Origin allowlist; optional extension ID pin | `verifyClient` + `.env` |
+| 12 | Download to private/metadata IP | SSRF from extension | Block localhost/private/link-local hosts | `isSafeDownloadUrl` |
+| 13 | Instagram reel (no extension in URL) | Saves HTML page | yt-dlp with cookie fallback; format picker | `extractor.ts` |
+| 14 | Expired CDN URL on resume | 403 mid-resume | Re-extract page URL on resume (unless user picked format) | `runDownloadJob` |
+| 15 | Filename collision | Overwrites unrelated file | Auto-rename `name (1).ext` | `uniqueSavePath` |
+| 16 | 100 simultaneous download requests | Socket/RAM exhaustion | FIFO queue + configurable active engine cap | scheduler + `.env` |
+| 17 | Native browser download while Veloce online | Bypasses engine | `chrome.downloads` intercept → Veloce queue | `background.js` |
+| 18 | User wants specific quality | Wrong default format | In-page badge → `LIST_FORMATS` → `directUrl` download | extension + `listFormats` |
+
 
 ## 🔒 Security
 
@@ -79,7 +107,7 @@ The coordinator reads `backend/.env` at startup (real environment variables over
 | Variable | Default | Meaning |
 |---|---|---|
 | `VELOCE_PORT` | `14921` | WebSocket + dev-server port. |
-| `VELOCE_MAX_CONCURRENT_DOWNLOADS` | `3` | Engine processes running at once. |
+| `VELOCE_MAX_CONCURRENT_DOWNLOADS` | `10` | Active engine processes; unlimited jobs queue FIFO. |
 | `VELOCE_DEFAULT_THREADS` | `8` | Connections per download when unspecified. |
 | `VELOCE_MAX_RATE_BYTES` | `0` | Global speed cap per download in bytes/sec (`0` = unlimited). |
 | `VELOCE_MIN_FREE_DISK_MB` | `500` | Refuse to start if less free space than this. |
@@ -126,8 +154,18 @@ These are the failure modes that bite naive downloaders. Each is handled so the 
 | BitTorrent / Metalink | ❌ | ✅ | ✅ | ✅ | ⏳ not planned |
 | Proxy / authenticated downloads | ✅ | ✅ | ✅ | ✅ | ⏳ planned |
 | Scheduler (time-of-day) | ✅ | partial | ✅ | ✅ | ⏳ planned |
-| Browser auto-capture / link grabber | ✅ | ❌ | ✅ | ✅ | ⏳ planned |
+| Browser auto-capture / link grabber | ✅ | ❌ | ✅ | ✅ | ✅ |
 
-> **Roadmap (next):** checksum verification (SHA-256/Metalink), multi-source/mirror fetch, HTTP proxy + Basic/Bearer auth, a time-of-day scheduler, and browser auto-capture with an in-page UI.
+> **Roadmap (next):** checksum verification (SHA-256/Metalink), multi-source/mirror fetch, HTTP proxy + Basic/Bearer auth, time-of-day scheduler.
 
-> **Note on scope:** the extension is currently a manual popup with full pause/resume/cancel controls. Automatic page scraping / network interception and a floating in-page UI are *not* implemented yet.
+## 🖱️ Using in-page capture
+
+1. Start the backend: `cd backend && npm run dev`
+2. Load the extension from `extension/build` (after `npm run build`)
+3. Browse any page — **Veloce** badges appear on downloadable links and media
+4. Click a badge → pick a format → download starts immediately
+5. Or click any normal download link — if coordinator is online, Veloce intercepts instead of the browser
+6. Toggle **Intercept** in the popup to fall back to native browser downloads
+
+Pin your extension ID in `.env` for production:
+`VELOCE_ALLOWED_EXTENSION_IDS=<your-chrome-extension-id>`
