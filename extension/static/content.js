@@ -365,7 +365,32 @@
 	}
 
 	if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
-		chrome.runtime.onMessage.addListener((msg) => {
+		chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+			if (msg.type === 'VELOCE_FETCH_BLOB' && msg.url) {
+				(async () => {
+					try {
+						const res = await fetch(msg.url);
+						if (!res.ok) throw new Error(`HTTP ${res.status}`);
+						const blob = await res.blob();
+						const buf = await blob.arrayBuffer();
+						const bytes = new Uint8Array(buf);
+						let binary = '';
+						const chunk = 8192;
+						for (let i = 0; i < bytes.length; i += chunk) {
+							binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+						}
+						sendResponse({
+							ok: true,
+							base64: btoa(binary),
+							mime: blob.type || 'application/octet-stream',
+							size: bytes.length
+						});
+					} catch (e) {
+						sendResponse({ ok: false, error: String(e) });
+					}
+				})();
+				return true;
+			}
 			if (msg.type === 'VELOCE_STATE') {
 				coordinatorOnline = msg.connected === true;
 			}

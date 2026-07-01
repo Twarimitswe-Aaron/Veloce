@@ -363,20 +363,113 @@ function scheduleKeepaliveAlarm() {
 	chrome.alarms.create('veloce-keepalive', { periodInMinutes: 3 });
 }
 
+const BROWSER_ONLY_URL = /^(blob:|data:|mediastream:)/i;
+
+function extFromMime(mime) {
+	const m = (mime || '').toLowerCase().split(';')[0].trim();
+	const map = {
+		'image/png': '.png',
+		'image/jpeg': '.jpg',
+		'image/jpg': '.jpg',
+		'image/webp': '.webp',
+		'image/gif': '.gif',
+		'image/svg+xml': '.svg',
+		'application/pdf': '.pdf'
+	};
+	return map[m] || '.bin';
+}
+
+/** Parse a data: URL in the service worker (no tab required). */
+function parseDataUrl(url) {
+	try {
+		const m = url.match(/^data:([^;,]*)(;base64)?,([\s\S]*)$/);
+		if (!m) return null;
+		const mime = m[1] || 'application/octet-stream';
+		const payload = m[3];
+		const base64 = m[2] ? payload.replace(/\s/g, '') : btoa(decodeURIComponent(payload));
+		return { base64, mime, size: Math.ceil(base64.length * 0.75) };
+	} catch {
+		return null;
+	}
+}
+
+/** Fetch blob bytes from the page context (MAIN world can read page blob URLs). */
+async function materializeBlobUrl(tabId, blobUrl) {
+	if (tabId == null || tabId < 0) return null;
+
+	const fetchInPage = async (u) => {
+		const res = await fetch(u);
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const blob = await res.blob();
+		const buf = await blob.arrayBuffer();
+		const bytes = new Uint8Array(buf);
+		let binary = '';
+		const chunk = 8192;
+		for (let i = 0; i < bytes.length; i += chunk) {
+			binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+		}
+		return {
+			base64: btoa(binary),
+			mime: blob.type || 'application/octet-stream',
+			size: bytes.length
+		};
+	};
+
+	try {
+		const results = await chrome.scripting.executeScript({
+			target: { tabId },
+			world: 'MAIN',
+			func: fetchInPage,
+			args: [blobUrl]
+		});
+		if (results?.[0]?.result?.base64) return results[0].result;
+	} catch (e) {
+		console.warn('[Veloce] MAIN-world blob fetch failed, trying content script', e);
+	}
+
+	return new Promise((resolve) => {
+		chrome.tabs.sendMessage(tabId, { type: 'VELOCE_FETCH_BLOB', url: blobUrl }, (resp) => {
+			if (chrome.runtime.lastError || !resp?.ok) resolve(null);
+			else resolve(resp);
+		});
+	});
+}
+
+async function startBlobDownload({ base64, mime, fileName, baseDirectory, sourceUrl, pageUrl }) {
+	const ok = await ensureConnected();
+	if (!ok) {
+		console.error('[Veloce] Cannot save blob — coordinator offline');
+		return false;
+	}
+	let name = fileName || 'download';
+	if (!/\.\w{2,5}$/.test(name) && mime) {
+		name = name.replace(/\.\w+$/, '') + extFromMime(mime);
+	}
+	return wsSend({
+		type: 'SAVE_BLOB',
+		payload: {
+			base64,
+			mime,
+			fileName: name,
+			baseDirectory,
+			sourceUrl: sourceUrl || pageUrl || 'blob:browser',
+			pageUrl
+		}
+	});
+}
+
 // ── Intercept native browser downloads when coordinator is online ─────────────
 chrome.downloads.onCreated.addListener(async (item) => {
 	if (!connected) return;
 	const { veloce_intercept } = await chrome.storage.local.get('veloce_intercept');
 	if (veloce_intercept === false) return;
 
-	try {
-		await chrome.downloads.cancel(item.id);
-	} catch (e) {
-		console.warn('[Veloce] Could not cancel native download', e);
-	}
-
 	const url = item.url || item.finalUrl;
 	if (!url) return;
+
+	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
+	const baseDirectory = veloce_base_dir || selectedDirectory || undefined;
+	const pageUrl = item.referrer || undefined;
 
 	let fileName = item.filename || '';
 	if (!fileName) {
@@ -388,11 +481,44 @@ chrome.downloads.onCreated.addListener(async (item) => {
 		}
 	}
 
-	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
+	// blob:/data: URLs only exist in the browser — materialize bytes before cancelling.
+	if (BROWSER_ONLY_URL.test(url)) {
+		let materialized = null;
+		if (url.startsWith('data:')) {
+			materialized = parseDataUrl(url);
+		} else if (url.startsWith('blob:')) {
+			materialized = await materializeBlobUrl(item.tabId, url);
+		}
+		if (!materialized?.base64) {
+			console.warn('[Veloce] Could not read blob/data URL — leaving native download alone');
+			return; // do not cancel; browser keeps the download
+		}
+		try {
+			await chrome.downloads.cancel(item.id);
+		} catch (e) {
+			console.warn('[Veloce] Could not cancel native download', e);
+		}
+		await startBlobDownload({
+			base64: materialized.base64,
+			mime: materialized.mime,
+			fileName,
+			baseDirectory,
+			sourceUrl: url,
+			pageUrl
+		});
+		return;
+	}
+
+	try {
+		await chrome.downloads.cancel(item.id);
+	} catch (e) {
+		console.warn('[Veloce] Could not cancel native download', e);
+	}
+
 	startDownload({
 		url,
 		fileName,
-		baseDirectory: veloce_base_dir || selectedDirectory || undefined,
+		baseDirectory,
 		threads: 8
 	});
 });

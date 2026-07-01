@@ -7,7 +7,7 @@ import { eq, sql, inArray } from 'drizzle-orm';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
-import { statfs, unlink } from 'fs/promises';
+import { statfs, unlink, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
@@ -17,6 +17,26 @@ import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from '.
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
+/** In-browser blob/data saves (AI images, canvas exports) — not fetched over HTTP. */
+const MAX_BLOB_BYTES = 80 * 1024 * 1024;
+
+function mimeToExt(mime: string): string {
+	const m = (mime || '').toLowerCase().split(';')[0].trim();
+	const map: Record<string, string> = {
+		'image/png': '.png',
+		'image/jpeg': '.jpg',
+		'image/jpg': '.jpg',
+		'image/webp': '.webp',
+		'image/gif': '.gif',
+		'image/svg+xml': '.svg',
+		'image/bmp': '.bmp',
+		'application/pdf': '.pdf',
+		'video/mp4': '.mp4',
+		'audio/mpeg': '.mp3',
+		'audio/wav': '.wav'
+	};
+	return map[m] || '.bin';
+}
 
 type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
 
@@ -493,6 +513,89 @@ interface QueueOpts {
 }
 
 /**
+ * Write bytes that only exist in the browser (blob:/data: URLs) straight to
+ * disk — no Rust engine. Used for AI-generated images and canvas exports.
+ */
+async function saveBlobDownload(opts: {
+	macAddress: string;
+	base64: string;
+	fileName: string;
+	mime?: string;
+	baseDir: string;
+	/** Page URL or synthetic id for history/dedup. */
+	sourceUrl: string;
+}): Promise<{ ok: true; downloadId: string } | { ok: false; error: string }> {
+	let buf: Buffer;
+	try {
+		buf = Buffer.from(opts.base64, 'base64');
+	} catch {
+		return { ok: false, error: 'Invalid blob data.' };
+	}
+	if (buf.length === 0) return { ok: false, error: 'Empty blob.' };
+	if (buf.length > MAX_BLOB_BYTES) {
+		return { ok: false, error: `Blob too large (max ${Math.round(MAX_BLOB_BYTES / 1048576)} MB).` };
+	}
+
+	let rawName = sanitizeFileName(opts.fileName || 'download');
+	if (!path.extname(rawName) && opts.mime) {
+		const stem = rawName.replace(/\.[^.]+$/, '') || 'download';
+		rawName = sanitizeFileName(stem + mimeToExt(opts.mime));
+	}
+
+	const ext = path.extname(rawName).toLowerCase();
+	const category = categoryForExt(ext || mimeToExt(opts.mime || ''));
+	const desiredPath = safeJoin(opts.baseDir, category, rawName);
+	if (!desiredPath) return { ok: false, error: 'Invalid file path.' };
+
+	const free = await freeSpaceFor(path.dirname(desiredPath));
+	if (free !== null && free < buf.length + MIN_FREE_BYTES) {
+		return { ok: false, error: 'Insufficient disk space.' };
+	}
+
+	const savePath = await uniqueSavePath(desiredPath);
+	const finalName = path.basename(savePath);
+	const downloadId = crypto.randomUUID();
+	const sourceUrl = opts.sourceUrl || `blob:local/${downloadId}`;
+
+	await db.insert(downloads).values({
+		id: downloadId,
+		deviceId: opts.macAddress,
+		url: sourceUrl,
+		fileName: finalName,
+		savePath,
+		status: 'downloading',
+		totalBytes: buf.length,
+		downloadedBytes: 0
+	});
+	broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: finalName, status: 'downloading' });
+
+	try {
+		await mkdir(path.dirname(savePath), { recursive: true });
+		await writeFile(savePath, buf);
+		await db.update(downloads)
+			.set({ status: 'completed', downloadedBytes: buf.length, totalBytes: buf.length })
+			.where(eq(downloads.id, downloadId));
+		broadcast({
+			type: 'PROGRESS',
+			downloadId,
+			downloaded: buf.length,
+			total: buf.length,
+			speedBps: 0,
+			etaSecs: 0
+		});
+		broadcast({ type: 'DOWNLOAD_COMPLETED', downloadId, status: 'completed' });
+		console.log(`✅ Blob saved: ${finalName} (${buf.length} bytes)`);
+		return { ok: true, downloadId };
+	} catch (e) {
+		console.error('SAVE_BLOB failed:', e);
+		await cleanupFiles(savePath);
+		await db.delete(downloads).where(eq(downloads.id, downloadId));
+		broadcast({ type: 'DOWNLOAD_REMOVED', downloadId });
+		return { ok: false, error: 'Could not write blob to disk.' };
+	}
+}
+
+/**
  * Create (or attach to) a single download from a normalized request. Handles
  * categorization, path confinement, dedup, DB insert, ACK broadcast and
  * scheduling. Shared by the single-download and playlist-expansion paths.
@@ -653,6 +756,27 @@ export function setupWebSocketServer(server: Server) {
 				if (data.type === 'PING') {
 					if (ws.readyState === 1) {
 						ws.send(JSON.stringify({ type: 'PONG' }));
+					}
+					return;
+				}
+
+				if (data.type === 'SAVE_BLOB') {
+					console.log('📥 Received blob save request:', data.payload?.fileName);
+					const payload = data.payload ?? {};
+					let baseDir = payload.baseDirectory;
+					if (!baseDir || String(baseDir).trim() === '') {
+						baseDir = runtime.baseDirectory;
+					}
+					const result = await saveBlobDownload({
+						macAddress,
+						base64: payload.base64 ?? '',
+						fileName: payload.fileName ?? 'download',
+						mime: payload.mime,
+						baseDir,
+						sourceUrl: payload.sourceUrl ?? payload.pageUrl ?? 'blob:browser'
+					});
+					if (!result.ok) {
+						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: result.error }));
 					}
 					return;
 				}
