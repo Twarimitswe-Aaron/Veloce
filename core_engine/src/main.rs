@@ -1,6 +1,6 @@
 use clap::Parser;
 use crossbeam_queue::SegQueue;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,6 +48,12 @@ struct Args {
     /// 0 means unlimited. Lets Veloce share bandwidth politely (an IDM staple).
     #[arg(long, default_value_t = 0)]
     max_rate: u64,
+
+    /// Suppress the interactive terminal progress bars (indicatif). The
+    /// coordinator sets this so many concurrent engines don't garble its
+    /// terminal — machine-readable JSON progress on stdout is unaffected.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
 }
 
 /// Global token-bucket rate limiter shared by every connection. A 1-second
@@ -423,7 +429,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // ── Progress bars (stderr; bypasses Node buffering, renders ANSI when TTY) ──
-    let mp = Arc::new(MultiProgress::new());
+    // In --quiet mode the draw target is hidden so nothing is written to the
+    // terminal (the coordinator relies on the JSON stdout stream instead).
+    let mp = Arc::new(if args.quiet {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    } else {
+        MultiProgress::new()
+    });
     let header_style = ProgressStyle::with_template(
         "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} | {binary_bytes_per_sec} | ETA {eta}",
     )

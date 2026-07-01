@@ -5,6 +5,16 @@ export const selectedDirectory = writable<string | null>(null);
 export const pickerError = writable<string | null>(null);
 export const interceptEnabled = writable(true);
 
+export interface VeloceSettings {
+	maxConcurrentDownloads: number;
+	defaultThreads: number;
+	maxRateBytes: number;
+	baseDirectory: string;
+	engineQuiet: boolean;
+}
+
+export const settings = writable<VeloceSettings | null>(null);
+
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
 
 export interface DownloadItem {
@@ -17,9 +27,34 @@ export interface DownloadItem {
 	etaSecs: number;
 	error?: string;
 	updatedAt: number;
+	/** Stable first-seen sequence — fixes each row's position so the list never reshuffles. */
+	order: number;
 }
 
 export const downloads = writable<Record<string, DownloadItem>>({});
+
+// Monotonic counter assigned once per download (on first sight) and never changed,
+// so progress updates can't reorder the queue.
+let orderSeq = 0;
+const orderById = new Map<string, number>();
+
+function orderFor(id: string): number {
+	let o = orderById.get(id);
+	if (o === undefined) {
+		o = orderSeq++;
+		orderById.set(id, o);
+	}
+	return o;
+}
+
+/** Rebuild the store from a backend snapshot while preserving stable per-id order. */
+function setDownloadsFromSnapshot(entries: Record<string, DownloadItem>) {
+	const map: Record<string, DownloadItem> = {};
+	for (const [id, d] of Object.entries(entries)) {
+		map[id] = { ...d, id, order: orderFor(id) };
+	}
+	downloads.set(map);
+}
 
 function upsertDownload(id: string, patch: Partial<DownloadItem>) {
 	downloads.update((map) => {
@@ -31,9 +66,11 @@ function upsertDownload(id: string, patch: Partial<DownloadItem>) {
 			total: 0,
 			speedBps: 0,
 			etaSecs: 0,
-			updatedAt: Date.now()
+			updatedAt: Date.now(),
+			order: orderFor(id)
 		};
-		return { ...map, [id]: { ...prev, ...patch, updatedAt: Date.now() } };
+		// Never let an incoming patch overwrite the stable order.
+		return { ...map, [id]: { ...prev, ...patch, order: prev.order, updatedAt: Date.now() } };
 	});
 }
 
@@ -65,11 +102,7 @@ class VeloceWebSocketClient {
 					selectedDirectory.set((msg.selectedDirectory as string | null) ?? null);
 				}
 				if (msg.downloads && typeof msg.downloads === 'object') {
-					const map: Record<string, DownloadItem> = {};
-					for (const [id, d] of Object.entries(msg.downloads as Record<string, DownloadItem>)) {
-						map[id] = { ...d, id };
-					}
-					downloads.set(map);
+					setDownloadsFromSnapshot(msg.downloads as Record<string, DownloadItem>);
 				}
 				break;
 			case 'VELOCE_DOWNLOAD_UPDATE':
@@ -93,6 +126,9 @@ class VeloceWebSocketClient {
 				break;
 			case 'VELOCE_PICKER_ERROR':
 				pickerError.set((msg.error as string) ?? 'Folder picker unavailable.');
+				break;
+			case 'VELOCE_SETTINGS':
+				if (msg.settings) settings.set(msg.settings as VeloceSettings);
 				break;
 		}
 	}
@@ -120,25 +156,28 @@ class VeloceWebSocketClient {
 			isConnected.set(!!r.veloce_connected);
 		});
 
-		void chromeSend<{ connected: boolean; downloads: Record<string, DownloadItem>; selectedDirectory: string | null }>({
+		void chromeSend<{ connected: boolean; downloads: Record<string, DownloadItem>; selectedDirectory: string | null; settings: VeloceSettings | null }>({
 			type: 'VELOCE_CONNECT'
 		}).then((state) => {
 			isConnected.set(!!state?.connected);
 			if (state?.selectedDirectory) selectedDirectory.set(state.selectedDirectory);
 			if (state?.downloads) {
-				const map: Record<string, DownloadItem> = {};
-				for (const [id, d] of Object.entries(state.downloads)) {
-					map[id] = { ...d, id };
-				}
-				downloads.set(map);
+				setDownloadsFromSnapshot(state.downloads);
 			}
+			if (state?.settings) settings.set(state.settings);
 		}).catch(() => {
 			isConnected.set(false);
 		});
 	}
 
-	sendDownloadRequest(url: string, fileName: string, baseDirectory?: string, threads: number = 8) {
-		void chromeSend({ type: 'VELOCE_NEW_DOWNLOAD', payload: { url, fileName, baseDirectory, threads } });
+	sendDownloadRequest(
+		url: string,
+		fileName: string,
+		baseDirectory?: string,
+		threads: number = 8,
+		playlist: boolean = false
+	) {
+		void chromeSend({ type: 'VELOCE_NEW_DOWNLOAD', payload: { url, fileName, baseDirectory, threads, playlist } });
 	}
 
 	pauseDownload(id: string) {
@@ -153,6 +192,12 @@ class VeloceWebSocketClient {
 	removeDownload(id: string) {
 		void chromeSend({ type: 'VELOCE_CONTROL', action: 'REMOVE_DOWNLOAD', downloadId: id });
 	}
+	openFile(id: string) {
+		void chromeSend({ type: 'VELOCE_CONTROL', action: 'OPEN_FILE', downloadId: id });
+	}
+	revealFile(id: string) {
+		void chromeSend({ type: 'VELOCE_CONTROL', action: 'REVEAL_FILE', downloadId: id });
+	}
 
 	requestDirectoryPicker() {
 		void chromeSend({ type: 'VELOCE_DIRECTORY_PICKER' });
@@ -161,6 +206,10 @@ class VeloceWebSocketClient {
 	setInterceptEnabled(enabled: boolean) {
 		interceptEnabled.set(enabled);
 		if (hasChrome) chrome.storage.local.set({ veloce_intercept: enabled });
+	}
+
+	updateSettings(patch: Partial<VeloceSettings>) {
+		void chromeSend({ type: 'VELOCE_SET_SETTINGS', payload: patch });
 	}
 }
 

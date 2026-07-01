@@ -57,6 +57,10 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Filename collision auto-rename** — a new download that would overwrite an unrelated existing file/row is renamed `name (1).ext`, `name (2).ext`, … instead of clobbering it.
 *   **Crash recovery / reconciliation** — on startup the coordinator re-queues any download left `downloading`/`queued` from a previous run; the engine resumes it from `.veloce_state`.
 *   **Pause / Resume / Cancel / Remove** — live control of in-flight jobs. Pausing `SIGTERM`s the engine (state preserved); resuming re-launches and resumes; for video sites the direct URL is **re-extracted on resume** so expired CDN links are refreshed.
+*   **Open file / Reveal in folder** — completed downloads can be opened (`xdg-open`) or highlighted in the file manager (`org.freedesktop.FileManager1`, falling back to opening the folder).
+*   **Live runtime settings** — max concurrent downloads, default connections, global speed cap, base directory and quiet-engine mode are editable from the popup / dashboard, persisted per-device and applied without a restart.
+*   **Playlist expansion** — a URL flagged as a playlist is expanded via `yt-dlp --flat-playlist` and each entry is queued as its own download.
+*   **Quiet engine** — the coordinator launches the engine with `--quiet` so many concurrent downloads don't garble the terminal (machine-readable JSON progress is unaffected).
 *   **Broadcast model** — progress is broadcast to all connected popups (and to a popup that connects *after* a download started, e.g. a reconciled one), not tied to one socket.
 *   **Resilient folder picker** — tries `zenity`, then `kdialog`, and reports when neither is available.
 
@@ -64,8 +68,16 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **In-page capture** — content script badges every downloadable `<a>`, `<video>`, `<audio>`, and video/social page; format picker via `LIST_FORMATS` (yt-dlp JSON).
 *   **Download interception** — `chrome.downloads.onCreated` cancels native downloads when coordinator is online (toggle in popup).
 *   **Persistent background WS** — service worker keeps the connection alive when popup is closed.
-*   **Live progress UI** — navy/white popup with queue, speed, ETA, pause/resume/cancel.
+*   **Live progress UI** — navy/white popup with queue, speed, ETA, pause/resume/cancel, and open/reveal for finished files.
 *   **State rehydration** — snapshot on connect survives popup reload.
+*   **Desktop notifications** — a system notification fires when a download completes, fails, or a playlist is queued.
+*   **Context menu** — right-click a link, image, video or audio element → *Download with Veloce*; or *Download all media links on page* (scans anchors via `chrome.scripting`).
+*   **Settings panel** — tune concurrency, connections, speed cap and quiet-engine mode from the popup; synced live to the coordinator.
+*   **Playlist toggle** — check *Treat URL as a playlist* to queue every item in one action.
+*   **Duplicate-safe link capture** — the in-page link interceptor caches the coordinator's online state so it can `preventDefault()` synchronously, preventing the browser from starting a parallel native download.
+
+### Local Dashboard (`backend/`)
+*   A **navy/white web dashboard** at `http://localhost:14921` (same origin as the coordinator) connects to the WebSocket directly and offers the full queue, live progress, pause/resume/cancel/open/reveal, a new-download form (with playlist support), and the runtime settings editor — no extension required.
 
 ## 📖 Issues resolved — problem, impact, and how we fixed it
 
@@ -111,6 +123,7 @@ The coordinator reads `backend/.env` at startup (real environment variables over
 | `VELOCE_DEFAULT_THREADS` | `8` | Connections per download when unspecified. |
 | `VELOCE_MAX_RATE_BYTES` | `0` | Global speed cap per download in bytes/sec (`0` = unlimited). |
 | `VELOCE_MIN_FREE_DISK_MB` | `500` | Refuse to start if less free space than this. |
+| `VELOCE_ENGINE_QUIET` | `true` | Suppress the engine's terminal progress bars (keeps the log clean). Tunable live. |
 | `VELOCE_BASE_DIR` | *(empty)* | Override the default `~/Downloads/Veloce` base dir. |
 | `VELOCE_ALLOWED_EXTENSION_IDS` | *(empty)* | Comma-separated extension IDs allowed to connect (empty = any extension). |
 | `VELOCE_BLOCK_PRIVATE_HOSTS` | `true` | Block local/private/metadata hosts (SSRF guard). |
@@ -148,6 +161,10 @@ These are the failure modes that bite naive downloaders. Each is handled so the 
 | Bandwidth cap | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Retry-After`-aware backoff | ? | ✅ | partial | ? | ✅ |
 | Video/social extraction (yt-dlp) | partial | ❌ | ✅ | partial | ✅ |
+| Playlist expansion | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Desktop notifications | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Local web dashboard | ✅ | partial (RPC) | ✅ | ✅ | ✅ |
+| Live-tunable settings (no restart) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | SSRF / origin hardening | n/a (native) | n/a | n/a | n/a | ✅ |
 | Checksum / hash verification | partial | ✅ (Metalink) | ✅ | partial | ⏳ planned |
 | Multi-source / mirror download | ❌ | ✅ (Metalink) | ✅ | ❌ | ⏳ planned |
@@ -157,6 +174,34 @@ These are the failure modes that bite naive downloaders. Each is handled so the 
 | Browser auto-capture / link grabber | ✅ | ❌ | ✅ | ✅ | ✅ |
 
 > **Roadmap (next):** checksum verification (SHA-256/Metalink), multi-source/mirror fetch, HTTP proxy + Basic/Bearer auth, time-of-day scheduler.
+
+## 🛠️ Setup
+
+One command builds the engine, installs dependencies and builds the extension:
+
+```bash
+./scripts/setup.sh
+```
+
+It checks prerequisites (`cargo`, `node`, `pnpm`/`npm`, and warns if `yt-dlp` is missing), builds `core_engine`, installs the backend + extension deps, builds the extension into `extension/build`, and scaffolds `backend/.env`.
+
+**Run the coordinator on login** (Linux, systemd user service):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp scripts/veloce.service ~/.config/systemd/user/veloce.service
+# edit WorkingDirectory / ExecStart paths inside, then:
+systemctl --user daemon-reload
+systemctl --user enable --now veloce.service
+```
+
+## 🧪 Testing
+
+Backend unit tests (URL-safety/SSRF guard, filename sanitization, path confinement, category mapping, direct-URL/extractor detection) run with Vitest:
+
+```bash
+cd backend && pnpm test
+```
 
 ## 🖱️ Using in-page capture
 

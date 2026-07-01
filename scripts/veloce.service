@@ -1,0 +1,33 @@
+# Veloce Local Coordinator — systemd *user* service.
+#
+# Install (Linux):
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/veloce.service ~/.config/systemd/user/veloce.service
+#   # Edit WorkingDirectory + ExecStart below to match your install path and
+#   # package manager, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now veloce.service
+#   systemctl --user status veloce.service      # check it's running
+#   journalctl --user -u veloce.service -f       # follow logs
+#
+# The service runs the coordinator (which spawns the Rust engine) on login.
+
+[Unit]
+Description=Veloce Local Coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ↓↓↓ EDIT THESE to your absolute paths ↓↓↓
+WorkingDirectory=%h/Documents/Notes/Rust/Veloce/backend
+ExecStart=/usr/bin/env pnpm run dev
+# ↑↑↑ EDIT THESE ↑↑↑
+Restart=on-failure
+RestartSec=3
+# Keep a bounded log; the coordinator is chatty on first connect.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

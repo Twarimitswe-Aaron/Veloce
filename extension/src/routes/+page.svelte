@@ -6,7 +6,9 @@
 		downloads,
 		pickerError,
 		interceptEnabled,
-		type DownloadItem
+		settings,
+		type DownloadItem,
+		type VeloceSettings
 	} from '$lib/wsClient';
 	import { onMount } from 'svelte';
 
@@ -14,9 +16,38 @@
 	let fileName = $state('');
 	let baseDirectory = $state('');
 	let threadCount = $state(8);
+	let asPlaylist = $state(false);
+	let showSettings = $state(false);
 
+	// Local editable copies of server settings (synced when the store updates).
+	let sMaxConcurrent = $state(10);
+	let sDefaultThreads = $state(8);
+	let sMaxRateMB = $state(0);
+	let sEngineQuiet = $state(true);
+
+	$effect(() => {
+		const s = $settings as VeloceSettings | null;
+		if (s) {
+			sMaxConcurrent = s.maxConcurrentDownloads;
+			sDefaultThreads = s.defaultThreads;
+			sMaxRateMB = Math.round((s.maxRateBytes / (1024 * 1024)) * 10) / 10;
+			sEngineQuiet = s.engineQuiet;
+		}
+	});
+
+	function saveSettings() {
+		wsClient.updateSettings({
+			maxConcurrentDownloads: sMaxConcurrent,
+			defaultThreads: sDefaultThreads,
+			maxRateBytes: Math.round(sMaxRateMB * 1024 * 1024),
+			engineQuiet: sEngineQuiet
+		});
+	}
+
+	// Sort by stable first-seen order so rows keep their position and never reshuffle
+	// while multiple downloads report progress concurrently.
 	let downloadList = $derived(
-		Object.values($downloads).sort((a, b) => b.updatedAt - a.updatedAt)
+		Object.values($downloads).sort((a, b) => a.order - b.order)
 	);
 
 	const inputClass =
@@ -65,7 +96,7 @@
 				extractedName = 'download_file';
 			}
 		}
-		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory, threadCount);
+		wsClient.sendDownloadRequest(downloadUrl, extractedName, baseDirectory, threadCount, asPlaylist);
 		downloadUrl = '';
 		fileName = '';
 	}
@@ -146,6 +177,11 @@
 			</select>
 		</div>
 
+		<label class="flex items-center gap-2 text-[11px] opacity-80 cursor-pointer">
+			<input type="checkbox" bind:checked={asPlaylist} class="accent-white" />
+			Treat URL as a playlist (queue every item)
+		</label>
+
 		<button
 			disabled={!$isConnected || !downloadUrl}
 			onclick={handleDownload}
@@ -153,6 +189,46 @@
 		>
 			Download
 		</button>
+	</div>
+
+	<!-- Settings -->
+	<div class="border border-white/20">
+		<button
+			type="button"
+			onclick={() => (showSettings = !showSettings)}
+			class="w-full flex items-center justify-between px-3 py-2 text-[10px] uppercase tracking-widest opacity-70 hover:bg-[#002a55] cursor-pointer"
+		>
+			<span>Settings</span>
+			<span>{showSettings ? '▲' : '▼'}</span>
+		</button>
+		{#if showSettings}
+			<div class="flex flex-col gap-3 p-3 border-t border-white/15">
+				<div>
+					<label for="maxc" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Max concurrent downloads</label>
+					<input id="maxc" type="number" min="1" max="64" bind:value={sMaxConcurrent} class={inputClass} />
+				</div>
+				<div>
+					<label for="dthreads" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Default connections</label>
+					<input id="dthreads" type="number" min="1" max="64" bind:value={sDefaultThreads} class={inputClass} />
+				</div>
+				<div>
+					<label for="rate" class="block text-[10px] uppercase tracking-widest opacity-60 mb-1">Speed cap (MB/s, 0 = unlimited)</label>
+					<input id="rate" type="number" min="0" step="0.1" bind:value={sMaxRateMB} class={inputClass} />
+				</div>
+				<label class="flex items-center gap-2 text-[11px] opacity-80 cursor-pointer">
+					<input type="checkbox" bind:checked={sEngineQuiet} class="accent-white" />
+					Quiet engine (no terminal progress bars)
+				</label>
+				<button
+					type="button"
+					disabled={!$isConnected}
+					onclick={saveSettings}
+					class="w-full border border-white py-1.5 text-xs font-medium hover:bg-[#002a55] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+				>
+					Save settings
+				</button>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Queue -->
@@ -171,7 +247,7 @@
 					{:else}
 						<div class="h-1 w-full bg-white/15">
 							<div
-								class="h-full bg-white transition-all duration-200"
+								class="h-full bg-white transition-[width] duration-200"
 								style="width: {d.status === 'completed' ? 100 : pct(d)}%"
 							></div>
 						</div>
@@ -202,6 +278,10 @@
 							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
 								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
 						{:else if d.status === 'completed'}
+							<button type="button" onclick={() => wsClient.openFile(d.id)}
+								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Open</button>
+							<button type="button" onclick={() => wsClient.revealFile(d.id)}
+								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Folder</button>
 							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
 								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
 						{/if}

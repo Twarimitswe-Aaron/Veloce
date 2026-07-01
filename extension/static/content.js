@@ -237,11 +237,84 @@
 
 	const badges = new Map(); // badgeKey -> { el, anchor, root, rawUrl, resolvedUrl, labelEl }
 	const badgeKeys = new Set();
-	const badgeRoots = new WeakSet();
-	const localFormatCache = new Map(); // badgeKey -> formats[]
-	const prefetchStarted = new Set(); // badgeKey
+	const localFormatCache = new Map();
+	const prefetchStarted = new Set();
+	const MAX_PREFETCH_BATCH = 3;
+	const BADGE_MARGIN_PX = 200;
+	const PREFETCH_MARGIN_PX = 80;
+	const SCANNED_ATTR = 'data-veloce-scanned';
+	const WATCH_ATTR = 'data-veloce-watch';
+	const TAB_PING_MS = 50000;
 	let openMenu = null;
 	let pendingMenuUrl = null;
+	let tabPort = null;
+	let tabPingTimer = null;
+	// Cached coordinator state so the link-click handler can preventDefault()
+	// synchronously — otherwise the native download starts before an async check
+	// returns, and chrome.downloads.onCreated would create a second copy.
+	let coordinatorOnline = false;
+
+	if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+		chrome.storage.local.get('veloce_connected', (r) => {
+			coordinatorOnline = r.veloce_connected === true;
+		});
+		chrome.storage.onChanged?.addListener((changes, area) => {
+			if (area === 'local' && changes.veloce_connected) {
+				coordinatorOnline = changes.veloce_connected.newValue === true;
+			}
+		});
+	}
+
+	function connectTabPort() {
+		try {
+			if (tabPort) return;
+			tabPort = chrome.runtime.connect({ name: 'veloce-tab' });
+			tabPort.onDisconnect.addListener(() => {
+				tabPort = null;
+				setTimeout(connectTabPort, 800);
+			});
+		} catch {
+			setTimeout(connectTabPort, 1500);
+		}
+	}
+
+	function startTabPing() {
+		if (tabPingTimer || document.hidden) return;
+		tabPingTimer = setInterval(() => {
+			if (document.hidden) return;
+			try {
+				if (tabPort) tabPort.postMessage({ type: 'ping' });
+				else connectTabPort();
+			} catch {
+				tabPort = null;
+				connectTabPort();
+			}
+		}, TAB_PING_MS);
+	}
+
+	function stopTabPing() {
+		if (tabPingTimer) {
+			clearInterval(tabPingTimer);
+			tabPingTimer = null;
+		}
+	}
+
+	connectTabPort();
+	startTabPing();
+
+	document.addEventListener('visibilitychange', () => {
+		if (document.visibilityState === 'visible') {
+			connectTabPort();
+			startTabPing();
+			scan();
+		} else {
+			stopTabPing();
+		}
+	});
+	window.addEventListener('pageshow', () => {
+		connectTabPort();
+		startTabPing();
+	});
 
 	function markBadgeReady(badgeKey) {
 		const entry = badges.get(badgeKey);
@@ -258,36 +331,44 @@
 		markBadgeReady(key);
 	}
 
-	function eagerPrefetch(url) {
-		const key = normalizeBadgeKey(url);
-		if (localFormatCache.has(key) || prefetchStarted.has(key)) return;
-		prefetchStarted.add(key);
-		try {
-			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FORMATS', url });
-		} catch { /* ignore */ }
+	function isNearViewport(el, margin = BADGE_MARGIN_PX) {
+		if (!el?.getBoundingClientRect) return false;
+		const r = el.getBoundingClientRect();
+		return r.width > 0 && r.height > 0 && r.bottom > -margin && r.top < window.innerHeight + margin;
 	}
 
-	// Prefetch as media scrolls near the viewport — before the user clicks.
-	const viewportPrefetch = new IntersectionObserver((entries) => {
-		for (const entry of entries) {
-			if (!entry.isIntersecting) continue;
-			const el = entry.target;
-			const tag = el.tagName?.toLowerCase();
-			const raw = tag === 'a' ? el.href : (el.currentSrc || el.src);
-			if (!raw) continue;
-			const resolved = resolveDownloadUrl(raw, el);
-			if (resolved) eagerPrefetch(resolved);
-		}
-	}, { rootMargin: '240px', threshold: 0.05 });
+	function isSocialFeedPage() {
+		return VIDEO_SITES.test(location.hostname) &&
+			!/\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
+	}
 
-	function observeForPrefetch(el) {
-		if (!el || el.__velocePrefetchObserved) return;
-		el.__velocePrefetchObserved = true;
-		viewportPrefetch.observe(el);
+	function eagerPrefetch(url) {
+		prefetchPageUrls([{ url, priority: true }]);
+	}
+
+	/** Queue format fetch — skips when tab hidden; caps batch size. */
+	function prefetchPageUrls(entries) {
+		if (document.hidden) return;
+		const sorted = [...entries].sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
+		const batch = [];
+		for (const { url, priority } of sorted) {
+			const key = normalizeBadgeKey(url);
+			if (localFormatCache.has(key) || prefetchStarted.has(key)) continue;
+			if (batch.length >= MAX_PREFETCH_BATCH) break;
+			prefetchStarted.add(key);
+			batch.push({ url, priority: !!priority });
+		}
+		if (!batch.length) return;
+		try {
+			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_BATCH', urls: batch });
+		} catch { /* ignore */ }
 	}
 
 	if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
 		chrome.runtime.onMessage.addListener((msg) => {
+			if (msg.type === 'VELOCE_STATE') {
+				coordinatorOnline = msg.connected === true;
+			}
 			if (msg.type === 'VELOCE_FORMATS_READY' && msg.url && msg.formats?.length) {
 				storeFormats(msg.url, msg.formats);
 				if (openMenu && pendingMenuUrl === normalizeBadgeKey(msg.url)) {
@@ -298,12 +379,12 @@
 					pendingMenuUrl = null;
 				}
 			}
+			if (msg.type === 'VELOCE_FORMATS_FAILED' && msg.url) {
+				prefetchStarted.delete(normalizeBadgeKey(msg.url));
+			}
 		});
 	}
 
-	try {
-		chrome.runtime.sendMessage({ type: 'VELOCE_WARMUP' });
-	} catch { /* ignore */ }
 
 	function closeMenu() {
 		if (openMenu) {
@@ -343,49 +424,61 @@
 		}
 	}
 
-	function placeBadge(resolvedUrl, anchor, rawUrl) {
+	let badgeLayoutQueued = false;
+
+	function scheduleBadgeLayout() {
+		if (badgeLayoutQueued || badges.size === 0) return;
+		badgeLayoutQueued = true;
+		requestAnimationFrame(() => {
+			badgeLayoutQueued = false;
+			for (const [, entry] of badges) {
+				const { el, root } = entry;
+				if (!root?.isConnected) continue;
+				const rect = root.getBoundingClientRect();
+				if (rect.width === 0 && rect.height === 0) {
+					el.style.display = 'none';
+					continue;
+				}
+				el.style.display = 'flex';
+				el.style.top = `${Math.max(4, rect.top + 4)}px`;
+				el.style.left = `${Math.max(4, Math.min(rect.right - 72, window.innerWidth - 80))}px`;
+			}
+		});
+	}
+
+	window.addEventListener('scroll', scheduleBadgeLayout, { passive: true });
+	window.addEventListener('resize', scheduleBadgeLayout, { passive: true });
+
+	function placeBadge(resolvedUrl, anchor, rawUrl, startPrefetch = false) {
 		const badgeKey = normalizeBadgeKey(resolvedUrl);
 		const root = findBadgeRoot(anchor);
 
-		if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
+		if (badgeKeys.has(badgeKey)) return;
 
 		const el = document.createElement('div');
 		el.className = 'badge badge-loading';
 		el.appendChild(iconSvg());
 		const label = document.createElement('span');
-		label.textContent = '…';
+		label.textContent = 'Veloce';
 		el.appendChild(label);
 
 		el.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			openFormatMenu(rawUrl, anchor, el);
+			openFormatMenu(resolvedUrl, anchor, el);
 		});
 
 		shadow.appendChild(el);
 		badgeKeys.add(badgeKey);
-		badgeRoots.add(root);
 		badges.set(badgeKey, { el, anchor, root, rawUrl, resolvedUrl, labelEl: label });
 
 		if (localFormatCache.has(badgeKey)) {
 			markBadgeReady(badgeKey);
+		} else if (startPrefetch) {
+			prefetchPageUrls([{ url: resolvedUrl }]);
 		}
 
-		const updatePos = () => {
-			const rect = root.getBoundingClientRect();
-			if (rect.width === 0 && rect.height === 0) {
-				el.style.display = 'none';
-				return;
-			}
-			el.style.display = 'flex';
-			el.style.top = `${Math.max(4, rect.top + 4)}px`;
-			el.style.left = `${Math.max(4, Math.min(rect.right - 72, window.innerWidth - 80))}px`;
-		};
-		updatePos();
-		const ro = new ResizeObserver(updatePos);
-		ro.observe(root);
-		window.addEventListener('scroll', updatePos, { passive: true });
-		window.addEventListener('resize', updatePos, { passive: true });
+		scheduleBadgeLayout();
 	}
 
 	function positionMenu(menu, badgeEl) {
@@ -403,7 +496,7 @@
 		menu.style.left = `${Math.max(8, left)}px`;
 	}
 
-	function showLoadingStatus(menu, closeBtn, rawUrl) {
+	function showLoadingStatus(menu, closeBtn) {
 		const status = document.createElement('div');
 		status.className = 'menu-status menu-loading';
 
@@ -412,7 +505,7 @@
 		status.appendChild(spinner);
 
 		const text = document.createElement('span');
-		text.textContent = isBrowserOnlyUrl(rawUrl) ? 'Resolving post URL…' : 'Loading formats…';
+		text.textContent = 'Loading formats…';
 		status.appendChild(text);
 
 		menu.insertBefore(status, closeBtn);
@@ -420,11 +513,7 @@
 		const t0 = Date.now();
 		const timer = setInterval(() => {
 			const secs = Math.floor((Date.now() - t0) / 1000);
-			if (secs > 0) {
-				text.textContent = isBrowserOnlyUrl(rawUrl)
-					? `Resolving post URL… ${secs}s`
-					: `Loading formats… ${secs}s`;
-			}
+			if (secs > 0) text.textContent = `Loading formats… ${secs}s`;
 		}, 400);
 
 		return {
@@ -460,7 +549,6 @@
 					};
 					chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload });
 				});
-				});
 			});
 			menu.insertBefore(btn, closeBtn);
 		}
@@ -471,8 +559,8 @@
 		renderFormatButtons(menu, closeBtn, formats, url);
 	}
 
-	function openFormatMenu(rawUrl, anchor, badgeEl) {
-		const url = resolveDownloadUrl(rawUrl, anchor);
+	function openFormatMenu(resolvedUrl, anchor, badgeEl) {
+		const url = resolvedUrl || resolveDownloadUrl(anchor?.currentSrc || anchor?.src || anchor?.href, anchor);
 		closeMenu();
 		const menu = document.createElement('div');
 		menu.className = 'menu';
@@ -495,9 +583,7 @@
 		if (!url) {
 			const err = document.createElement('div');
 			err.className = 'menu-status';
-			err.textContent = isBrowserOnlyUrl(rawUrl)
-				? 'This video uses a browser-only blob URL. Veloce will use the Instagram post link — open the post (/p/…) or click the badge on the video card in your feed after reloading the extension.'
-				: 'No downloadable URL found for this item.';
+			err.textContent = 'No downloadable URL found for this item.';
 			menu.insertBefore(err, closeBtn);
 			return;
 		}
@@ -509,13 +595,12 @@
 			return;
 		}
 
-		// Still loading from eager prefetch — keep menu open with spinner briefly.
 		let busyPort = null;
 		try {
 			busyPort = chrome.runtime.connect({ name: 'veloce-busy' });
 		} catch { /* ignore */ }
 
-		const loading = showLoadingStatus(menu, closeBtn, rawUrl);
+		const loading = showLoadingStatus(menu, closeBtn);
 		pendingMenuUrl = badgeKey;
 		eagerPrefetch(url);
 
@@ -543,43 +628,75 @@
 		});
 	}
 
+
+	function shouldWatchLink(a) {
+		try {
+			const href = a.href;
+			if (!href || href.startsWith('javascript:') || !isHttpUrl(href)) return false;
+			if (CDN_IMAGE.test(href) && /\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(href)) return false;
+			// Feed pages: video nodes resolve the same post URL — skip link observers.
+			if (VIDEO_SITES.test(location.hostname) && /\/(p|reel|tv)\//.test(href)) {
+				return !isSocialFeedPage();
+			}
+			return a.hasAttribute('download') || FILE_EXT.test(href);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Show badge when near viewport; prefetch only when close enough to likely click. */
+	function processMediaElement(el) {
+		if (!el || el.getAttribute(SCANNED_ATTR) || document.hidden) return null;
+		const rawUrl = el.tagName === 'A' ? el.href : (el.currentSrc || el.src);
+		if (!rawUrl) return null;
+		const url = resolveDownloadUrl(rawUrl, el);
+		if (!url) return null;
+		el.setAttribute(SCANNED_ATTR, '1');
+		try { mediaIo.unobserve(el); } catch { /* ignore */ }
+		const startPrefetch = isNearViewport(el, PREFETCH_MARGIN_PX);
+		if (!badgeKeys.has(normalizeBadgeKey(url))) placeBadge(url, el, rawUrl, startPrefetch);
+		return url;
+	}
+
+	let watchBudget = 30;
+
+	function watchElement(el) {
+		if (!el || el.getAttribute(WATCH_ATTR) || watchBudget <= 0) return;
+		const tag = el.tagName;
+		if (tag === 'A') {
+			if (!shouldWatchLink(el)) return;
+		} else if (tag !== 'VIDEO' && tag !== 'AUDIO') {
+			return;
+		}
+		watchBudget--;
+		el.setAttribute(WATCH_ATTR, '1');
+		mediaIo.observe(el);
+		if (isNearViewport(el, BADGE_MARGIN_PX)) processMediaElement(el);
+	}
+
+	function scanSubtree(root) {
+		if (!root?.querySelectorAll) return;
+		if (root.nodeType === 1) watchElement(root);
+		root.querySelectorAll(
+			'a[href]:not([data-veloce-watch]), video:not([data-veloce-watch]), audio:not([data-veloce-watch])'
+		).forEach(watchElement);
+	}
+
+	const mediaIo = new IntersectionObserver(
+		(entries) => {
+			if (document.hidden) return;
+			for (const entry of entries) {
+				if (!entry.isIntersecting) continue;
+				processMediaElement(entry.target);
+			}
+		},
+		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
+	);
+
 	function scan() {
 		pruneBadges();
-
-		function tryBadge(rawUrl, anchor) {
-			const url = resolveDownloadUrl(rawUrl, anchor);
-			if (!url) return;
-			const badgeKey = normalizeBadgeKey(url);
-			const root = findBadgeRoot(anchor);
-
-			observeForPrefetch(anchor);
-			eagerPrefetch(url);
-
-			if (badgeKeys.has(badgeKey) || badgeRoots.has(root)) return;
-			placeBadge(url, anchor, rawUrl);
-		}
-
-		document.querySelectorAll('a[href]').forEach((a) => {
-			try {
-				const href = a.href;
-				if (!href || href.startsWith('javascript:') || !isHttpUrl(href)) return;
-				if (CDN_IMAGE.test(href) && /\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(href)) return;
-				if (a.hasAttribute('download') || FILE_EXT.test(href)) {
-					observeForPrefetch(a);
-					const resolved = resolveDownloadUrl(href, a);
-					if (resolved) eagerPrefetch(resolved);
-					tryBadge(href, a);
-				}
-			} catch { /* ignore */ }
-		});
-
-		document.querySelectorAll('video, audio').forEach((el) => {
-			const src = el.currentSrc || el.src;
-			if (src) {
-				observeForPrefetch(el);
-				tryBadge(src, el);
-			}
-		});
+		watchBudget = 30;
+		scanSubtree(document);
 	}
 
 	document.addEventListener('click', (e) => {
@@ -589,16 +706,41 @@
 		if (!href || !isHttpUrl(href)) return;
 		if (!a.hasAttribute('download') && !FILE_EXT.test(href)) return;
 
-		chrome.runtime.sendMessage({ type: 'VELOCE_GET_STATE' }, (state) => {
-			if (!state?.connected) return;
-			e.preventDefault();
-			e.stopPropagation();
-			openFormatMenu(href, a, a);
-		});
+		// Only intercept when the coordinator is online. preventDefault MUST run
+		// synchronously here — deferring it (e.g. inside a sendMessage callback)
+		// lets the browser start a native download, which chrome.downloads.onCreated
+		// would then turn into a duplicate of the one the format menu starts.
+		if (!coordinatorOnline) return;
+		e.preventDefault();
+		e.stopPropagation();
+		openFormatMenu(resolveDownloadUrl(href, a) || href, a, a);
 	}, true);
 
+	let scanTimer = null;
+	let pendingMutations = [];
+
+	function scheduleScan() {
+		clearTimeout(scanTimer);
+		scanTimer = setTimeout(() => {
+			scanTimer = null;
+			watchBudget = 30;
+			const batch = pendingMutations.splice(0);
+			for (const m of batch) {
+				for (const node of m.addedNodes) {
+					if (node.nodeType !== 1) continue;
+					scanSubtree(node);
+					if (watchBudget <= 0) break;
+				}
+				if (watchBudget <= 0) break;
+			}
+		}, 600);
+	}
+
 	scan();
-	const observer = new MutationObserver(() => scan());
+	const observer = new MutationObserver((mutations) => {
+		pendingMutations.push(...mutations);
+		scheduleScan();
+	});
 	observer.observe(document.documentElement, { childList: true, subtree: true });
-	setInterval(scan, 2000);
+	setInterval(pruneBadges, 30000);
 })();

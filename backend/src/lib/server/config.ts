@@ -66,6 +66,8 @@ export const config = {
 	maxRateBytes: num('VELOCE_MAX_RATE_BYTES', 0),
 	/** Minimum free disk space (MB) required before starting a download. */
 	minFreeDiskMb: num('VELOCE_MIN_FREE_DISK_MB', 500),
+	/** Suppress the engine's terminal progress bars (keeps the coordinator log clean). */
+	engineQuiet: bool('VELOCE_ENGINE_QUIET', true),
 	/** Optional override for the default base download directory. */
 	baseDir: env['VELOCE_BASE_DIR'] || '',
 	/**

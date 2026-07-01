@@ -11,8 +11,9 @@ import { statfs, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import { extractMediaUrl, listFormats } from './extractor';
+import { extractMediaUrl, listFormats, listPlaylistEntries, getRecentFormatError, isDirectFileUrl } from './extractor';
 import { config } from './config';
+import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from './util';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
@@ -67,63 +68,6 @@ function isAllowedOrigin(origin?: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-/**
- * Validate a user-supplied download URL: only http(s), and (optionally) block
- * hosts that point back at the local machine / private networks / cloud
- * metadata endpoints. This is an SSRF guard — important because the engine
- * fetches whatever URL it is given.
- */
-function isSafeDownloadUrl(raw: string): { ok: true } | { ok: false; reason: string } {
-	let u: URL;
-	try {
-		u = new URL(raw);
-	} catch {
-		return { ok: false, reason: 'Invalid URL.' };
-	}
-	if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-		return { ok: false, reason: `Unsupported protocol "${u.protocol}". Only http/https are allowed.` };
-	}
-	if (config.blockPrivateHosts) {
-		const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-		const isPrivate =
-			host === 'localhost' ||
-			host === '0.0.0.0' ||
-			host === '::1' ||
-			host.endsWith('.localhost') ||
-			/^127\./.test(host) ||
-			/^10\./.test(host) ||
-			/^192\.168\./.test(host) ||
-			/^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-			/^169\.254\./.test(host) || // link-local incl. 169.254.169.254 metadata
-			/^fe80:/i.test(host) ||
-			/^fc00:/i.test(host) ||
-			/^fd[0-9a-f]{2}:/i.test(host);
-		if (isPrivate) {
-			return { ok: false, reason: 'Downloads from local/private network addresses are blocked.' };
-		}
-	}
-	return { ok: true };
-}
-
-/** Strip any directory components / control chars so a filename can't escape its folder. */
-function sanitizeFileName(name: string): string {
-	let base = path.basename(name || '').replace(/[\\/\x00-\x1f]/g, '_').trim();
-	if (!base || base === '.' || base === '..') base = `download_${Date.now()}`;
-	return base.slice(0, 200);
-}
-
-/**
- * Join into a path that is guaranteed to stay within `baseDir`. Returns null if
- * the result would escape the base (defense-in-depth against traversal).
- */
-function safeJoin(baseDir: string, category: string, fileName: string): string | null {
-	const root = path.resolve(baseDir);
-	const target = path.resolve(root, category, sanitizeFileName(fileName));
-	const rel = path.relative(root, target);
-	if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
-	return target;
 }
 
 // ── Filesystem / disk helpers ────────────────────────────────────────────────
@@ -194,13 +138,111 @@ function pickDirectory(): string | null {
 	return null;
 }
 
+// ── Runtime settings (overridable at run time via SET_SETTINGS) ───────────────
+// Initialized from `.env` config; persisted per-device in `devices.settings` and
+// applied live so the popup / dashboard can tune behavior without a restart.
+interface RuntimeSettings {
+	maxConcurrentDownloads: number;
+	defaultThreads: number;
+	maxRateBytes: number;
+	baseDirectory: string;
+	engineQuiet: boolean;
+}
+
+const runtime: RuntimeSettings = {
+	maxConcurrentDownloads: config.maxConcurrentDownloads,
+	defaultThreads: config.defaultThreads,
+	maxRateBytes: config.maxRateBytes,
+	baseDirectory: config.baseDir || path.join(os.homedir(), 'Downloads', 'Veloce'),
+	engineQuiet: config.engineQuiet
+};
+
+function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+	const n = Math.round(Number(v));
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(max, Math.max(min, n));
+}
+
+/** Merge an untrusted partial settings object into the live runtime settings. */
+function applySettings(patch: Record<string, unknown>) {
+	if (patch.maxConcurrentDownloads !== undefined)
+		runtime.maxConcurrentDownloads = clampInt(patch.maxConcurrentDownloads, 1, 64, runtime.maxConcurrentDownloads);
+	if (patch.defaultThreads !== undefined)
+		runtime.defaultThreads = clampInt(patch.defaultThreads, 1, 64, runtime.defaultThreads);
+	if (patch.maxRateBytes !== undefined)
+		runtime.maxRateBytes = clampInt(patch.maxRateBytes, 0, Number.MAX_SAFE_INTEGER, runtime.maxRateBytes);
+	if (typeof patch.baseDirectory === 'string' && patch.baseDirectory.trim())
+		runtime.baseDirectory = patch.baseDirectory.trim();
+	if (typeof patch.engineQuiet === 'boolean') runtime.engineQuiet = patch.engineQuiet;
+}
+
+let settingsLoaded = false;
+
+/** Load persisted device settings into the live runtime (once, on first client). */
+async function loadSettings(macAddress: string) {
+	if (settingsLoaded) return;
+	settingsLoaded = true;
+	try {
+		const rows = await db.select().from(devices).where(eq(devices.id, macAddress));
+		const s = rows[0]?.settings as Record<string, unknown> | null;
+		if (s) applySettings(s);
+	} catch (e) {
+		console.error('Failed to load device settings:', e);
+	}
+}
+
+/** Persist the live runtime settings to this device's row. */
+async function persistSettings(macAddress: string) {
+	try {
+		await db.update(devices).set({ settings: { ...runtime } }).where(eq(devices.id, macAddress));
+	} catch (e) {
+		console.error('Failed to persist device settings:', e);
+	}
+}
+
+/** Open a path (file or folder) with the desktop's default handler, detached. */
+function xdgOpen(target: string): boolean {
+	try {
+		const child = spawn('xdg-open', [target], { stdio: 'ignore', detached: true });
+		child.on('error', (e) => console.error('xdg-open failed:', e));
+		child.unref();
+		return true;
+	} catch (e) {
+		console.error('xdg-open spawn failed:', e);
+		return false;
+	}
+}
+
+/** Reveal a file in the file manager, highlighting it when the DBus API exists. */
+function revealInFileManager(filePath: string): boolean {
+	try {
+		const child = spawn(
+			'dbus-send',
+			[
+				'--session', '--print-reply', '--dest=org.freedesktop.FileManager1',
+				'--type=method_call', '/org/freedesktop/FileManager1',
+				'org.freedesktop.FileManager1.ShowItems',
+				`array:string:file://${filePath}`, 'string:'
+			],
+			{ stdio: 'ignore' }
+		);
+		let failed = false;
+		child.on('error', () => { failed = true; });
+		child.on('close', (code) => {
+			if (failed || code !== 0) xdgOpen(path.dirname(filePath)); // fallback: open folder
+		});
+		return true;
+	} catch {
+		return xdgOpen(path.dirname(filePath));
+	}
+}
+
 // ── Scheduler: cap concurrent engine processes ───────────────────────────────
-const MAX_CONCURRENT_DOWNLOADS = config.maxConcurrentDownloads;
 let activeDownloads = 0;
 const pendingJobs: Array<() => Promise<void>> = [];
 
 function pumpScheduler() {
-	while (activeDownloads < MAX_CONCURRENT_DOWNLOADS && pendingJobs.length > 0) {
+	while (activeDownloads < runtime.maxConcurrentDownloads && pendingJobs.length > 0) {
 		const job = pendingJobs.shift()!;
 		activeDownloads++;
 		job()
@@ -251,9 +293,18 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	try {
 		let finalUrl = spec.directUrl || spec.pageUrl;
 
-		// (Re)extract direct media URL for video/social sites — unless the caller
-		// already picked a specific format URL from the format picker.
-		if (!spec.directUrl && spec.category === VIDEO_CATEGORY) {
+		// MediaFire CDN tokens expire — always resolve a fresh download URL.
+		if (finalUrl.includes('mediafire.com')) {
+			console.log(`🔍 Refreshing Mediafire URL for ${finalUrl}...`);
+			const fresh = await extractMediaUrl(finalUrl);
+			if (!fresh) {
+				console.error(`❌ Mediafire link expired or unavailable: ${finalUrl}`);
+				await markError(id, 'MediaFire download link expired. Refresh the file page in your browser and try again.');
+				return;
+			}
+			finalUrl = fresh;
+			console.log('🎯 Mediafire URL refreshed');
+		} else if (!spec.directUrl && !isDirectFileUrl(spec.pageUrl) && spec.category === VIDEO_CATEGORY) {
 			console.log(`🔍 Extracting direct URL for ${spec.pageUrl}...`);
 			const directUrl = await extractMediaUrl(spec.pageUrl);
 			if (!directUrl) {
@@ -300,17 +351,15 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 		const coreDir = path.resolve(process.cwd(), '../core_engine');
 		const binaryPath = path.join(coreDir, 'target', 'release', 'core_engine');
-		const rustProcess = spawn(
-			binaryPath,
-			[
-				'--id', id,
-				'--url', finalUrl,
-				'--save-path', savePath,
-				'--threads', spec.threads.toString(),
-				'--max-rate', config.maxRateBytes.toString()
-			],
-			{ stdio: ['ignore', 'pipe', 'inherit'] }
-		);
+		const engineArgs = [
+			'--id', id,
+			'--url', finalUrl,
+			'--save-path', savePath,
+			'--threads', spec.threads.toString(),
+			'--max-rate', runtime.maxRateBytes.toString()
+		];
+		if (runtime.engineQuiet) engineArgs.push('--quiet');
+		const rustProcess = spawn(binaryPath, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
 		running.set(id, { proc: rustProcess, intent: 'normal' });
 
 		let resolveProc!: () => void;
@@ -419,6 +468,103 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	}
 }
 
+const EXTRACTOR_DOMAINS = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'];
+
+function categoryFor(sourceUrl: string, rawName: string): { category: string; rawName: string } {
+	let ext = path.extname(rawName).toLowerCase();
+	try {
+		const hostname = new URL(sourceUrl).hostname.toLowerCase();
+		if (EXTRACTOR_DOMAINS.some((d) => hostname.includes(d))) {
+			if (!ext) rawName += (ext = '.mp4');
+			return { category: VIDEO_CATEGORY, rawName };
+		}
+	} catch { /* ignore */ }
+	return { category: categoryForExt(ext), rawName };
+}
+
+interface QueueOpts {
+	macAddress: string;
+	rawUrl: string; // normalized source url (used for dedup + re-extraction)
+	fileName: string;
+	baseDir: string;
+	threads: number;
+	directUrl?: string;
+	ext?: string;
+}
+
+/**
+ * Create (or attach to) a single download from a normalized request. Handles
+ * categorization, path confinement, dedup, DB insert, ACK broadcast and
+ * scheduling. Shared by the single-download and playlist-expansion paths.
+ */
+async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: string } | { ok: false; error: string }> {
+	let rawName = sanitizeFileName(opts.fileName || 'download_file');
+	if (opts.directUrl) {
+		try {
+			const du = new URL(opts.directUrl);
+			const fromPath = path.basename(du.pathname);
+			if (fromPath && fromPath.includes('.')) {
+				rawName = sanitizeFileName(fromPath);
+			} else if (opts.ext) {
+				const stem = rawName.replace(/\.[^.]+$/, '') || 'download';
+				rawName = sanitizeFileName(`${stem}${opts.ext.startsWith('.') ? opts.ext : '.' + opts.ext}`);
+			}
+		} catch { /* keep rawName */ }
+	}
+
+	const cat = categoryFor(opts.rawUrl, rawName);
+	const category = cat.category;
+	rawName = cat.rawName;
+
+	const desiredPath = safeJoin(opts.baseDir, category, rawName);
+	if (!desiredPath) return { ok: false, error: 'Invalid file path' };
+
+	// Dedup keyed on SOURCE url. A picked format/direct URL allows multiple
+	// qualities but still collapses an *active* identical source+target.
+	let duplicate: (typeof downloads.$inferSelect) | undefined;
+	const sameSource = await db.select().from(downloads).where(eq(downloads.url, opts.rawUrl));
+	if (!opts.directUrl) {
+		const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
+		const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
+		duplicate = activeDownload ?? completedOnDisk;
+	} else {
+		duplicate = sameSource.find(
+			(d) => ['queued', 'downloading'].includes(d.status) && path.basename(d.savePath) === rawName
+		);
+	}
+	if (duplicate) {
+		console.log(`♻️  Duplicate found! Attaching to existing download ID: ${duplicate.id}`);
+		broadcast({ type: 'DOWNLOAD_ACK', downloadId: duplicate.id, fileName: duplicate.fileName, status: duplicate.status });
+		return { ok: true, downloadId: duplicate.id };
+	}
+
+	const savePath = await uniqueSavePath(desiredPath);
+	const finalName = path.basename(savePath);
+	const downloadId = crypto.randomUUID();
+	await db.insert(downloads).values({
+		id: downloadId,
+		deviceId: opts.macAddress,
+		url: opts.rawUrl,
+		fileName: finalName,
+		savePath,
+		status: 'queued'
+	});
+	broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: finalName, status: 'queued' });
+	console.log(`✅ Download queued with ID: ${downloadId}`);
+
+	scheduleDownload(() => runDownloadJob({
+		id: downloadId,
+		pageUrl: opts.rawUrl,
+		fileName: finalName,
+		savePath,
+		category,
+		threads: opts.threads,
+		allowRename: !opts.directUrl && !isDirectFileUrl(opts.rawUrl),
+		directUrl: opts.directUrl || (isDirectFileUrl(opts.rawUrl) ? opts.rawUrl : undefined)
+	}));
+	return { ok: true, downloadId };
+}
+
 /**
  * On startup, reclaim downloads that were mid-flight when the process last
  * stopped. Their engine child was killed with us, but the `.veloce_state`
@@ -468,10 +614,11 @@ export function setupWebSocketServer(server: Server) {
 				await db.insert(devices).values({ id: macAddress, createdAt: new Date(), lastActive: new Date(), settings: {} });
 			} else {
 				await db.update(devices).set({ lastActive: new Date() }).where(eq(devices.id, macAddress));
-				const settings = deviceResult[0].settings as any;
-				if (settings?.baseDirectory && ws.readyState === 1) {
-					ws.send(JSON.stringify({ type: 'DIRECTORY_SELECTED', payload: { path: settings.baseDirectory } }));
-				}
+			}
+			await loadSettings(macAddress);
+			if (ws.readyState === 1) {
+				ws.send(JSON.stringify({ type: 'DIRECTORY_SELECTED', payload: { path: runtime.baseDirectory } }));
+				ws.send(JSON.stringify({ type: 'SETTINGS', settings: { ...runtime } }));
 			}
 		} catch (err) {
 			console.error('Failed to initialize device identity:', err);
@@ -503,6 +650,13 @@ export function setupWebSocketServer(server: Server) {
 			try {
 				const data = JSON.parse(message.toString());
 
+				if (data.type === 'PING') {
+					if (ws.readyState === 1) {
+						ws.send(JSON.stringify({ type: 'PONG' }));
+					}
+					return;
+				}
+
 				if (data.type === 'NEW_DOWNLOAD') {
 					console.log('📥 Received new download request:', data.payload);
 
@@ -532,99 +686,54 @@ export function setupWebSocketServer(server: Server) {
 						console.error('Invalid URL during normalization');
 					}
 
-					const threads = data.payload.threads || config.defaultThreads;
+					const threads = data.payload.threads || runtime.defaultThreads;
 
 					let baseDir = data.payload.baseDirectory;
 					if (!baseDir || baseDir.trim() === '') {
-						baseDir = config.baseDir || path.join(os.homedir(), 'Downloads', 'Veloce');
+						baseDir = runtime.baseDirectory;
 					}
 
-					// Categorize by domain, then extension.
-					let rawName = sanitizeFileName(data.payload.fileName || 'download_file');
-					if (data.payload.directUrl) {
+					// Playlist: expand into one download per entry (best format each).
+					if (data.payload.playlist) {
+						let entries: { url: string; title?: string }[] = [];
 						try {
-							const du = new URL(data.payload.directUrl);
-							const fromPath = path.basename(du.pathname);
-							if (fromPath && fromPath.includes('.')) {
-								rawName = sanitizeFileName(fromPath);
-							} else if (data.payload.ext) {
-								const stem = rawName.replace(/\.[^.]+$/, '') || 'download';
-								rawName = sanitizeFileName(`${stem}${data.payload.ext.startsWith('.') ? data.payload.ext : '.' + data.payload.ext}`);
-							}
-						} catch { /* keep rawName */ }
-					}
-					let ext = path.extname(rawName).toLowerCase();
-					let category = 'others';
-					try {
-						const hostname = new URL(data.payload.url).hostname.toLowerCase();
-						const extractorDomains = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'];
-						if (extractorDomains.some((d) => hostname.includes(d))) {
-							category = VIDEO_CATEGORY;
-							if (!ext) {
-								ext = '.mp4';
-								rawName += ext;
-							}
+							entries = await listPlaylistEntries(rawUrl);
+						} catch (e) {
+							console.error('Playlist expansion failed:', e);
 						}
-					} catch {
-						// ignore invalid URL
-					}
-					if (category === 'others') {
-						if (['.mp4', '.mkv', '.webm', '.avi', '.mov'].includes(ext)) category = VIDEO_CATEGORY;
-						else if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'].includes(ext)) category = 'images';
-						else if (['.mp3', '.wav', '.flac', '.ogg'].includes(ext)) category = 'audio';
-						else if (['.pdf', '.doc', '.docx', '.txt'].includes(ext)) category = 'documents';
-						else if (['.zip', '.rar', '.7z', '.tar', '.gz'].includes(ext)) category = 'archives';
-					}
-
-					const desiredPath = safeJoin(baseDir, category, rawName);
-					if (!desiredPath) {
-						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: 'Invalid file path' }));
+						if (!entries.length) {
+							ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: 'No playlist entries found (or not a playlist).' }));
+							return;
+						}
+						console.log(`📃 Expanding playlist into ${entries.length} download(s)`);
+						let queued = 0;
+						for (const entry of entries) {
+							if (!isSafeDownloadUrl(entry.url).ok) continue;
+							const r = await queueDownload({
+								macAddress,
+								rawUrl: entry.url,
+								fileName: entry.title || 'video',
+								baseDir,
+								threads
+							});
+							if (r.ok) queued++;
+						}
+						ws.send(JSON.stringify({ type: 'PLAYLIST_QUEUED', count: queued, total: entries.length }));
 						return;
 					}
 
-					// Dedup is keyed on the SOURCE url (same link = same download).
-					// When a specific format/direct URL was picked, allow multiple qualities.
-					let duplicate: (typeof downloads.$inferSelect) | undefined;
-					if (!data.payload.directUrl) {
-						const sameSource = await db.select().from(downloads).where(eq(downloads.url, rawUrl));
-						const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
-						const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
-						duplicate = activeDownload ?? completedOnDisk;
-					}
-
-					if (duplicate) {
-						console.log(`♻️  Duplicate found! Attaching to existing download ID: ${duplicate.id}`);
-						ws.send(JSON.stringify({ type: 'DOWNLOAD_ACK', downloadId: duplicate.id, fileName: duplicate.fileName, status: duplicate.status }));
-						return;
-					}
-
-					// Not a duplicate source — make sure we don't clobber an unrelated
-					// existing file/row that happens to share the name.
-					const savePath = await uniqueSavePath(desiredPath);
-					const finalName = path.basename(savePath);
-
-					const downloadId = crypto.randomUUID();
-					await db.insert(downloads).values({
-						id: downloadId,
-						deviceId: macAddress,
-						url: rawUrl,
-						fileName: finalName,
-						savePath,
-						status: 'queued'
-					});
-					broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: finalName, status: 'queued' });
-					console.log(`✅ Download queued with ID: ${downloadId}`);
-
-					scheduleDownload(() => runDownloadJob({
-						id: downloadId,
-						pageUrl: rawUrl,
-						fileName: finalName,
-						savePath,
-						category,
+					const result = await queueDownload({
+						macAddress,
+						rawUrl,
+						fileName: data.payload.fileName || 'download_file',
+						baseDir,
 						threads,
-						allowRename: !data.payload.directUrl,
-						directUrl: data.payload.directUrl
-					}));
+						directUrl: data.payload.directUrl,
+						ext: data.payload.ext
+					});
+					if (!result.ok) {
+						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: result.error }));
+					}
 				} else if (data.type === 'LIST_FORMATS') {
 					const pageUrl = data.payload?.url ?? '';
 					if (/^(blob:|data:|mediastream:)/i.test(pageUrl)) {
@@ -642,6 +751,15 @@ export function setupWebSocketServer(server: Server) {
 					}
 					try {
 						const formats = await listFormats(pageUrl);
+						if (!formats.length) {
+							const hint = getRecentFormatError(pageUrl);
+							ws.send(JSON.stringify({
+								type: 'FORMATS_ERROR',
+								requestId: data.requestId,
+								error: hint ?? 'No formats found for this URL.'
+							}));
+							return;
+						}
 						ws.send(JSON.stringify({ type: 'FORMATS_LIST', requestId: data.requestId, formats }));
 					} catch (e) {
 						console.error('LIST_FORMATS failed:', e);
@@ -683,7 +801,8 @@ export function setupWebSocketServer(server: Server) {
 					console.log('🔄 Directory picker requested by frontend');
 					const result = pickDirectory();
 					if (result) {
-						await db.update(devices).set({ settings: { baseDirectory: result } }).where(eq(devices.id, macAddress));
+						runtime.baseDirectory = result;
+						await persistSettings(macAddress);
 						if (ws.readyState === 1) {
 							ws.send(JSON.stringify({ type: 'DIRECTORY_SELECTED', payload: { path: result } }));
 						}
@@ -693,6 +812,22 @@ export function setupWebSocketServer(server: Server) {
 							error: 'No graphical folder picker found. Install zenity or kdialog, or type the path manually.'
 						}));
 					}
+				} else if (data.type === 'OPEN_FILE' || data.type === 'REVEAL_FILE') {
+					const row = (await db.select().from(downloads).where(eq(downloads.id, data.downloadId)))[0];
+					if (!row) return;
+					if (!existsSync(row.savePath)) {
+						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: row.id, error: 'File no longer exists on disk.' }));
+						return;
+					}
+					if (data.type === 'OPEN_FILE') xdgOpen(row.savePath);
+					else revealInFileManager(row.savePath);
+				} else if (data.type === 'GET_SETTINGS') {
+					if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'SETTINGS', settings: { ...runtime } }));
+				} else if (data.type === 'SET_SETTINGS') {
+					applySettings(data.payload ?? {});
+					await persistSettings(macAddress);
+					pumpScheduler(); // a raised concurrency cap may free queued jobs immediately
+					broadcast({ type: 'SETTINGS', settings: { ...runtime } });
 				}
 			} catch (err) {
 				console.error('❌ Failed to process WebSocket message:', err);

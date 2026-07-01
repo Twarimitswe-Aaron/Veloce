@@ -9,13 +9,23 @@ let ws = null;
 let connected = false;
 let reconnectTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS;
+let wsPingTimer = null;
+const livePorts = new Set();
 const downloads = {};
 let selectedDirectory = null;
+let settings = null;
 const pendingFormatRequests = new Map(); // requestId -> { sendResponse, url? }
+const NOTIF_ICON = 'icons/icon-128.png';
 
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const formatCache = new Map(); // url -> { formats, ts }
 const inflightFormatUrls = new Set();
+const prefetchQueue = [];
+const prefetchQueued = new Set();
+let prefetchRunning = 0;
+const PREFETCH_LIMIT = 1;
+const PREFETCH_QUEUE_MAX = 8;
+const WS_PING_MS = 50000;
 
 function getFormatCache(url) {
 	const hit = formatCache.get(url);
@@ -30,12 +40,48 @@ function setFormatCache(url, formats) {
 	}
 }
 
-function prefetchFormats(url) {
+function notifyFormatFailed(url) {
+	broadcastToExtension({ type: 'VELOCE_FORMATS_FAILED', url });
+}
+
+function drainPrefetchQueue() {
+	if (!hasLiveClients()) return;
 	connectWs();
-	if (!url || getFormatCache(url) || inflightFormatUrls.has(url)) return;
-	void requestFormatsFromCoordinator(url, (data) => {
-		if (data.formats?.length) setFormatCache(url, data.formats);
-	});
+	while (prefetchRunning < PREFETCH_LIMIT && prefetchQueue.length > 0) {
+		const url = prefetchQueue.shift();
+		prefetchQueued.delete(url);
+		if (!url || getFormatCache(url) || inflightFormatUrls.has(url)) continue;
+		prefetchRunning++;
+		void requestFormatsFromCoordinator(url, (data) => {
+			prefetchRunning--;
+			if (data.formats?.length) setFormatCache(url, data.formats);
+			else notifyFormatFailed(url);
+			drainPrefetchQueue();
+		});
+	}
+}
+
+function enqueuePrefetch(url, front = false) {
+	if (!url || getFormatCache(url) || inflightFormatUrls.has(url) || prefetchQueued.has(url)) return;
+	if (!front && prefetchQueue.length >= PREFETCH_QUEUE_MAX) return;
+	prefetchQueued.add(url);
+	if (front) prefetchQueue.unshift(url);
+	else prefetchQueue.push(url);
+	drainPrefetchQueue();
+}
+
+function prefetchFormats(url) {
+	enqueuePrefetch(url);
+}
+
+function prefetchBatch(urls) {
+	connectWs();
+	if (!Array.isArray(urls) || !urls.length) return;
+	for (const item of urls) {
+		const url = typeof item === 'string' ? item : item?.url;
+		const front = typeof item === 'object' && item?.priority;
+		if (url) enqueuePrefetch(url, front);
+	}
 }
 
 async function waitForInflightFormats(url, maxMs = 25000) {
@@ -54,7 +100,20 @@ function broadcastToExtension(msg) {
 	chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
+function notify(id, title, message) {
+	if (!chrome.notifications) return;
+	try {
+		chrome.notifications.create(id, {
+			type: 'basic',
+			iconUrl: NOTIF_ICON,
+			title,
+			message: String(message ?? '').slice(0, 300)
+		});
+	} catch { /* notifications may be unavailable */ }
+}
+
 function setConnected(val) {
+	if (connected === val) return;
 	connected = val;
 	chrome.storage.local.set({ veloce_connected: val });
 	broadcastToExtension({ type: 'VELOCE_STATE', connected: val, downloads, selectedDirectory });
@@ -103,9 +162,12 @@ function handleWsMessage(data) {
 				etaSecs: data.etaSecs ?? 0
 			});
 			break;
-		case 'DOWNLOAD_COMPLETED':
+		case 'DOWNLOAD_COMPLETED': {
+			const name = downloads[data.downloadId]?.fileName ?? 'Download';
 			upsertDownload(data.downloadId, { status: data.status ?? 'completed', speedBps: 0, etaSecs: 0 });
+			notify(`veloce-done-${data.downloadId}`, 'Download complete', name);
 			break;
+		}
 		case 'DOWNLOAD_PAUSED':
 			upsertDownload(data.downloadId, { status: 'paused', speedBps: 0, etaSecs: 0 });
 			break;
@@ -113,13 +175,23 @@ function handleWsMessage(data) {
 			delete downloads[data.downloadId];
 			broadcastToExtension({ type: 'VELOCE_DOWNLOAD_REMOVED', downloadId: data.downloadId });
 			break;
-		case 'DOWNLOAD_ERROR':
+		case 'DOWNLOAD_ERROR': {
+			const name = downloads[data.downloadId]?.fileName ?? 'Download';
 			upsertDownload(data.downloadId, {
 				status: 'error',
 				error: data.error ?? 'Download failed',
 				speedBps: 0,
 				etaSecs: 0
 			});
+			notify(`veloce-err-${data.downloadId ?? Date.now()}`, 'Download failed', `${name}: ${data.error ?? 'Unknown error'}`);
+			break;
+		}
+		case 'SETTINGS':
+			settings = data.settings ?? null;
+			broadcastToExtension({ type: 'VELOCE_SETTINGS', settings });
+			break;
+		case 'PLAYLIST_QUEUED':
+			notify(`veloce-pl-${Date.now()}`, 'Playlist queued', `${data.count}/${data.total} items added to Veloce.`);
 			break;
 		case 'DIRECTORY_SELECTED':
 			selectedDirectory = data.payload?.path ?? null;
@@ -145,16 +217,47 @@ function handleWsMessage(data) {
 	}
 }
 
-function connectWs() {
-	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-		return;
+function hasLiveClients() {
+	return livePorts.size > 0;
+}
+
+function stopWsPing() {
+	if (wsPingTimer) {
+		clearInterval(wsPingTimer);
+		wsPingTimer = null;
 	}
+}
+
+function startWsPing() {
+	stopWsPing();
+	wsPingTimer = setInterval(() => {
+		if (ws?.readyState === WebSocket.OPEN) {
+			wsSend({ type: 'PING' });
+		}
+	}, WS_PING_MS);
+}
+
+function scheduleWsReconnect() {
+	clearTimeout(reconnectTimer);
+	const delay = hasLiveClients() ? 400 : reconnectDelay;
+	reconnectTimer = setTimeout(() => {
+		connectWs();
+		if (!hasLiveClients()) {
+			reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), RECONNECT_MAX_MS);
+		}
+	}, delay);
+}
+
+function connectWs() {
+	if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
+	if (ws?.readyState === WebSocket.CLOSING) return;
 
 	ws = new WebSocket(WS_URL);
 
 	ws.onopen = () => {
 		reconnectDelay = RECONNECT_BASE_MS;
 		setConnected(true);
+		startWsPing();
 	};
 
 	ws.onmessage = (event) => {
@@ -167,12 +270,9 @@ function connectWs() {
 
 	ws.onclose = () => {
 		ws = null;
+		stopWsPing();
 		setConnected(false);
-		clearTimeout(reconnectTimer);
-		reconnectTimer = setTimeout(() => {
-			connectWs();
-			reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), RECONNECT_MAX_MS);
-		}, reconnectDelay);
+		scheduleWsReconnect();
 	};
 
 	ws.onerror = () => ws?.close();
@@ -247,11 +347,20 @@ async function listFormats(url, sendResponse, sender) {
 		return;
 	}
 
+	// User click — jump the queue for this URL.
+	enqueuePrefetch(url, true);
+	await waitForInflightFormats(url);
+	cached = getFormatCache(url);
+	if (cached?.length) {
+		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
+		return;
+	}
+
 	await requestFormatsFromCoordinator(url, sendResponse);
 }
 
 function scheduleKeepaliveAlarm() {
-	chrome.alarms.create('veloce-keepalive', { periodInMinutes: 1 });
+	chrome.alarms.create('veloce-keepalive', { periodInMinutes: 3 });
 }
 
 // ── Intercept native browser downloads when coordinator is online ─────────────
@@ -294,14 +403,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		case 'VELOCE_CONNECT':
 			(async () => {
 				await ensureConnected();
-				sendResponse({ connected, downloads, selectedDirectory });
+				sendResponse({ connected, downloads, selectedDirectory, settings });
 			})();
 			return true;
 
 		case 'VELOCE_GET_STATE':
 			(async () => {
 				await ensureConnected(3000);
-				sendResponse({ connected, downloads, selectedDirectory });
+				sendResponse({ connected, downloads, selectedDirectory, settings });
+			})();
+			return true;
+
+		case 'VELOCE_SET_SETTINGS':
+			(async () => {
+				await ensureConnected();
+				sendResponse({ ok: wsSend({ type: 'SET_SETTINGS', payload: msg.payload }) });
+			})();
+			return true;
+
+		case 'VELOCE_GET_SETTINGS':
+			(async () => {
+				await ensureConnected();
+				sendResponse({ ok: wsSend({ type: 'GET_SETTINGS' }) });
 			})();
 			return true;
 
@@ -317,6 +440,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 		case 'VELOCE_PREFETCH_FORMATS':
 			prefetchFormats(msg.url);
+			return false;
+
+		case 'VELOCE_PREFETCH_BATCH':
+			prefetchBatch(msg.urls);
 			return false;
 
 		case 'VELOCE_WARMUP':
@@ -342,20 +469,98 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	}
 });
 
+function setupContextMenus() {
+	if (!chrome.contextMenus) return;
+	chrome.contextMenus.removeAll(() => {
+		chrome.contextMenus.create({
+			id: 'veloce-download-link',
+			title: 'Download link with Veloce',
+			contexts: ['link']
+		});
+		chrome.contextMenus.create({
+			id: 'veloce-download-media',
+			title: 'Download media with Veloce',
+			contexts: ['image', 'video', 'audio']
+		});
+		chrome.contextMenus.create({
+			id: 'veloce-download-page-links',
+			title: 'Download all media links on page',
+			contexts: ['page']
+		});
+	});
+}
+
+async function downloadFromContext(url) {
+	if (!url) return;
+	let fileName = 'download';
+	try {
+		const parts = new URL(url).pathname.split('/').filter(Boolean);
+		fileName = parts.pop() || 'download';
+	} catch { /* keep default */ }
+	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
+	startDownload({ url, fileName, baseDirectory: veloce_base_dir || selectedDirectory || undefined, threads: 8 });
+}
+
+if (chrome.contextMenus) {
+	chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+		if (info.menuItemId === 'veloce-download-link') {
+			await downloadFromContext(info.linkUrl);
+		} else if (info.menuItemId === 'veloce-download-media') {
+			await downloadFromContext(info.srcUrl || info.linkUrl);
+		} else if (info.menuItemId === 'veloce-download-page-links' && tab?.id != null) {
+			try {
+				const results = await chrome.scripting.executeScript({
+					target: { tabId: tab.id },
+					func: () => {
+						const re = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|iso)(\?|#|$)/i;
+						return Array.from(document.querySelectorAll('a[href]'))
+							.map((a) => a.href)
+							.filter((h) => /^https?:/i.test(h) && re.test(h));
+					}
+				});
+				const urls = [...new Set((results?.[0]?.result) || [])];
+				for (const u of urls) await downloadFromContext(u);
+				notify(`veloce-pagelinks-${Date.now()}`, 'Veloce', `Queued ${urls.length} link(s) from the page.`);
+			} catch (e) {
+				console.warn('[Veloce] page-links scan failed', e);
+			}
+		}
+	});
+}
+
 chrome.runtime.onInstalled.addListener(() => {
 	chrome.storage.local.set({ veloce_intercept: true });
 	scheduleKeepaliveAlarm();
+	setupContextMenus();
 	connectWs();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-	if (alarm.name === 'veloce-keepalive') connectWs();
+	if (alarm.name === 'veloce-keepalive' && hasLiveClients()) connectWs();
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-	if (port.name === 'veloce-popup' || port.name === 'veloce-busy') {
-		connectWs();
-	}
+	if (!['veloce-popup', 'veloce-busy', 'veloce-tab'].includes(port.name)) return;
+
+	livePorts.add(port);
+	connectWs();
+	drainPrefetchQueue();
+
+	port.onMessage.addListener((msg) => {
+		if (msg?.type === 'ping') {
+			try { port.postMessage({ type: 'pong', connected }); } catch { /* ignore */ }
+		}
+	});
+
+	port.onDisconnect.addListener(() => {
+		livePorts.delete(port);
+		if (hasLiveClients()) connectWs();
+	});
+});
+
+chrome.tabs.onRemoved.addListener(() => {
+	// Ports disconnect asynchronously; ensure WS stays up for remaining tabs.
+	if (hasLiveClients()) connectWs();
 });
 
 scheduleKeepaliveAlarm();
