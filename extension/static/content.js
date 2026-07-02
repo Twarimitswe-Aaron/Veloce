@@ -1485,16 +1485,18 @@
 				pageUrl,
 				referer: pageUrl,
 				fileName: titleStem || 'playlist',
+				playlistFolder: titleStem || undefined,
 				baseDirectory: cfg.veloce_base_dir || undefined,
 				threads: 8,
-				playlist: true
+				playlist: true,
+				playlistMode: 'audio-then-720'
 			};
 			chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
 				if (chrome.runtime.lastError || !resp?.ok) {
 					showVeloceToast('Veloce: could not queue playlist — is the backend running?', true);
 					return;
 				}
-				showVeloceToast(`Veloce: queuing playlist "${titleStem}"…`, false);
+				showVeloceToast(`Veloce: queuing playlist to folder "${titleStem}"…`, false);
 			});
 		});
 	}
@@ -1506,7 +1508,7 @@
 		if (!playlistUrl) return;
 		const btn = document.createElement('button');
 		btn.className = 'menu-item menu-item-playlist';
-		btn.textContent = 'Download entire playlist';
+		btn.textContent = 'Download entire playlist (folder · audio or 720p)';
 		btn.addEventListener('click', (e) => {
 			e.stopPropagation();
 			queuePlaylistDownload(playlistUrl, pageUrl);

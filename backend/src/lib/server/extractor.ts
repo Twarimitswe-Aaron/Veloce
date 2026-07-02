@@ -772,24 +772,81 @@ export function finalizeFormatsForPicker(formats: MediaFormat[], source: MediaSo
 export interface PlaylistEntry {
 	url: string;
 	title?: string;
+	/** 1-based position in the playlist. */
+	index?: number;
+}
+
+export interface ResolvedPlaylist {
+	title: string;
+	id?: string;
+	entries: PlaylistEntry[];
+}
+
+const YTDLP_BEST_FORMAT = 'b';
+
+function extFromMediaUrl(mediaUrl: string, fallback: string): string {
+	try {
+		const mime = new URL(mediaUrl).searchParams.get('mime');
+		if (mime?.includes('audio/mp4') || mime?.includes('mp4a')) return '.m4a';
+		if (mime?.includes('audio/webm') || mime?.includes('opus')) return '.webm';
+		if (mime?.includes('video/mp4')) return '.mp4';
+		if (mime?.includes('video/webm')) return '.webm';
+		const base = path.basename(new URL(mediaUrl).pathname);
+		const ext = path.extname(base);
+		if (ext && ext.length <= 5) return ext;
+	} catch { /* ignore */ }
+	return fallback;
+}
+
+/** Extract media URL using a specific yt-dlp format selector. */
+export async function extractMediaWithFormat(url: string, format: string): Promise<{ url: string; ext: string } | null> {
+	const pageUrl = normalizeYoutubeWatchUrl(url);
+	const cookieStrategies: string[][] = [
+		['--cookies-from-browser', 'chrome'],
+		['--cookies-from-browser', 'chromium'],
+		['--cookies-from-browser', 'firefox'],
+		[]
+	];
+	for (const cookieArgs of cookieStrategies) {
+		const direct = await runYtDlp(pageUrl, cookieArgs, format);
+		if (direct) {
+			const fallback = format.startsWith('ba') || format.includes('bestaudio') ? '.m4a' : '.mp4';
+			return { url: direct, ext: extFromMediaUrl(direct, fallback) };
+		}
+	}
+	return null;
+}
+
+function normalizeYoutubeWatchUrl(entryUrl: string): string {
+	try {
+		const u = new URL(entryUrl);
+		const v = u.searchParams.get('v');
+		if (v) return `https://www.youtube.com/watch?v=${v}`;
+	} catch { /* ignore */ }
+	return entryUrl;
 }
 
 /**
- * Return the entries of a playlist (YouTube playlist, channel, Instagram
- * carousel, etc.) using yt-dlp's flat listing. Each entry is a single item URL
- * the caller can queue as its own download. Returns [] for non-playlists.
+ * Return playlist title + entries (YouTube playlist/mix, Instagram carousel, etc.).
  */
-export async function listPlaylistEntries(url: string): Promise<PlaylistEntry[]> {
-	if (!isExtractorDomain(url)) return [];
-
-	for (const cookieArgs of [[], ['--cookies-from-browser', 'chromium'], ['--cookies-from-browser', 'chrome']]) {
-		const entries = await runYtDlpFlatPlaylist(url, cookieArgs);
-		if (entries.length) return entries;
+export async function resolvePlaylist(url: string): Promise<ResolvedPlaylist | null> {
+	if (!isExtractorDomain(url)) return null;
+	for (const cookieArgs of [[], ['--cookies-from-browser', 'chrome'], ['--cookies-from-browser', 'chromium']]) {
+		const info = await runYtDlpPlaylistJson(url, cookieArgs);
+		if (info?.entries.length) return info;
 	}
-	return [];
+	return null;
 }
 
-function runYtDlpFlatPlaylist(url: string, cookieArgs: string[]): Promise<PlaylistEntry[]> {
+/**
+ * Return the entries of a playlist using yt-dlp's flat listing.
+ */
+export async function listPlaylistEntries(url: string): Promise<PlaylistEntry[]> {
+	const pl = await resolvePlaylist(url);
+	return pl?.entries ?? [];
+}
+
+function runYtDlpPlaylistJson(url: string, cookieArgs: string[]): Promise<ResolvedPlaylist | null> {
 	return new Promise((resolve) => {
 		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
 		const proc = spawn(ytdlpPath, [
@@ -807,33 +864,46 @@ function runYtDlpFlatPlaylist(url: string, cookieArgs: string[]): Promise<Playli
 
 		let output = '';
 		let settled = false;
-		const done = (result: PlaylistEntry[]) => {
+		const done = (result: ResolvedPlaylist | null) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
 			resolve(result);
 		};
-		const timeout = setTimeout(() => { try { proc.kill('SIGTERM'); } catch { /* ignore */ } done([]); }, 40_000);
+		const timeout = setTimeout(() => {
+			try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+			done(null);
+		}, 90_000);
 
 		proc.stdout?.on('data', (d) => { output += d.toString(); });
-		proc.on('error', () => done([]));
+		proc.on('error', () => done(null));
 		proc.on('close', () => {
-			if (!output.trim()) return done([]);
+			if (!output.trim()) return done(null);
 			try {
 				const info = JSON.parse(output);
-				if (info._type !== 'playlist' || !Array.isArray(info.entries)) return done([]);
-				const out: PlaylistEntry[] = [];
-				for (const e of info.entries) {
+				if (info._type !== 'playlist' || !Array.isArray(info.entries)) return done(null);
+				const entries: PlaylistEntry[] = [];
+				for (let i = 0; i < info.entries.length; i++) {
+					const e = info.entries[i];
 					if (!e) continue;
 					const entryUrl = (e.url as string) || (e.webpage_url as string) ||
 						(e.id ? `https://www.youtube.com/watch?v=${e.id}` : '');
-					if (entryUrl && /^https?:/i.test(entryUrl)) {
-						out.push({ url: entryUrl, title: (e.title as string) || undefined });
-					}
+					if (!entryUrl || !/^https?:/i.test(entryUrl)) continue;
+					const idx = typeof e.playlist_index === 'number' ? e.playlist_index : i + 1;
+					entries.push({
+						url: normalizeYoutubeWatchUrl(entryUrl),
+						title: (e.title as string) || undefined,
+						index: idx
+					});
 				}
-				done(out);
+				if (!entries.length) return done(null);
+				done({
+					title: (info.title as string) || 'playlist',
+					id: info.id as string | undefined,
+					entries
+				});
 			} catch {
-				done([]);
+				done(null);
 			}
 		});
 	});
@@ -861,7 +931,7 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
 
     for (const cookieArgs of cookieStrategies) {
         const label = cookieArgs.length ? cookieArgs[1] : 'no-cookies';
-        const directUrl = await runYtDlp(url, cookieArgs);
+        const directUrl = await runYtDlp(url, cookieArgs, YTDLP_BEST_FORMAT);
         if (directUrl) {
             return directUrl;
         }
@@ -874,16 +944,15 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
 
 /**
  * Run yt-dlp once with a given cookie strategy and return the first direct
- * media URL, or null on failure/timeout. Uses `-f b` (best progressive stream)
- * so the engine receives a single downloadable URL with audio+video combined.
+ * media URL, or null on failure/timeout.
  */
-function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
+function runYtDlp(url: string, cookieArgs: string[], format: string): Promise<string | null> {
     return new Promise((resolve) => {
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
         const ytdlp = spawn(ytdlpPath, [
             ...ytdlpSharedArgs(),
             ...cookieArgs,
-            '-f', 'b',
+            '-f', format,
             '--no-playlist',
             '--no-warnings',
             '--no-progress',

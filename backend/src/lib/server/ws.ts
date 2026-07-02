@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import { db } from './db';
-import { downloads, devices } from './db/schema';
+import { downloads, devices, playlistJobs } from './db/schema';
 import { getMacAddress } from './identity';
 import { eq, sql, inArray } from 'drizzle-orm';
 import crypto from 'crypto';
@@ -11,12 +11,53 @@ import { statfs, unlink, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import { extractMediaUrl, listFormats, listPlaylistEntries, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl } from './extractor';
+import { extractMediaUrl, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl } from './extractor';
+import {
+	defaultPlaylistFormatSettings,
+	parsePlaylistFormatSettings,
+	type PlaylistFormatSettings
+} from './playlistSettings';
+import {
+	queuePlaylistDownload,
+	schedulePlaylistJob,
+	pausePlaylistJob,
+	cancelPlaylistJob,
+	resumePlaylistJob,
+	listPlaylistJobsForDevice,
+	getPlaylistJob,
+	isActivePlaylistJob,
+	type PlaylistRuntime
+} from './playlistRunner';
 import { config } from './config';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from './util';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
+
+function playlistRuntimeFromSettings(): PlaylistRuntime {
+	return {
+		baseDirectory: runtime.baseDirectory,
+		defaultThreads: runtime.defaultThreads,
+		maxRateBytes: runtime.maxRateBytes,
+		engineQuiet: runtime.engineQuiet,
+		playlistFormats: runtime.playlistFormats
+	};
+}
+
+function playlistJobToSnapshot(row: typeof import('./db/schema').playlistJobs.$inferSelect) {
+	return {
+		downloadId: row.id,
+		playlistId: row.id,
+		fileName: `${row.title} (${row.currentIndex}/${row.totalTracks} tracks)`,
+		status: row.status === 'cancelled' ? 'error' : row.status,
+		downloaded: row.downloadedBytes ?? 0,
+		total: row.totalBytes ?? 0,
+		isPlaylist: true,
+		playlistCurrent: row.currentIndex,
+		playlistTotal: row.totalTracks,
+		saveDir: row.saveDir
+	};
+}
 /** In-browser blob/data saves (AI images, canvas exports) — not fetched over HTTP. */
 const MAX_BLOB_BYTES = 80 * 1024 * 1024;
 
@@ -193,6 +234,7 @@ interface RuntimeSettings {
 	maxRateBytes: number;
 	baseDirectory: string;
 	engineQuiet: boolean;
+	playlistFormats: PlaylistFormatSettings;
 }
 
 const runtime: RuntimeSettings = {
@@ -200,7 +242,8 @@ const runtime: RuntimeSettings = {
 	defaultThreads: config.defaultThreads,
 	maxRateBytes: config.maxRateBytes,
 	baseDirectory: config.baseDir || path.join(os.homedir(), 'Downloads', 'Veloce'),
-	engineQuiet: config.engineQuiet
+	engineQuiet: config.engineQuiet,
+	playlistFormats: defaultPlaylistFormatSettings()
 };
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -220,6 +263,9 @@ function applySettings(patch: Record<string, unknown>) {
 	if (typeof patch.baseDirectory === 'string' && patch.baseDirectory.trim())
 		runtime.baseDirectory = patch.baseDirectory.trim();
 	if (typeof patch.engineQuiet === 'boolean') runtime.engineQuiet = patch.engineQuiet;
+	if (patch.playlistFormats && typeof patch.playlistFormats === 'object') {
+		runtime.playlistFormats = parsePlaylistFormatSettings(patch.playlistFormats);
+	}
 }
 
 let settingsLoaded = false;
@@ -341,7 +387,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	try {
 		let finalUrl = spec.directUrl || spec.pageUrl;
 
-		// HLS/DASH manifest URLs cannot be fetched by the Rust engine — resolve via yt-dlp on the page URL.
 		if (spec.directUrl && isManifestFormatUrl(spec.directUrl)) {
 			const extracted = await extractMediaUrl(spec.pageUrl);
 			if (!extracted) {
@@ -801,17 +846,19 @@ export function setupWebSocketServer(server: Server) {
 				.where(eq(downloads.deviceId, macAddress))
 				.orderBy(sql`rowid desc`)
 				.limit(20);
-			if (ws.readyState === 1 && recent.length > 0) {
-				ws.send(JSON.stringify({
-					type: 'DOWNLOAD_SNAPSHOT',
-					downloads: recent.map((d) => ({
-						downloadId: d.id,
-						fileName: d.fileName,
-						status: d.status,
-						downloaded: d.downloadedBytes ?? 0,
-						total: d.totalBytes ?? 0
-					}))
-				}));
+			const playlists = await listPlaylistJobsForDevice(macAddress);
+			const snapshot = [
+				...playlists.map(playlistJobToSnapshot),
+				...recent.map((d) => ({
+					downloadId: d.id,
+					fileName: d.fileName,
+					status: d.status,
+					downloaded: d.downloadedBytes ?? 0,
+					total: d.totalBytes ?? 0
+				}))
+			];
+			if (ws.readyState === 1 && snapshot.length > 0) {
+				ws.send(JSON.stringify({ type: 'DOWNLOAD_SNAPSHOT', downloads: snapshot }));
 			}
 		} catch (err) {
 			console.error('Failed to send download snapshot:', err);
@@ -887,31 +934,30 @@ export function setupWebSocketServer(server: Server) {
 						baseDir = runtime.baseDirectory;
 					}
 
-					// Playlist: expand into one download per entry (best format each).
+					// Playlist: one folder per playlist; audio preferred, else 720p video (step down).
 					if (data.payload.playlist) {
-						let entries: { url: string; title?: string }[] = [];
-						try {
-							entries = await listPlaylistEntries(rawUrl);
-						} catch (e) {
-							console.error('Playlist expansion failed:', e);
-						}
-						if (!entries.length) {
-							ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: 'No playlist entries found (or not a playlist).' }));
+						const result = await queuePlaylistDownload({
+							macAddress,
+							playlistUrl: rawUrl,
+							referer: data.payload.referer || data.payload.pageUrl,
+							baseDir,
+							threads,
+							formatSettings: runtime.playlistFormats,
+							broadcast
+						});
+						if (!result.ok) {
+							ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: result.error }));
 							return;
 						}
-						let queued = 0;
-						for (const entry of entries) {
-							if (!isSafeDownloadUrl(entry.url).ok) continue;
-							const r = await queueDownload({
-								macAddress,
-								rawUrl: entry.url,
-								fileName: entry.title || 'video',
-								baseDir,
-								threads
-							});
-							if (r.ok) queued++;
-						}
-						ws.send(JSON.stringify({ type: 'PLAYLIST_QUEUED', count: queued, total: entries.length }));
+						schedulePlaylistJob(result.playlistId, playlistRuntimeFromSettings(), broadcast);
+						ws.send(JSON.stringify({
+							type: 'PLAYLIST_QUEUED',
+							playlistId: result.playlistId,
+							count: result.total,
+							total: result.total,
+							folder: result.saveDir,
+							title: result.title
+						}));
 						return;
 					}
 
@@ -960,12 +1006,23 @@ export function setupWebSocketServer(server: Server) {
 						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId: data.requestId, error: 'Could not list formats.' }));
 					}
 				} else if (data.type === 'PAUSE_DOWNLOAD') {
+					const pl = await getPlaylistJob(data.downloadId);
+					if (pl) {
+						pausePlaylistJob(data.downloadId);
+						broadcast({ type: 'PLAYLIST_UPDATE', playlistId: pl.id, fileName: `${pl.title} (${pl.currentIndex}/${pl.totalTracks} tracks)`, status: 'paused', isPlaylist: true });
+						return;
+					}
 					const r = running.get(data.downloadId);
 					if (r) {
 						r.intent = 'paused';
 						r.proc.kill('SIGTERM');
 					}
 				} else if (data.type === 'RESUME_DOWNLOAD') {
+					const pl = await getPlaylistJob(data.downloadId);
+					if (pl && ['paused', 'queued', 'error'].includes(pl.status) && !isActivePlaylistJob(pl.id)) {
+						await resumePlaylistJob(pl.id, playlistRuntimeFromSettings(), broadcast);
+						return;
+					}
 					const row = (await db.select().from(downloads).where(eq(downloads.id, data.downloadId)))[0];
 					if (row && ['paused', 'error', 'queued'].includes(row.status) && !running.has(row.id)) {
 						await setStatus(row.id, 'queued');
@@ -973,6 +1030,11 @@ export function setupWebSocketServer(server: Server) {
 						scheduleDownload(() => runDownloadJob(specFromRow(row)));
 					}
 				} else if (data.type === 'CANCEL_DOWNLOAD') {
+					const pl = await getPlaylistJob(data.downloadId);
+					if (pl) {
+						await cancelPlaylistJob(data.downloadId, broadcast);
+						return;
+					}
 					const r = running.get(data.downloadId);
 					if (r) {
 						r.intent = 'cancelled';

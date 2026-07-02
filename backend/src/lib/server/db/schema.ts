@@ -26,6 +26,31 @@ export const downloads = sqliteTable('downloads', {
 	downloadedBytes: integer('downloaded_bytes').default(0)
 });
 
+/** One row = entire playlist job (sequential tracks, single pause control). */
+export const playlistJobs = sqliteTable('playlist_jobs', {
+	id: text('id').primaryKey(),
+	deviceId: text('device_id').notNull().references(() => devices.id),
+	playlistUrl: text('playlist_url').notNull(),
+	title: text('title').notNull(),
+	saveDir: text('save_dir').notNull(),
+	status: text('status', {
+		enum: ['queued', 'downloading', 'paused', 'completed', 'error', 'cancelled']
+	}).notNull().default('queued'),
+	currentIndex: integer('current_index').notNull().default(0),
+	totalTracks: integer('total_tracks').notNull(),
+	completedTracks: integer('completed_tracks').notNull().default(0),
+	failedTracks: integer('failed_tracks').notNull().default(0),
+	entries: text('entries', { mode: 'json' }).notNull(),
+	settings: text('settings', { mode: 'json' }),
+	referer: text('referer'),
+	threads: integer('threads').notNull().default(8),
+	currentTrackTitle: text('current_track_title'),
+	error: text('error'),
+	downloadedBytes: integer('downloaded_bytes').default(0),
+	totalBytes: integer('total_bytes').default(0),
+	createdAt: integer('created_at', { mode: 'timestamp' }).notNull()
+});
+
 export const chunks = sqliteTable('chunks', {
 	id: text('id').primaryKey(), // UUID string
 	downloadId: text('download_id')

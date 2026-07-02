@@ -46,13 +46,26 @@ export function sanitizeFileName(name: string): string {
 	return base.slice(0, 200);
 }
 
+/** Playlist folder names — allow spaces; strip illegal path chars. */
+export function sanitizeFolderName(name: string): string {
+	const cleaned = (name || 'playlist')
+		.replace(/[\\/\x00-\x1f:*?"<>|]/g, '_')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.slice(0, 120);
+	return cleaned || 'playlist';
+}
+
 /**
  * Join into a path that is guaranteed to stay within `baseDir`. Returns null if
  * the result would escape the base (defense-in-depth against traversal).
  */
-export function safeJoin(baseDir: string, category: string, fileName: string): string | null {
+export function safeJoin(baseDir: string, category: string, fileName: string, subfolder?: string): string | null {
 	const root = path.resolve(baseDir);
-	const target = path.resolve(root, category, sanitizeFileName(fileName));
+	const parts = [root, category];
+	if (subfolder) parts.push(sanitizeFolderName(subfolder));
+	parts.push(sanitizeFileName(fileName));
+	const target = path.resolve(...parts);
 	const rel = path.relative(root, target);
 	if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
 	return target;

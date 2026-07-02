@@ -55,6 +55,11 @@ describe('safeJoin', () => {
 		const p = safeJoin('/base', 'videos', '../../evil.sh');
 		expect(p).toBe(path.resolve('/base/videos/evil.sh'));
 	});
+
+	it('supports playlist subfolders', () => {
+		const p = safeJoin('/base', 'playlists', '02 - Song.mp4', 'Mix - My Playlist');
+		expect(p).toBe(path.resolve('/base/playlists/Mix - My Playlist/02 - Song.mp4'));
+	});
 });
 
 describe('categoryForExt', () => {
