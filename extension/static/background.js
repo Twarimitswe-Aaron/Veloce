@@ -559,10 +559,10 @@ async function enrichDownloadPayload(payload, tabId) {
 	}
 
 	const mediaUrl = out.directUrl || out.url;
-	if (mediaUrl && out.url === mediaUrl && out.pageUrl) {
+	if (!out.playlist && mediaUrl && out.url === mediaUrl && out.pageUrl) {
 		out.url = out.pageUrl;
 	}
-	if (out.directUrl == null && mediaUrl && out.url !== mediaUrl) {
+	if (!out.playlist && out.directUrl == null && mediaUrl && out.url !== mediaUrl) {
 		out.directUrl = mediaUrl;
 	}
 

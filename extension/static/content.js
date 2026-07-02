@@ -453,6 +453,13 @@
 		}
 		.menu-item:hover { background: #002a55; }
 		.menu-item:last-child { border-bottom: none; }
+		.menu-item-playlist {
+			font-weight: 600;
+			background: rgba(0, 255, 157, 0.08);
+			border-bottom: 1px solid rgba(0, 255, 157, 0.25);
+		}
+		.menu-item-playlist:hover { background: rgba(0, 255, 157, 0.16); }
+		.menu-item-recommended { font-weight: 600; }
 		.menu-status {
 			padding: 10px;
 			font-size: 11px;
@@ -1444,6 +1451,69 @@
 		setTimeout(() => t.remove(), isError ? 6000 : 3500);
 	}
 
+	function isYoutubePlaylistContext(href = location.href) {
+		try {
+			const u = new URL(href);
+			if (u.pathname === '/playlist' && u.searchParams.get('list')) return true;
+			return u.pathname === '/watch' && !!u.searchParams.get('list');
+		} catch { return false; }
+	}
+
+	function youtubePlaylistTargetUrl(href = location.href) {
+		try {
+			const u = new URL(href);
+			const list = u.searchParams.get('list');
+			if (!list) return null;
+			if (u.pathname === '/playlist') {
+				u.hash = '';
+				return u.href;
+			}
+			const v = u.searchParams.get('v');
+			if (u.pathname === '/watch' && v) {
+				return `https://www.youtube.com/watch?v=${v}&list=${list}`;
+			}
+			return `https://www.youtube.com/playlist?list=${list}`;
+		} catch { return null; }
+	}
+
+	function queuePlaylistDownload(playlistUrl, pageUrl) {
+		closeMenu();
+		const titleStem = (document.title || 'playlist').replace(/\s*-\s*YouTube\s*$/i, '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
+		chrome.storage.local.get(['veloce_base_dir'], (cfg) => {
+			const payload = {
+				url: playlistUrl,
+				pageUrl,
+				referer: pageUrl,
+				fileName: titleStem || 'playlist',
+				baseDirectory: cfg.veloce_base_dir || undefined,
+				threads: 8,
+				playlist: true
+			};
+			chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
+				if (chrome.runtime.lastError || !resp?.ok) {
+					showVeloceToast('Veloce: could not queue playlist — is the backend running?', true);
+					return;
+				}
+				showVeloceToast(`Veloce: queuing playlist "${titleStem}"…`, false);
+			});
+		});
+	}
+
+	function appendPlaylistDownloadOption(menu, closeBtn, pageUrl) {
+		if (!/youtube\.com/i.test(location.hostname)) return;
+		if (!isYoutubePlaylistContext(pageUrl)) return;
+		const playlistUrl = youtubePlaylistTargetUrl(pageUrl);
+		if (!playlistUrl) return;
+		const btn = document.createElement('button');
+		btn.className = 'menu-item menu-item-playlist';
+		btn.textContent = 'Download entire playlist';
+		btn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			queuePlaylistDownload(playlistUrl, pageUrl);
+		});
+		menu.insertBefore(btn, closeBtn);
+	}
+
 	function isManifestFormat(fmt) {
 		return fmt.kind === 'manifest' ||
 			/\.m3u8(\?|$)/i.test(fmt.url || '') ||
@@ -1454,6 +1524,7 @@
 		for (const fmt of formats) {
 			const btn = document.createElement('button');
 			btn.className = 'menu-item';
+			if (fmt.id === 'best') btn.classList.add('menu-item-recommended');
 			btn.textContent = fmt.label;
 			btn.addEventListener('click', (e) => {
 				e.stopPropagation();
@@ -1463,10 +1534,11 @@
 				const pageUrl = location.href.split('#')[0];
 				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 				const manifest = isManifestFormat(fmt);
+				const useDirect = fmt.url && fmt.id !== 'best' && !manifest;
 				chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
 					const payload = {
 						url: sourceUrl,
-						directUrl: manifest ? undefined : fmt.url,
+						directUrl: useDirect ? fmt.url : undefined,
 						pageUrl,
 						referer: pageUrl,
 						fileName,
@@ -1497,6 +1569,8 @@
 
 	function showFormatsInMenu(menu, closeBtn, formats, url, loading) {
 		if (loading) loading.stop();
+		const pageUrl = location.href.split('#')[0];
+		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
 		renderFormatButtons(menu, closeBtn, formats, url);
 	}
 

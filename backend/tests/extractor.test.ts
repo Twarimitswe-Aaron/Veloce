@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isDirectFileUrl, isExtractorDomain, normalizeFormatUrl } from '../src/lib/server/extractor';
+import { isDirectFileUrl, isExtractorDomain, normalizeFormatUrl, finalizeFormatsForPicker, type MediaFormat } from '../src/lib/server/extractor';
 
 describe('isDirectFileUrl', () => {
 	it('detects direct media/file links by extension', () => {
@@ -49,5 +49,20 @@ describe('isExtractorDomain', () => {
 	it('returns false for generic hosts', () => {
 		expect(isExtractorDomain('https://example.com/a.mp4')).toBe(false);
 		expect(isExtractorDomain('bad url')).toBe(false);
+	});
+});
+
+describe('finalizeFormatsForPicker', () => {
+	it('hides YouTube video-only streams and adds a best row', () => {
+		const raw: MediaFormat[] = [
+			{ id: '137', label: 'Song — 1920x1080 webm · 200 MB', url: 'https://v.example/v', ext: '.webm', av: 'video' },
+			{ id: '18', label: 'Song — 640x360 mp4 · 11 MB', url: 'https://v.example/p', ext: '.mp4', av: 'both' },
+			{ id: '140', label: 'Song — audio only m4a', url: 'https://v.example/a', ext: '.m4a', av: 'audio' }
+		];
+		const out = finalizeFormatsForPicker(raw, 'youtube');
+		expect(out[0]?.id).toBe('best');
+		expect(out.some((f) => f.id === '137')).toBe(false);
+		expect(out.some((f) => f.id === '18')).toBe(true);
+		expect(out.some((f) => f.id === '140')).toBe(false);
 	});
 });

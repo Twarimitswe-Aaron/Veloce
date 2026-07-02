@@ -14,6 +14,8 @@ import {
 
 export type { FormatKind, MediaSource };
 
+export type AvStream = 'both' | 'video' | 'audio';
+
 export interface MediaFormat {
 	id: string;
 	label: string;
@@ -24,6 +26,8 @@ export interface MediaFormat {
 	source?: MediaSource;
 	/** How the engine should fetch it. */
 	kind?: FormatKind;
+	/** Whether the stream includes video, audio, or both (YouTube DASH). */
+	av?: AvStream;
 }
 
 const EXTRACTOR_DOMAINS = [
@@ -243,8 +247,9 @@ async function listFormatsUncached(
 	}
 
 	const { formats, lastErr } = await listFormatsBySource(url, source, opts);
-	if (formats.length > 0) {
-		setCached(cacheKey, formats);
+	const pickerFormats = finalizeFormatsForPicker(formats, source);
+	if (pickerFormats.length > 0) {
+		setCached(cacheKey, pickerFormats);
 	} else {
 		failCache.set(cacheKey, {
 			reason: failReasonForSource(source, lastErr),
@@ -252,7 +257,7 @@ async function listFormatsUncached(
 			source
 		});
 	}
-	return formats;
+	return pickerFormats;
 }
 
 type YtDlpAttempt = {
@@ -597,12 +602,13 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 		const hasAudio = f.acodec && f.acodec !== 'none';
 		if (!hasVideo && !hasAudio) continue;
 
+		const av: AvStream = hasVideo && hasAudio ? 'both' : hasVideo ? 'video' : 'audio';
 		const res = f.resolution && f.resolution !== 'audio only' ? f.resolution : '';
-		const kind = hasVideo && hasAudio ? 'video+audio' : hasVideo ? 'video' : 'audio';
+		const avTag = av === 'video' ? 'video only' : av === 'audio' ? 'audio only' : 'video+audio';
 		const size = (f.filesize || f.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const ext = (f.ext as string) || 'mp4';
-		const label = [res || kind, ext, sizeStr].filter(Boolean).join(' ');
+		const label = [res || avTag, ext, sizeStr].filter(Boolean).join(' ');
 
 		out.push({
 			id: String(f.format_id),
@@ -610,6 +616,7 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 			url: f.url as string,
 			ext: ext.startsWith('.') ? ext : `.${ext}`,
 			filesize: size,
+			av,
 			kind: inferFormatKind(f.url as string, f.protocol as string | undefined)
 		});
 	}
@@ -716,14 +723,50 @@ async function resolveMediafireDownload(url: string): Promise<string | null> {
 }
 
 function dedupeFormats(out: MediaFormat[]): MediaFormat[] {
-	out.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
 	const seen = new Set<string>();
 	return out.filter((f) => {
-		const key = `${f.label}|${f.ext}`;
+		const key = `${f.id}|${f.label}|${f.ext}`;
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
 	});
+}
+
+function parseFormatHeight(label: string): number {
+	const m = label.match(/(\d{3,4})x(\d{3,4})/);
+	if (m) return parseInt(m[2], 10);
+	const p = label.match(/\b(\d{3,4})p\b/i);
+	if (p) return parseInt(p[1], 10);
+	return 0;
+}
+
+/** YouTube picker: hide silent video-only DASH streams; offer a merged "best" row. */
+function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
+	const combined = dedupeFormats(formats.filter((f) => f.av === 'both'));
+	combined.sort((a, b) => {
+		const hb = parseFormatHeight(b.label);
+		const ha = parseFormatHeight(a.label);
+		if (hb !== ha) return hb - ha;
+		return (b.filesize ?? 0) - (a.filesize ?? 0);
+	});
+	const titleStem = combined[0]?.label.split(' — ')[0] || 'video';
+	const best: MediaFormat = {
+		id: 'best',
+		label: `${titleStem} — Best (video + audio)`,
+		url: '',
+		ext: '.mp4',
+		source: 'youtube',
+		kind: 'progressive',
+		av: 'both'
+	};
+	return [best, ...combined].slice(0, 24);
+}
+
+export function finalizeFormatsForPicker(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
+	if (source === 'youtube') return youtubePickerFormats(formats);
+	const sorted = dedupeFormats([...formats]);
+	sorted.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
+	return sorted.slice(0, 40);
 }
 
 export interface PlaylistEntry {
@@ -840,7 +883,7 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
         const ytdlp = spawn(ytdlpPath, [
             ...ytdlpSharedArgs(),
             ...cookieArgs,
-            '-f', 'b/best',
+            '-f', 'b',
             '--no-playlist',
             '--no-warnings',
             '--no-progress',
