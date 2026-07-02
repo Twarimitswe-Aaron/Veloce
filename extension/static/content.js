@@ -8,25 +8,7 @@
 
 	console.log('%c[Veloce] content script active', 'color:#00ff9d;font-weight:bold', location.href);
 
-	function ensurePageHookInjected() {
-		try {
-			const root = document.documentElement;
-			if (!root) return;
-			if (root.dataset.veloceHookReady === '1') return;
-			if (root.dataset.veloceInjectRequested === '1') return;
-			root.dataset.veloceInjectRequested = '1';
-			const s = document.createElement('script');
-			s.src = chrome.runtime.getURL('inject-intercept.js');
-			s.async = false;
-			(document.head || root).appendChild(s);
-			console.log('[Veloce] injected page hook script tag (backup)');
-		} catch (e) {
-			console.warn('[Veloce] page hook inject failed', e);
-		}
-	}
-	if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
-		ensurePageHookInjected();
-	}
+	// Page hook is injected via manifest MAIN-world content_script — no backup <script> tag.
 
 	const FILE_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|csv|json|xml|iso)(\?|#|$)/i;
 	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
@@ -447,6 +429,7 @@
 	if (typeof chrome !== 'undefined' && chrome.storage?.local) {
 		chrome.storage.local.get('veloce_connected', (r) => {
 			coordinatorOnline = r.veloce_connected === true;
+			coordinatorStateReady = true;
 			syncInjectCoordinatorState();
 		});
 		chrome.storage.onChanged?.addListener((changes, area) => {
@@ -771,7 +754,11 @@
 		}
 	}
 
+	let coordinatorStateReady = false;
+
 	function syncInjectCoordinatorState() {
+		// Avoid flashing offline to page hook before chrome.storage.local has loaded.
+		if (!coordinatorStateReady && !coordinatorOnline) return;
 		if (syncInjectCoordinatorState.lastOnline === coordinatorOnline) return;
 		syncInjectCoordinatorState.lastOnline = coordinatorOnline;
 		try {
@@ -781,10 +768,53 @@
 				type: 'VELOCE_COORDINATOR',
 				online: coordinatorOnline
 			}, '*');
-			interceptLog('coordinator state → page hook', { online: coordinatorOnline });
+			interceptLog('coordinator → page hook', { online: coordinatorOnline });
 		} catch { /* ignore */ }
 	}
 	syncInjectCoordinatorState.lastOnline = null;
+
+	let omniSaveLinks = [];
+	let omniSaveMovieTitle = '';
+	const OMNI_STORAGE_KEY = 'veloce_omni_links';
+
+	function loadOmniLinksFromStorage() {
+		try {
+			const raw = sessionStorage.getItem(OMNI_STORAGE_KEY);
+			if (!raw) return;
+			const data = JSON.parse(raw);
+			if (!data?.links?.length || Date.now() - (data.ts || 0) > 600000) return;
+			omniSaveLinks = data.links;
+			if (data.movie) omniSaveMovieTitle = data.movie;
+		} catch { /* ignore */ }
+	}
+
+	function normalizeQualityKey(label) {
+		return String(label || '').replace(/\s+/g, '').replace(/p$/i, '').toLowerCase();
+	}
+
+	function findOmniSaveLink(qualityLabel) {
+		const key = normalizeQualityKey(qualityLabel);
+		if (!key || !omniSaveLinks.length) return null;
+		return omniSaveLinks.find((l) => {
+			const r = normalizeQualityKey(l.resolution ?? l.res ?? l.quality ?? l.label ?? '');
+			return r === key;
+		}) || null;
+	}
+
+	function formatFromOmniSaveLink(link, qualityLabel, movieTitle) {
+		const url = link.url || link.downloadUrl || link.href;
+		if (!url || !isHttpUrl(url)) return null;
+		const res = link.resolution ?? link.res ?? qualityLabel ?? 'download';
+		const fmt = (link.format || 'mp4').toLowerCase();
+		const title = (movieTitle || 'download').replace(/[\\/:*?"<>|]/g, '_');
+		const fileName = `${title}_${res}p.${fmt}`;
+		return [{
+			id: 'intercept',
+			label: `${qualityLabel} — ${fmt.toUpperCase()}`,
+			url,
+			ext: `.${fmt.replace(/^\./, '')}`
+		}];
+	}
 
 	function handleInterceptRequest(detail) {
 		const { href, download, source } = detail || {};
@@ -803,15 +833,41 @@
 			return;
 		}
 		interceptLog('step 5: opening Veloce format menu', formats[0]);
+		if (openMenu) closeMenu();
 		openFormatMenu(location.href.split('#')[0], document.body, document.body, formats);
 	}
+
+	// When OmniSave "Download Options" modal opens, reload cached API links.
+	try {
+		const omniModalObs = new MutationObserver(() => {
+			if (document.getElementById('download-modal-title')) {
+				loadOmniLinksFromStorage();
+				if (omniSaveLinks.length) {
+					interceptLog('step 0: OmniSave modal open — links ready', {
+						count: omniSaveLinks.length,
+						qualities: omniSaveLinks.map((l) => l.resolution ?? l.res)
+					});
+				}
+			}
+		});
+		omniModalObs.observe(document.documentElement, { childList: true, subtree: true });
+	} catch { /* ignore */ }
 
 	function setupInjectBridge() {
 		window.addEventListener('message', (e) => {
 			if (e.source !== window || !e.data) return;
 			const data = e.data;
 			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_HOOK_LOG') {
-				interceptLog(`page hook: ${data.step}`, data.detail);
+				if (data.important) interceptLog(`page hook: ${data.step}`, data.detail);
+				return;
+			}
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_DOWNLOAD_LINKS') {
+				omniSaveLinks = Array.isArray(data.links) ? data.links : [];
+				if (data.movie) omniSaveMovieTitle = data.movie;
+				interceptLog('step 0: cached OmniSave links', {
+					count: omniSaveLinks.length,
+					qualities: omniSaveLinks.map((l) => l.resolution || l.res || l.quality)
+				});
 				return;
 			}
 			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_INTERCEPT') {
@@ -819,7 +875,7 @@
 			}
 		});
 
-		syncInjectCoordinatorState();
+		// Coordinator sync happens after chrome.storage.local loads (see above).
 	}
 
 	setupInjectBridge();
@@ -828,33 +884,38 @@
 	function parseDownloadModalButton(target) {
 		const title = document.getElementById('download-modal-title');
 		if (!title) return null;
+		// Modal: fixed overlay z-[80], role=dialog, inner .animate-modal
 		const modal = title.closest('[role="dialog"]')
 			|| title.closest('.animate-modal')
-			|| title.closest('[class*="animate-modal"]')
-			|| title.parentElement?.parentElement?.parentElement;
+			|| title.closest('[class*="z-[80]"]')
+			|| title.closest('.fixed.inset-0');
 		if (!modal) return null;
 		const btn = target.closest?.('button');
 		if (!btn || !modal.contains(btn)) return null;
 
 		let sectionKind = 'unknown';
-		for (const sec of modal.querySelectorAll('.mb-6, section, div')) {
-			if (!sec.contains(btn)) continue;
-			const heading = sec.querySelector('h3')?.textContent || '';
-			if (/quality/i.test(heading)) { sectionKind = 'quality'; break; }
-			if (/subtitle/i.test(heading)) { sectionKind = 'subtitle'; break; }
+		// Walk up to the section block containing this button
+		let section = btn.parentElement;
+		for (let i = 0; i < 8 && section && section !== modal; i++) {
+			const h3 = section.querySelector(':scope > h3, :scope > div > h3');
+			const heading = h3?.textContent || '';
+			if (/select quality|quality/i.test(heading)) { sectionKind = 'quality'; break; }
+			if (/select subtitle|subtitle/i.test(heading)) { sectionKind = 'subtitle'; break; }
+			section = section.parentElement;
 		}
 		if (sectionKind === 'unknown') {
-			const labelGuess = btn.textContent?.replace(/\s+/g, ' ').trim() || '';
+			const labelGuess = btn.querySelector('.font-semibold')?.textContent?.trim()
+				|| btn.textContent?.replace(/\s+/g, ' ').trim() || '';
 			if (/^\d{3,4}\s*P$/i.test(labelGuess)) sectionKind = 'quality';
 		}
 
 		const label = btn.querySelector('.font-semibold')?.textContent?.trim()
 			|| btn.textContent?.replace(/\s+/g, ' ').trim().slice(0, 48);
+		// Movie title is in the grid card at top of modal (h3.mb-1), NOT the modal title h2
 		const movie = modal.querySelector('h3.mb-1')?.textContent?.trim()
 			|| modal.querySelector('.grid h3')?.textContent?.trim();
-		const size = [...btn.querySelectorAll('.text-xs')].pop()?.textContent?.trim();
 
-		return { modal, btn, sectionKind, label, movie, size };
+		return { modal, btn, sectionKind, label, movie };
 	}
 
 	function refreshCoordinatorState(cb) {
@@ -1096,6 +1157,14 @@
 	}
 
 	function positionMenu(menu, badgeEl) {
+		// Intercept menu from download modal — center on screen (modal is z-80, we are z-max)
+		if (!badgeEl || badgeEl === document.body || badgeEl.closest?.('#download-modal-title, [aria-labelledby="download-modal-title"]')) {
+			menu.style.top = '50%';
+			menu.style.left = '50%';
+			menu.style.transform = 'translate(-50%, -50%)';
+			menu.style.position = 'fixed';
+			return;
+		}
 		const rect = badgeEl.getBoundingClientRect();
 		const menuH = Math.min(280, window.innerHeight - 16);
 		let top = rect.bottom + 4;
@@ -1373,25 +1442,48 @@
 	document.addEventListener('click', (e) => {
 		const modalBtn = parseDownloadModalButton(e.target);
 		if (modalBtn) {
-			refreshCoordinatorState();
-			interceptLog('step 1: download modal button clicked', {
+			loadOmniLinksFromStorage();
+
+			try {
+				document.documentElement.setAttribute('data-veloce-coordinator', coordinatorOnline ? '1' : '0');
+				window.postMessage({
+					source: 'veloce-extension',
+					type: 'VELOCE_COORDINATOR',
+					online: coordinatorOnline
+				}, '*');
+			} catch { /* ignore */ }
+
+			interceptLog('step 1: OmniSave modal button', {
 				section: modalBtn.sectionKind,
 				label: modalBtn.label,
 				movie: modalBtn.movie,
-				size: modalBtn.size,
 				coordinatorOnline,
-				hint: 'page hook should log createElement <a> next'
+				cachedLinks: omniSaveLinks.length,
+				qualities: omniSaveLinks.map((l) => l.resolution ?? l.res)
 			});
-			if (!coordinatorOnline) {
-				interceptLog('step 1b: coordinator OFFLINE — run: cd backend && pnpm dev, open Veloce popup, refresh this tab');
-			}
-			try {
-				chrome.runtime.sendMessage({
-					type: 'VELOCE_INTERCEPT_LOG',
-					step: 'modal button',
-					detail: { label: modalBtn.label, movie: modalBtn.movie, section: modalBtn.sectionKind }
+
+			if (modalBtn.sectionKind === 'quality' && coordinatorOnline) {
+				const link = findOmniSaveLink(modalBtn.label);
+				const movie = modalBtn.movie || omniSaveMovieTitle;
+				const formats = link ? formatFromOmniSaveLink(link, modalBtn.label, movie) : null;
+				if (formats) {
+					interceptLog('step 2: opening Veloce menu (cached link)', formats[0]);
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					openFormatMenu(location.href.split('#')[0], modalBtn.btn, modalBtn.btn, formats);
+					return;
+				}
+				interceptLog('step 1c: no cached link — open modal again or refresh tab after extension load', {
+					label: modalBtn.label,
+					hint: 'links load when Download Options modal opens (axios API)'
 				});
-			} catch { /* ignore */ }
+				showVeloceToast('Veloce: reopen Download Options modal once, then click quality again', true);
+			}
+
+			if (!coordinatorOnline) {
+				interceptLog('step 1b: coordinator OFFLINE — pnpm dev + click Veloce icon');
+				showVeloceToast('Veloce offline — run: cd backend && pnpm dev', true);
+			}
 		}
 
 		const a = e.target.closest?.('a[href]');

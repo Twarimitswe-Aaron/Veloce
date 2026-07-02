@@ -746,6 +746,7 @@ export function setupWebSocketServer(server: Server) {
 		return;
 	}
 	(server as Server & { [WSS_SINGLETON_KEY]?: boolean })[WSS_SINGLETON_KEY] = true;
+	console.log(`[Veloce] WebSocket ready — ws://localhost:${config.port}/ws`);
 
 	const wss = new WebSocketServer({
 		server,
@@ -762,8 +763,10 @@ export function setupWebSocketServer(server: Server) {
 		void reconcileInterrupted();
 	}
 
-	wss.on('connection', async (ws) => {
+	wss.on('connection', async (ws, req) => {
 		clients.add(ws);
+		const origin = req.headers.origin || 'native';
+		console.log(`[Veloce] client connected from ${origin} (${clients.size} total)`);
 		const macAddress = getMacAddress();
 
 		try {
@@ -1016,6 +1019,7 @@ export function setupWebSocketServer(server: Server) {
 
 		ws.on('close', () => {
 			clients.delete(ws);
+			console.log(`[Veloce] client disconnected (${clients.size} remaining)`);
 		});
 	});
 }

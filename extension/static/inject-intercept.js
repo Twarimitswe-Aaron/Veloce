@@ -1,20 +1,35 @@
-// MAIN-world hook for sites that programmatically create <a download> (OmniSave, etc.)
+// MAIN-world hook — minimal surface for SES-hardened pages (OmniSave mirrors, etc.)
 (function () {
-	if (window.__veloceInjectLoaded) return;
-	window.__veloceInjectLoaded = true;
+	try {
+		const root = document.documentElement;
+		if (window.__veloceInjectLoaded || root?.dataset?.veloceHookInstalled === '1') return;
+		window.__veloceInjectLoaded = true;
+		if (root) root.dataset.veloceHookInstalled = '1';
+	} catch {
+		if (window.__veloceInjectLoaded) return;
+		window.__veloceInjectLoaded = true;
+	}
 
 	const TAG = '[Veloce page-hook]';
+	const STORAGE_KEY = 'veloce_omni_links';
 	let coordinatorOnline = false;
+	let lastLoggedOnline = null;
 
-	function log(step, detail) {
-		if (detail !== undefined) {
-			console.log(TAG, step, detail);
-		} else {
-			console.log(TAG, step);
-		}
+	function logImportant(step, detail) {
+		if (detail !== undefined) console.log(TAG, step, detail);
+		else console.log(TAG, step);
 		try {
-			window.postMessage({ source: 'veloce-page-hook', type: 'VELOCE_HOOK_LOG', step, detail }, '*');
+			window.postMessage({ source: 'veloce-page-hook', type: 'VELOCE_HOOK_LOG', step, detail, important: true }, '*');
 		} catch { /* ignore */ }
+	}
+
+	function setCoordinatorOnline(online) {
+		if (coordinatorOnline === online) return;
+		coordinatorOnline = online;
+		if (lastLoggedOnline !== online) {
+			lastLoggedOnline = online;
+			logImportant('coordinator online', { online });
+		}
 	}
 
 	function readCoordinatorOnline() {
@@ -24,97 +39,108 @@
 		return coordinatorOnline;
 	}
 
-	function requestIntercept(href, download, source) {
-		log('INTERCEPT request → extension', { href, download, source });
+	function storeDownloadLinks(links, movie) {
+		if (!Array.isArray(links) || !links.length) return;
+		const payload = { links, movie: movie || '', ts: Date.now() };
+		try {
+			sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+		} catch { /* ignore */ }
+		logImportant('stored download links', {
+			count: links.length,
+			movie,
+			qualities: links.map((l) => l.resolution ?? l.res ?? l.quality)
+		});
+		try {
+			window.postMessage({
+				source: 'veloce-page-hook',
+				type: 'VELOCE_DOWNLOAD_LINKS',
+				links,
+				movie
+			}, '*');
+		} catch { /* ignore */ }
+	}
+
+	function parseDownloadApiBody(body) {
+		if (!body || typeof body !== 'object') return;
+		const links = body.downloads || body.downloadLinks || body.data?.downloads || [];
+		if (!Array.isArray(links) || !links.length) return;
+		const movie = body.title || body.subject?.title || body.data?.title || '';
+		storeDownloadLinks(links, movie);
+	}
+
+	function isDownloadApiUrl(url) {
+		return /subject\/download|video-download|wefeed-h5api|wefeed-seo-bff|h5-api\.aoneroom/i.test(String(url || ''));
+	}
+
+	function notifyIntercept(href, download) {
+		logImportant('download anchor click', { href, download });
 		try {
 			window.postMessage({
 				source: 'veloce-page-hook',
 				type: 'VELOCE_INTERCEPT',
 				href,
 				download,
-				source
+				source: 'anchor.click'
 			}, '*');
-		} catch (e) {
-			log('postMessage failed', String(e));
-		}
-	}
-
-	function tryInterceptAnchor(anchor, source) {
-		const href = anchor.href;
-		const download = anchor.getAttribute('download') || '';
-		const online = readCoordinatorOnline();
-		log('anchor check', { source, href, download, coordinatorOnline: online });
-		if (!online) {
-			log('SKIP — coordinator offline (open Veloce popup / start backend, refresh tab)');
-			return false;
-		}
-		if (!href || !/^https?:/i.test(href)) {
-			log('SKIP — not http(s)', { href });
-			return false;
-		}
-		if (!anchor.hasAttribute('download')) {
-			log('SKIP — no download attribute');
-			return false;
-		}
-		requestIntercept(href, download, source);
-		return true;
-	}
-
-	function hookAnchorElement(anchor, source) {
-		if (!anchor || anchor.__veloceHooked) return;
-		anchor.__veloceHooked = true;
-		const nativeClick = anchor.click.bind(anchor);
-		anchor.click = function veloceHookedAnchorClick() {
-			log('element.click()', { source, href: anchor.href, download: anchor.getAttribute('download') });
-			if (tryInterceptAnchor(anchor, source + '/click')) return;
-			return nativeClick();
-		};
+		} catch { /* ignore */ }
 	}
 
 	window.addEventListener('message', (e) => {
 		if (e.source !== window || !e.data || e.data.source !== 'veloce-extension') return;
 		if (e.data.type === 'VELOCE_COORDINATOR') {
-			coordinatorOnline = e.data.online === true;
-			log('coordinator state from extension', { online: coordinatorOnline });
+			setCoordinatorOnline(e.data.online === true);
 		}
 	});
 
 	try {
 		const obs = new MutationObserver(() => {
 			const v = document.documentElement?.getAttribute('data-veloce-coordinator');
-			if (v === '1') coordinatorOnline = true;
-			else if (v === '0') coordinatorOnline = false;
+			if (v === '1') setCoordinatorOnline(true);
+			else if (v === '0') setCoordinatorOnline(false);
 		});
 		obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-veloce-coordinator'] });
 	} catch { /* ignore */ }
 
-	const nativeCreate = Document.prototype.createElement;
-	Document.prototype.createElement = function veloceCreateElement(tag, options) {
-		const el = nativeCreate.call(this, tag, options);
-		if (String(tag || '').toLowerCase() === 'a') {
-			log('createElement <a>');
-			hookAnchorElement(el, 'createElement');
-		}
-		return el;
-	};
+	// OmniSave API uses axios/XHR — not window.fetch.
+	try {
+		const nativeXHROpen = XMLHttpRequest.prototype.open;
+		const nativeXHRSend = XMLHttpRequest.prototype.send;
+		XMLHttpRequest.prototype.open = function veloceXHROpen(method, url, ...rest) {
+			this.__veloceUrl = url;
+			return nativeXHROpen.call(this, method, url, ...rest);
+		};
+		XMLHttpRequest.prototype.send = function veloceXHRSend(...args) {
+			this.addEventListener('load', function veloceXHRLoad() {
+				const url = this.__veloceUrl || '';
+				if (!isDownloadApiUrl(url) || !this.responseText) return;
+				try {
+					parseDownloadApiBody(JSON.parse(this.responseText));
+				} catch { /* ignore */ }
+			});
+			return nativeXHRSend.apply(this, args);
+		};
+	} catch (e) {
+		logImportant('XHR hook failed (SES?)', String(e));
+	}
 
-	const nativeAppend = Node.prototype.appendChild;
-	Node.prototype.appendChild = function veloceAppendChild(child) {
-		if (child?.tagName === 'A') hookAnchorElement(child, 'appendChild');
-		return nativeAppend.call(this, child);
-	};
+	// Only intercept programmatic <a download>.click() — do NOT hook createElement (breaks React/GSI).
+	try {
+		const nativeProtoClick = HTMLAnchorElement.prototype.click;
+		HTMLAnchorElement.prototype.click = function veloceProtoAnchorClick() {
+			if (readCoordinatorOnline() && this.hasAttribute?.('download')) {
+				const href = this.href;
+				const download = this.getAttribute('download') || '';
+				if (href && /^https?:/i.test(href)) {
+					notifyIntercept(href, download);
+				}
+			}
+			return nativeProtoClick.call(this);
+		};
+	} catch (e) {
+		logImportant('anchor.click hook failed (SES?)', String(e));
+	}
 
-	const nativeProtoClick = HTMLAnchorElement.prototype.click;
-	HTMLAnchorElement.prototype.click = function veloceProtoAnchorClick() {
-		log('HTMLAnchorElement.prototype.click', {
-			href: this.href,
-			download: this.getAttribute('download')
-		});
-		if (this.hasAttribute?.('download') && tryInterceptAnchor(this, 'prototype.click')) return;
-		return nativeProtoClick.call(this);
-	};
-
-	log('MAIN-world hooks installed', { href: location.href });
+	logImportant('hooks installed', { href: location.href });
 	try {
 		document.documentElement.dataset.veloceHookReady = '1';
 	} catch { /* ignore */ }
