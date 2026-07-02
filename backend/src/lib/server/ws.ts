@@ -30,6 +30,7 @@ import {
 } from './playlistRunner';
 import { config } from './config';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
+import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
@@ -788,6 +789,7 @@ async function reconcileInterrupted() {
 }
 
 let reconciled = false;
+let dbCleaned = false;
 
 const WSS_SINGLETON_KEY = '__veloce_wss_attached';
 
@@ -812,6 +814,10 @@ export function setupWebSocketServer(server: Server) {
 	if (!reconciled) {
 		reconciled = true;
 		void reconcileInterrupted();
+	}
+	if (!dbCleaned) {
+		dbCleaned = true;
+		void runDatabaseCleanup();
 	}
 
 	wss.on('connection', async (ws, req) => {
@@ -841,17 +847,20 @@ export function setupWebSocketServer(server: Server) {
 			const recent = await db.select().from(downloads)
 				.where(eq(downloads.deviceId, macAddress))
 				.orderBy(sql`rowid desc`)
-				.limit(20);
+				.limit(50);
 			const playlists = await listPlaylistJobsForDevice(macAddress);
 			const snapshot = [
 				...playlists.map(playlistJobToSnapshot),
-				...recent.map((d) => ({
-					downloadId: d.id,
-					fileName: d.fileName,
-					status: d.status,
-					downloaded: d.downloadedBytes ?? 0,
-					total: d.totalBytes ?? 0
-				}))
+				...recent
+					.filter((d) => !isOrphanPlaylistDownloadRow(d))
+					.slice(0, 20)
+					.map((d) => ({
+						downloadId: d.id,
+						fileName: d.fileName,
+						status: d.status,
+						downloaded: d.downloadedBytes ?? 0,
+						total: d.totalBytes ?? 0
+					}))
 			];
 			if (ws.readyState === 1 && snapshot.length > 0) {
 				ws.send(JSON.stringify({ type: 'DOWNLOAD_SNAPSHOT', downloads: snapshot }));

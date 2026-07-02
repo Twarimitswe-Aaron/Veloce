@@ -36,6 +36,15 @@ describe('normalizeFormatUrl', () => {
 			'https://www.instagram.com/reel/AbCd'
 		);
 	});
+
+	it('canonicalizes Instagram story URLs', () => {
+		expect(normalizeFormatUrl('https://www.instagram.com/stories/li_estas_leul/345678901234/?utm=x')).toBe(
+			'https://www.instagram.com/stories/li_estas_leul/345678901234'
+		);
+		expect(normalizeFormatUrl('https://www.instagram.com/stories/user/')).toBe(
+			'https://www.instagram.com/stories/user'
+		);
+	});
 });
 
 describe('isExtractorDomain', () => {

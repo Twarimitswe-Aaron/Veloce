@@ -119,6 +119,13 @@ function instagramUrlVariants(url: string): string[] {
 		variants.add(`https://www.instagram.com/p/${code}`);
 		variants.add(`https://www.instagram.com/reel/${code}`);
 	}
+	const sm = url.match(/instagram\.com\/stories\/([^/?#]+)(?:\/(\d+))?/i);
+	if (sm) {
+		const user = sm[1];
+		const id = sm[2];
+		variants.add(`https://www.instagram.com/stories/${user}`);
+		if (id) variants.add(`https://www.instagram.com/stories/${user}/${id}`);
+	}
 	return [...variants];
 }
 

@@ -40,6 +40,31 @@ export function findCompletedTrackFile(saveDir: string, stem: string): string | 
 	return null;
 }
 
+export function prepareResumePosition(
+	entries: PlaylistEntry[],
+	saveDir: string,
+	index: number,
+	completed: number,
+	failedIndices: number[]
+): { index: number; completed: number; failedIndices: number[] } {
+	let i = index;
+	let done = completed;
+	const failed = [...failedIndices];
+	while (i < entries.length) {
+		if (failed.includes(i)) {
+			i++;
+			continue;
+		}
+		if (findCompletedTrackFile(saveDir, trackStem(entries[i], i))) {
+			done++;
+			i++;
+			continue;
+		}
+		break;
+	}
+	return { index: i, completed: done, failedIndices: failed };
+}
+
 export function parseFailedIndices(raw: unknown): number[] {
 	if (!Array.isArray(raw)) return [];
 	return raw.filter((n): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0);

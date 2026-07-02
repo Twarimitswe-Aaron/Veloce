@@ -12,7 +12,7 @@ import {
 	formatAttemptsForTrack,
 	parsePlaylistFormatSettings
 } from './playlistSettings';
-import { findCompletedTrackFile, isTrackCompleteOnDisk, parseFailedIndices, trackStem } from './playlistTrack';
+import { findCompletedTrackFile, isTrackCompleteOnDisk, parseFailedIndices, prepareResumePosition, trackStem } from './playlistTrack';
 import { sanitizeFileName, sanitizeFolderName } from './util';
 
 export type PlaylistRuntime = {
@@ -195,6 +195,15 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 	let completed = row.completedTracks;
 	let failed = row.failedTracks;
 	let failedIndices = parseFailedIndices(row.failedIndices);
+
+	const resumed = prepareResumePosition(entries, row.saveDir, index, completed, failedIndices);
+	index = resumed.index;
+	completed = resumed.completed;
+	failedIndices = resumed.failedIndices;
+	if (index !== row.currentIndex || completed !== row.completedTracks) {
+		await patchJob(playlistId, { currentIndex: index, completedTracks: completed, failedIndices });
+		row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
+	}
 
 	await patchJob(playlistId, { status: 'downloading', error: null });
 	row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;

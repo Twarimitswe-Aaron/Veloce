@@ -51,6 +51,9 @@ export function failReasonForSource(source: MediaSource, lastErr?: string): stri
 		if (err.includes('empty media')) {
 			return 'Instagram blocked yt-dlp for this post. Stay logged in to Instagram in Chrome (not only Chromium), reload the post, then click the Veloce badge again. Image-only posts have no video.';
 		}
+		if (err.includes('story') || err.includes('stories')) {
+			return 'Instagram story extraction failed. Stay logged in to Chrome, open the video story, then click the Veloce badge. Photo-only stories have no video stream.';
+		}
 		return 'Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry.';
 	}
 
