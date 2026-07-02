@@ -6,9 +6,60 @@
 	if (window.__veloceContentLoaded) return;
 	window.__veloceContentLoaded = true;
 
+	console.log('%c[Veloce] content script active', 'color:#00ff9d;font-weight:bold', location.href);
+
+	function ensurePageHookInjected() {
+		try {
+			const root = document.documentElement;
+			if (!root) return;
+			if (root.dataset.veloceHookReady === '1') return;
+			if (root.dataset.veloceInjectRequested === '1') return;
+			root.dataset.veloceInjectRequested = '1';
+			const s = document.createElement('script');
+			s.src = chrome.runtime.getURL('inject-intercept.js');
+			s.async = false;
+			(document.head || root).appendChild(s);
+			console.log('[Veloce] injected page hook script tag (backup)');
+		} catch (e) {
+			console.warn('[Veloce] page hook inject failed', e);
+		}
+	}
+	if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
+		ensurePageHookInjected();
+	}
+
 	const FILE_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|csv|json|xml|iso)(\?|#|$)/i;
 	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
 	const CDN_IMAGE = /fbcdn\.net|cdninstagram\.com/i;
+
+	/** YouTube uses /watch?v=ID — not /watch/ID. */
+	function canonicalYoutubeUrl(href = location.href) {
+		try {
+			const u = new URL(href, location.origin);
+			const host = u.hostname.toLowerCase();
+			if (host === 'youtu.be') {
+				const id = u.pathname.split('/').filter(Boolean)[0];
+				if (id) return `https://www.youtube.com/watch?v=${id}`;
+			}
+			if (host.includes('youtube.com')) {
+				if (u.pathname.startsWith('/shorts/')) {
+					const id = u.pathname.split('/').filter(Boolean)[1];
+					if (id) return `https://www.youtube.com/shorts/${id}`;
+				}
+				if (u.pathname === '/watch') {
+					const v = u.searchParams.get('v');
+					if (v) return `https://www.youtube.com/watch?v=${v}`;
+				}
+			}
+		} catch { /* ignore */ }
+		return null;
+	}
+
+	function isYoutubeWatchPage() {
+		if (!/youtube\.com/i.test(location.hostname)) return false;
+		if (/^\/shorts\/[^/?#]+/.test(location.pathname)) return true;
+		return location.pathname === '/watch' && !!new URL(location.href).searchParams.get('v');
+	}
 
 	function isHttpUrl(url) {
 		try {
@@ -25,6 +76,56 @@
 			return p === 'blob:' || p === 'data:' || p === 'mediastream:';
 		} catch {
 			return /^blob:|^data:|^mediastream:/i.test(url || '');
+		}
+	}
+
+	function resolveInterceptListUrl(pageUrl, interceptUrl) {
+		if (interceptUrl && isInterceptableMediaUrl(interceptUrl) && !isInterceptTrapUrl(interceptUrl)) {
+			return interceptUrl;
+		}
+		if (pageUrl && isHttpUrl(pageUrl)) return pageUrl;
+		return interceptUrl || pageUrl || '';
+	}
+
+	function formatsFromDownloadAnchor(anchor) {
+		const href = anchor?.href;
+		if (!href || !isHttpUrl(href)) return null;
+		let fileName = anchor.getAttribute('download') || '';
+		if (!fileName) {
+			try {
+				fileName = decodeURIComponent(new URL(href).pathname.split('/').filter(Boolean).pop() || 'download');
+			} catch {
+				fileName = 'download';
+			}
+		}
+		const dot = fileName.lastIndexOf('.');
+		const ext = dot > 0 ? fileName.slice(dot) : '.mp4';
+		const label = dot > 0 ? fileName.slice(0, dot).replace(/_/g, ' ') : fileName;
+		return [{ id: 'intercept', label, url: href, ext }];
+	}
+
+	const INTERCEPT_MEDIA_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|iso)(\?|#|$)/i;
+
+	function isInterceptableMediaUrl(url) {
+		try {
+			const u = new URL(url);
+			if (!/^https?:$/i.test(u.protocol)) return false;
+			return INTERCEPT_MEDIA_EXT.test(u.pathname);
+		} catch {
+			return false;
+		}
+	}
+
+	function isInterceptTrapUrl(url) {
+		try {
+			const u = new URL(url);
+			const path = u.pathname.toLowerCase();
+			if (/\/redirect|\/pkg\/|\/api\/|\/graphql|\/download\?/i.test(path)) return true;
+			if (/redirect|download/i.test(u.searchParams.get('a') || '')) return true;
+			if (isInterceptableMediaUrl(url)) return false;
+			return !INTERCEPT_MEDIA_EXT.test(u.pathname);
+		} catch {
+			return false;
 		}
 	}
 
@@ -62,6 +163,8 @@
 			if (!VIDEO_SITES.test(location.hostname)) return null;
 			const post = anchor ? findPostUrl(anchor) : null;
 			if (post) return post;
+			const yt = canonicalYoutubeUrl();
+			if (yt) return yt;
 			if (/\/(p|reel|tv)\//.test(location.pathname)) {
 				return location.href.split('?')[0];
 			}
@@ -69,6 +172,12 @@
 		}
 
 		if (!isHttpUrl(raw)) return null;
+
+		// YouTube streams via googlevideo.com — badge/yt-dlp target is the watch page.
+		if (/googlevideo\.com/i.test(raw) && /youtube\.com|youtu\.be/i.test(location.hostname)) {
+			const yt = canonicalYoutubeUrl();
+			if (yt) return yt;
+		}
 
 		// Skip CDN still/thumbnail images on social feeds (not the video file).
 		if (anchor && /instagram\.com/i.test(location.hostname) && CDN_IMAGE.test(raw)) {
@@ -87,6 +196,10 @@
 		try {
 			const u = new URL(url);
 			u.hash = '';
+			if (/youtube\.com|youtu\.be/i.test(u.hostname)) {
+				const canon = canonicalYoutubeUrl(u.href);
+				if (canon) return canon;
+			}
 			if (VIDEO_SITES.test(u.hostname) && /\/(p|reel|tv)\//.test(u.pathname)) {
 				const path = u.pathname.replace(/\/+$/, '');
 				return `${u.origin}${path}`;
@@ -134,11 +247,21 @@
 
 	const style = document.createElement('style');
 	style.textContent = `
-		:host { all: initial; }
+		:host {
+			all: initial;
+			position: fixed !important;
+			inset: 0 !important;
+			width: 100vw !important;
+			height: 100vh !important;
+			z-index: 2147483647 !important;
+			pointer-events: none !important;
+			overflow: visible !important;
+		}
 		* { box-sizing: border-box; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
 		.badge {
 			position: fixed;
-			z-index: 2147483646;
+			z-index: 2147483647;
+			pointer-events: auto;
 			display: flex;
 			align-items: center;
 			gap: 4px;
@@ -153,6 +276,7 @@
 			user-select: none;
 			line-height: 1.2;
 			white-space: nowrap;
+			box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
 		}
 		.badge:hover { background: #002a55; }
 		.badge-loading { opacity: 0.7; }
@@ -168,6 +292,7 @@
 		.menu {
 			position: fixed;
 			z-index: 2147483647;
+			pointer-events: auto;
 			min-width: 220px;
 			max-width: min(320px, calc(100vw - 16px));
 			max-height: min(280px, calc(100vh - 16px));
@@ -244,7 +369,7 @@
 	const PREFETCH_MARGIN_PX = 80;
 	const SCANNED_ATTR = 'data-veloce-scanned';
 	const WATCH_ATTR = 'data-veloce-watch';
-	const TAB_PING_MS = 50000;
+	const TAB_PING_MS = 25000;
 	let openMenu = null;
 	let pendingMenuUrl = null;
 	let tabPort = null;
@@ -253,14 +378,81 @@
 	// synchronously — otherwise the native download starts before an async check
 	// returns, and chrome.downloads.onCreated would create a second copy.
 	let coordinatorOnline = false;
+	/** Only the active tab in the focused window may show badges or prefetch. */
+	let isForegroundTab = false;
+
+	function captureActive() {
+		return isForegroundTab && !document.hidden;
+	}
+
+	function suspendCapture() {
+		closeMenu();
+		for (const key of [...badgeKeys]) removeBadge(key);
+		document.querySelectorAll(`[${WATCH_ATTR}], [${SCANNED_ATTR}]`).forEach((el) => {
+			try { mediaIo.unobserve(el); } catch { /* ignore */ }
+			el.removeAttribute(WATCH_ATTR);
+			el.removeAttribute(SCANNED_ATTR);
+		});
+		// Keep the tab port alive — pings wake the service worker for message routing.
+		if (!tabPort) connectTabPort();
+		if (!tabPingTimer) startTabPing();
+	}
+
+	function resumeCapture() {
+		if (!captureActive()) return;
+		connectTabPort();
+		startTabPing();
+		scan();
+	}
+
+	function syncForegroundState(active) {
+		const was = isForegroundTab;
+		isForegroundTab = active === true;
+		if (!isForegroundTab) {
+			suspendCapture();
+			ensureForegroundPolling();
+		} else {
+			if (ensureForegroundPolling.timer) {
+				clearInterval(ensureForegroundPolling.timer);
+				ensureForegroundPolling.timer = null;
+			}
+			if (!was || document.visibilityState === 'visible') {
+				resumeCapture();
+			}
+		}
+	}
+
+	function queryForegroundState() {
+		if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+		chrome.runtime.sendMessage({ type: 'VELOCE_AM_I_FOREGROUND' }, (r) => {
+			if (chrome.runtime.lastError) return;
+			syncForegroundState(!!r?.active);
+		});
+	}
+
+	function ensureForegroundPolling() {
+		if (ensureForegroundPolling.timer) return;
+		ensureForegroundPolling.timer = setInterval(() => {
+			if (document.hidden) return;
+			if (isForegroundTab) {
+				clearInterval(ensureForegroundPolling.timer);
+				ensureForegroundPolling.timer = null;
+				return;
+			}
+			queryForegroundState();
+		}, 1500);
+	}
+	ensureForegroundPolling.timer = null;
 
 	if (typeof chrome !== 'undefined' && chrome.storage?.local) {
 		chrome.storage.local.get('veloce_connected', (r) => {
 			coordinatorOnline = r.veloce_connected === true;
+			syncInjectCoordinatorState();
 		});
 		chrome.storage.onChanged?.addListener((changes, area) => {
 			if (area === 'local' && changes.veloce_connected) {
 				coordinatorOnline = changes.veloce_connected.newValue === true;
+				syncInjectCoordinatorState();
 			}
 		});
 	}
@@ -269,6 +461,11 @@
 		try {
 			if (tabPort) return;
 			tabPort = chrome.runtime.connect({ name: 'veloce-tab' });
+			tabPort.onMessage.addListener((msg) => {
+				if (msg?.type === 'VELOCE_FOREGROUND_STATE') {
+					syncForegroundState(msg.active === true);
+				}
+			});
 			tabPort.onDisconnect.addListener(() => {
 				tabPort = null;
 				setTimeout(connectTabPort, 800);
@@ -299,22 +496,17 @@
 		}
 	}
 
-	connectTabPort();
-	startTabPing();
-
 	document.addEventListener('visibilitychange', () => {
 		if (document.visibilityState === 'visible') {
-			connectTabPort();
-			startTabPing();
-			scan();
+			queryForegroundState();
 		} else {
-			stopTabPing();
+			suspendCapture();
 		}
 	});
-	window.addEventListener('pageshow', () => {
-		connectTabPort();
-		startTabPing();
-	});
+	window.addEventListener('pageshow', () => queryForegroundState());
+	window.addEventListener('focus', () => queryForegroundState());
+
+	queryForegroundState();
 
 	function markBadgeReady(badgeKey) {
 		const entry = badges.get(badgeKey);
@@ -338,8 +530,214 @@
 	}
 
 	function isSocialFeedPage() {
-		return VIDEO_SITES.test(location.hostname) &&
-			!/\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
+		if (!VIDEO_SITES.test(location.hostname)) return false;
+		if (isDedicatedMediaPage()) return false;
+		return !/\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
+	}
+
+	function isDedicatedMediaPage() {
+		if (!VIDEO_SITES.test(location.hostname)) return false;
+		if (isYoutubeWatchPage()) return true;
+		if (/youtu\.be/i.test(location.hostname) && location.pathname.length > 1) return true;
+		return /\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
+	}
+
+	function isMainYoutubePlayer(el) {
+		if (!/youtube\.com/i.test(location.hostname)) return true;
+		if (!isYoutubeWatchPage()) return true;
+		return !!el.closest('#movie_player, #player, ytd-player, .html5-video-player, ytd-shorts');
+	}
+
+	/** Primary modal player — largest visible video dialog (main reel, not DM sidebar). */
+	function findMediaOverlay() {
+		let best = null;
+		let bestArea = 0;
+		for (const d of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+			try {
+				const st = getComputedStyle(d);
+				if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+			} catch { /* ignore */ }
+			const dr = d.getBoundingClientRect();
+			if (dr.width < 160 || dr.height < 160) continue;
+			const video = d.querySelector('video');
+			if (!video) continue;
+			const vis = visibleMediaRect(video) || clipRectToViewport(video.getBoundingClientRect());
+			if (!vis || vis.width < 80 || vis.height < 80) continue;
+			const area = vis.width * vis.height;
+			if (area > bestArea) {
+				bestArea = area;
+				best = d;
+			}
+		}
+		return best;
+	}
+
+	/**
+	 * Painted video/audio bounds inside the element box (object-fit letterboxing).
+	 * Instagram reel players often use a viewport-sized <video> with pillarboxed content.
+	 */
+	function visibleMediaRect(el) {
+		if (!el?.getBoundingClientRect) return null;
+		const box = el.getBoundingClientRect();
+		if (box.width <= 0 || box.height <= 0) return null;
+
+		const tag = el.tagName?.toLowerCase();
+		if (tag !== 'video' && tag !== 'audio') {
+			return clipRectToViewport(box);
+		}
+
+		const vw = el.videoWidth;
+		const vh = el.videoHeight;
+		if (!vw || !vh) {
+			// Full-viewport element before metadata — don't pin badge to window corner yet.
+			if (box.width >= window.innerWidth * 0.9 && box.height >= window.innerHeight * 0.5) {
+				return null;
+			}
+			return clipRectToViewport(box);
+		}
+
+		let fit = 'contain';
+		try {
+			fit = getComputedStyle(el).objectFit || 'contain';
+		} catch { /* ignore */ }
+
+		const cw = box.width;
+		const ch = box.height;
+		let rw = cw;
+		let rh = ch;
+		let ox = 0;
+		let oy = 0;
+
+		if (fit === 'fill') {
+			// use full box
+		} else if (fit === 'cover') {
+			// cropped to fill — badge on element box is fine
+		} else if (fit === 'none') {
+			rw = Math.min(vw, cw);
+			rh = Math.min(vh, ch);
+			ox = (cw - rw) / 2;
+			oy = (ch - rh) / 2;
+		} else {
+			// contain / scale-down
+			const arEl = cw / ch;
+			const arVid = vw / vh;
+			if (arVid > arEl) {
+				rw = cw;
+				rh = cw / arVid;
+				ox = 0;
+				oy = (ch - rh) / 2;
+			} else {
+				rh = ch;
+				rw = ch * arVid;
+				ox = (cw - rw) / 2;
+				oy = 0;
+			}
+		}
+
+		return clipRectToViewport({
+			left: box.left + ox,
+			top: box.top + oy,
+			right: box.left + ox + rw,
+			bottom: box.top + oy + rh,
+			width: rw,
+			height: rh
+		});
+	}
+
+	function mediaDisplayScore(el) {
+		const vis = visibleMediaRect(el);
+		return vis ? vis.width * vis.height : 0;
+	}
+
+	function clipRectToViewport(rect) {
+		if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+		const left = Math.max(rect.left, 0);
+		const top = Math.max(rect.top, 0);
+		const right = Math.min(rect.right, window.innerWidth);
+		const bottom = Math.min(rect.bottom, window.innerHeight);
+		if (right - left < 24 || bottom - top < 16) return null;
+		return { left, top, right, bottom, width: right - left, height: bottom - top };
+	}
+
+	function mediaVisibleRect(el) {
+		return visibleMediaRect(el) || clipRectToViewport(el.getBoundingClientRect());
+	}
+
+	function hitTestMedia(el, cx, cy) {
+		if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) return false;
+		let hit = document.elementFromPoint(cx, cy);
+		const root = findBadgeRoot(el);
+		for (let i = 0; i < 14 && hit; i++) {
+			if (hit === el || el.contains(hit)) return true;
+			if (root && (hit === root || root.contains(hit))) return true;
+			if (hit.id === 'veloce-host') break;
+			hit = hit.parentElement;
+		}
+		return false;
+	}
+
+	/** True when the element is the media the user is actually looking at (not feed behind a modal). */
+	function isElementForeground(el) {
+		if (!el?.isConnected) return false;
+		const tag = el.tagName?.toLowerCase();
+		if (tag !== 'video' && tag !== 'audio' && tag !== 'a') return false;
+
+		const overlay = findMediaOverlay();
+		if (overlay) {
+			if (!overlay.contains(el)) return false;
+		} else if (isSocialFeedPage()) {
+			if (!isNearViewport(el, 0)) return false;
+		}
+
+		const vis = mediaVisibleRect(el);
+		if (!vis || vis.width < 48 || vis.height < 48) return false;
+
+		// Dedicated watch/reel pages: skip hit-test (players stack UI over the video).
+		if (isDedicatedMediaPage() && !overlay) return true;
+
+		// Modal player: visible in-viewport video inside the dialog counts as foreground.
+		if (overlay && overlay.contains(el)) return true;
+
+		// Feed tiles: sample a few points — center is often covered by controls/overlays.
+		const points = [
+			[vis.left + vis.width * 0.5, vis.top + vis.height * 0.38],
+			[vis.left + vis.width * 0.82, vis.top + vis.height * 0.18],
+			[vis.left + vis.width * 0.18, vis.top + vis.height * 0.22]
+		];
+		for (const [cx, cy] of points) {
+			if (hitTestMedia(el, cx, cy)) return true;
+		}
+		return false;
+	}
+
+	function shouldReanchorBadge(entry, newAnchor) {
+		if (!newAnchor?.isConnected) return false;
+		if (!entry.anchor?.isConnected) return true;
+		const newScore = mediaDisplayScore(newAnchor);
+		const oldScore = mediaDisplayScore(entry.anchor);
+		if (newScore > oldScore * 1.15) return true;
+		if (isElementForeground(newAnchor) && !isElementForeground(entry.anchor)) return true;
+		const overlay = findMediaOverlay();
+		if (overlay && overlay.contains(newAnchor) && !overlay.contains(entry.anchor)) return true;
+		return false;
+	}
+
+	/** Drop badges tied to feed tiles when a modal/overlay player is open. */
+	function cullBackgroundBadges() {
+		const overlay = findMediaOverlay();
+		for (const [key, entry] of [...badges]) {
+			if (!entry.anchor?.isConnected) {
+				removeBadge(key);
+				continue;
+			}
+			if (overlay && !overlay.contains(entry.anchor)) {
+				removeBadge(key);
+				continue;
+			}
+			if (!isElementForeground(entry.anchor)) {
+				entry.el.style.display = 'none';
+			}
+		}
 	}
 
 	function eagerPrefetch(url) {
@@ -348,7 +746,7 @@
 
 	/** Queue format fetch — skips when tab hidden; caps batch size. */
 	function prefetchPageUrls(entries) {
-		if (document.hidden) return;
+		if (!captureActive() || document.hidden) return;
 		const sorted = [...entries].sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
 		const batch = [];
 		for (const { url, priority } of sorted) {
@@ -364,8 +762,141 @@
 		} catch { /* ignore */ }
 	}
 
+	function interceptLog(step, detail) {
+		const ts = new Date().toISOString();
+		if (detail !== undefined) {
+			console.log(`[Veloce intercept] ${ts} ${step}`, detail);
+		} else {
+			console.log(`[Veloce intercept] ${ts} ${step}`);
+		}
+	}
+
+	function syncInjectCoordinatorState() {
+		if (syncInjectCoordinatorState.lastOnline === coordinatorOnline) return;
+		syncInjectCoordinatorState.lastOnline = coordinatorOnline;
+		try {
+			document.documentElement?.setAttribute('data-veloce-coordinator', coordinatorOnline ? '1' : '0');
+			window.postMessage({
+				source: 'veloce-extension',
+				type: 'VELOCE_COORDINATOR',
+				online: coordinatorOnline
+			}, '*');
+			interceptLog('coordinator state → page hook', { online: coordinatorOnline });
+		} catch { /* ignore */ }
+	}
+	syncInjectCoordinatorState.lastOnline = null;
+
+	function handleInterceptRequest(detail) {
+		const { href, download, source } = detail || {};
+		interceptLog('step 4: page hook → content script', { href, download, source, coordinatorOnline });
+		if (!coordinatorOnline) {
+			interceptLog('step 4b: ABORT — coordinator offline (pnpm dev + open Veloce popup, refresh tab)');
+			return;
+		}
+		const fake = {
+			href,
+			getAttribute: (k) => (k === 'download' ? (download || '') : null)
+		};
+		const formats = formatsFromDownloadAnchor(fake);
+		if (!formats) {
+			interceptLog('step 4b: ABORT — could not build format', { href, download });
+			return;
+		}
+		interceptLog('step 5: opening Veloce format menu', formats[0]);
+		openFormatMenu(location.href.split('#')[0], document.body, document.body, formats);
+	}
+
+	function setupInjectBridge() {
+		window.addEventListener('message', (e) => {
+			if (e.source !== window || !e.data) return;
+			const data = e.data;
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_HOOK_LOG') {
+				interceptLog(`page hook: ${data.step}`, data.detail);
+				return;
+			}
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_INTERCEPT') {
+				handleInterceptRequest(data);
+			}
+		});
+
+		syncInjectCoordinatorState();
+	}
+
+	setupInjectBridge();
+
+	/** OmniSave / videodownloader.site download modal (#download-modal-title). */
+	function parseDownloadModalButton(target) {
+		const title = document.getElementById('download-modal-title');
+		if (!title) return null;
+		const modal = title.closest('[role="dialog"]')
+			|| title.closest('.animate-modal')
+			|| title.closest('[class*="animate-modal"]')
+			|| title.parentElement?.parentElement?.parentElement;
+		if (!modal) return null;
+		const btn = target.closest?.('button');
+		if (!btn || !modal.contains(btn)) return null;
+
+		let sectionKind = 'unknown';
+		for (const sec of modal.querySelectorAll('.mb-6, section, div')) {
+			if (!sec.contains(btn)) continue;
+			const heading = sec.querySelector('h3')?.textContent || '';
+			if (/quality/i.test(heading)) { sectionKind = 'quality'; break; }
+			if (/subtitle/i.test(heading)) { sectionKind = 'subtitle'; break; }
+		}
+		if (sectionKind === 'unknown') {
+			const labelGuess = btn.textContent?.replace(/\s+/g, ' ').trim() || '';
+			if (/^\d{3,4}\s*P$/i.test(labelGuess)) sectionKind = 'quality';
+		}
+
+		const label = btn.querySelector('.font-semibold')?.textContent?.trim()
+			|| btn.textContent?.replace(/\s+/g, ' ').trim().slice(0, 48);
+		const movie = modal.querySelector('h3.mb-1')?.textContent?.trim()
+			|| modal.querySelector('.grid h3')?.textContent?.trim();
+		const size = [...btn.querySelectorAll('.text-xs')].pop()?.textContent?.trim();
+
+		return { modal, btn, sectionKind, label, movie, size };
+	}
+
+	function refreshCoordinatorState(cb) {
+		if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+			cb?.();
+			return;
+		}
+		chrome.runtime.sendMessage({ type: 'VELOCE_GET_STATE' }, (r) => {
+			if (!chrome.runtime.lastError && r) {
+				coordinatorOnline = r.connected === true;
+				syncInjectCoordinatorState();
+			}
+			cb?.();
+		});
+	}
+
 	if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
 		chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+			if (msg.type === 'VELOCE_INTERCEPT_OPEN_MENU') {
+				const listUrl = msg.listUrl || msg.url || msg.pageUrl || msg.interceptUrl;
+				const pageUrl = msg.pageUrl || location.href.split('#')[0];
+				const interceptUrl = msg.interceptUrl || msg.url;
+				interceptLog('format menu requested', {
+					listUrl,
+					pageUrl,
+					interceptUrl,
+					fileName: msg.fileName
+				});
+				if (!listUrl) {
+					interceptLog('abort — no list url');
+					return;
+				}
+				const anchor = document.querySelector('video, audio') || document.body;
+				const badge = host || anchor;
+				const preloaded = Array.isArray(msg.preloadedFormats) && msg.preloadedFormats.length
+					? msg.preloadedFormats
+					: (msg.interceptUrl && msg.fileName
+						? formatsFromDownloadAnchor({ href: msg.interceptUrl, getAttribute: (k) => (k === 'download' ? msg.fileName : null) })
+						: null);
+				openFormatMenu(listUrl, anchor, badge, preloaded || undefined);
+				interceptLog('format menu shown — pick a format to download');
+			}
 			if (msg.type === 'VELOCE_FETCH_BLOB' && msg.url) {
 				(async () => {
 					try {
@@ -391,8 +922,12 @@
 				})();
 				return true;
 			}
+			if (msg.type === 'VELOCE_FOREGROUND_STATE') {
+				syncForegroundState(msg.active === true);
+			}
 			if (msg.type === 'VELOCE_STATE') {
 				coordinatorOnline = msg.connected === true;
+				syncInjectCoordinatorState();
 			}
 			if (msg.type === 'VELOCE_FORMATS_READY' && msg.url && msg.formats?.length) {
 				storeFormats(msg.url, msg.formats);
@@ -405,7 +940,7 @@
 				}
 			}
 			if (msg.type === 'VELOCE_FORMATS_FAILED' && msg.url) {
-				prefetchStarted.delete(normalizeBadgeKey(msg.url));
+				// Keep prefetchStarted set — background fail cache prevents re-queue for 5 min.
 			}
 		});
 	}
@@ -451,22 +986,57 @@
 
 	let badgeLayoutQueued = false;
 
+	/** Use the painted media box — not a full-viewport <video> letterbox wrapper. */
+	function layoutRectForEntry(entry) {
+		const anchor = entry.anchor;
+		if (!anchor?.isConnected) return null;
+		const tag = anchor.tagName?.toLowerCase();
+		if (tag === 'video' || tag === 'audio') {
+			return mediaVisibleRect(anchor);
+		}
+		if (tag === 'a') {
+			return clipRectToViewport(anchor.getBoundingClientRect());
+		}
+		return clipRectToViewport(entry.root?.getBoundingClientRect?.() ?? null);
+	}
+
+	function layoutBadge(el, rect) {
+		const pad = 6;
+		const w = el.offsetWidth || 72;
+		const h = el.offsetHeight || 28;
+		// Pin top-right inside the visible media rectangle — never outside it.
+		let top = rect.top + pad;
+		let left = rect.right - w - pad;
+		top = Math.max(rect.top + 2, Math.min(top, rect.bottom - h - 2));
+		left = Math.max(rect.left + 2, Math.min(left, rect.right - w - 2));
+		top = Math.max(4, Math.min(top, window.innerHeight - h - 4));
+		left = Math.max(4, Math.min(left, window.innerWidth - w - 4));
+		el.style.display = 'flex';
+		el.style.top = `${top}px`;
+		el.style.left = `${left}px`;
+		el.style.right = 'auto';
+		el.style.bottom = 'auto';
+	}
+
 	function scheduleBadgeLayout() {
 		if (badgeLayoutQueued || badges.size === 0) return;
 		badgeLayoutQueued = true;
 		requestAnimationFrame(() => {
 			badgeLayoutQueued = false;
+			cullBackgroundBadges();
 			for (const [, entry] of badges) {
-				const { el, root } = entry;
-				if (!root?.isConnected) continue;
-				const rect = root.getBoundingClientRect();
-				if (rect.width === 0 && rect.height === 0) {
+				const { el } = entry;
+				if (!entry.anchor?.isConnected) continue;
+				if (!isElementForeground(entry.anchor)) {
 					el.style.display = 'none';
 					continue;
 				}
-				el.style.display = 'flex';
-				el.style.top = `${Math.max(4, rect.top + 4)}px`;
-				el.style.left = `${Math.max(4, Math.min(rect.right - 72, window.innerWidth - 80))}px`;
+				const rect = layoutRectForEntry(entry);
+				if (!rect) {
+					el.style.display = 'none';
+					continue;
+				}
+				layoutBadge(el, rect);
 			}
 		});
 	}
@@ -478,7 +1048,18 @@
 		const badgeKey = normalizeBadgeKey(resolvedUrl);
 		const root = findBadgeRoot(anchor);
 
-		if (badgeKeys.has(badgeKey)) return;
+		const existing = badges.get(badgeKey);
+		if (existing) {
+			if (shouldReanchorBadge(existing, anchor)) {
+				existing.anchor = anchor;
+				existing.root = root;
+				scheduleBadgeLayout();
+			}
+			return;
+		}
+
+		// Don't create badges for feed tiles that aren't the foreground media.
+		if (!isElementForeground(anchor)) return;
 
 		const el = document.createElement('div');
 		el.className = 'badge badge-loading';
@@ -504,6 +1085,14 @@
 		}
 
 		scheduleBadgeLayout();
+
+		// Video dimensions often start at 0×0 until metadata loads — relayout then.
+		const tag = anchor?.tagName?.toLowerCase();
+		if (tag === 'video' || tag === 'audio') {
+			anchor.addEventListener('loadedmetadata', () => scheduleBadgeLayout(), { once: true });
+			anchor.addEventListener('loadeddata', () => scheduleBadgeLayout(), { once: true });
+			anchor.addEventListener('playing', () => scheduleBadgeLayout());
+		}
 	}
 
 	function positionMenu(menu, badgeEl) {
@@ -553,6 +1142,21 @@
 		};
 	}
 
+	function showVeloceToast(message, isError) {
+		interceptLog(isError ? 'ERROR toast' : 'OK toast', message);
+		const t = document.createElement('div');
+		t.textContent = message;
+		t.style.cssText = [
+			'position:fixed', 'bottom:24px', 'left:50%', 'transform:translateX(-50%)',
+			'z-index:2147483647', 'padding:12px 20px', 'border-radius:12px',
+			'font:600 14px system-ui,sans-serif', 'color:#fff', 'max-width:90vw',
+			isError ? 'background:#c0392b' : 'background:#0d6b4d',
+			'box-shadow:0 8px 32px rgba(0,0,0,.45)', 'pointer-events:none'
+		].join(';');
+		document.body.appendChild(t);
+		setTimeout(() => t.remove(), isError ? 6000 : 3500);
+	}
+
 	function renderFormatButtons(menu, closeBtn, formats, url) {
 		for (const fmt of formats) {
 			const btn = document.createElement('button');
@@ -563,16 +1167,34 @@
 				closeMenu();
 				const stem = fmt.label.split(' — ')[0] || 'download';
 				const fileName = `${stem}${fmt.ext || '.mp4'}`.replace(/[\\/:*?"<>|]/g, '_');
+				const pageUrl = location.href.split('#')[0];
+				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 				chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
 					const payload = {
-						url,
+						url: sourceUrl,
 						directUrl: fmt.url,
+						pageUrl,
+						referer: pageUrl,
 						fileName,
 						ext: fmt.ext,
 						baseDirectory: cfg.veloce_base_dir || undefined,
 						threads: 8
 					};
-					chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload });
+				chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
+					if (chrome.runtime.lastError) {
+						const err = chrome.runtime.lastError.message || 'extension error';
+						interceptLog('step 7: FAILED — sendMessage', { err });
+						showVeloceToast(`Veloce: ${err}`, true);
+						return;
+					}
+					if (!resp?.ok) {
+						interceptLog('step 7: FAILED — coordinator not reached', { resp });
+						showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
+						return;
+					}
+					interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
+					showVeloceToast(`Veloce: downloading ${fileName}`, false);
+				});
 				});
 			});
 			menu.insertBefore(btn, closeBtn);
@@ -584,7 +1206,8 @@
 		renderFormatButtons(menu, closeBtn, formats, url);
 	}
 
-	function openFormatMenu(resolvedUrl, anchor, badgeEl) {
+	function openFormatMenu(resolvedUrl, anchor, badgeEl, preloadedFormats) {
+		const pageUrl = location.href.split('#')[0];
 		const url = resolvedUrl || resolveDownloadUrl(anchor?.currentSrc || anchor?.src || anchor?.href, anchor);
 		closeMenu();
 		const menu = document.createElement('div');
@@ -605,11 +1228,17 @@
 		openMenu = menu;
 		positionMenu(menu, badgeEl);
 
-		if (!url) {
+		if (!url && !preloadedFormats?.length) {
 			const err = document.createElement('div');
 			err.className = 'menu-status';
 			err.textContent = 'No downloadable URL found for this item.';
 			menu.insertBefore(err, closeBtn);
+			return;
+		}
+
+		if (preloadedFormats?.length) {
+			interceptLog('step 6: showing preloaded format(s)', { count: preloadedFormats.length, labels: preloadedFormats.map((f) => f.label) });
+			showFormatsInMenu(menu, closeBtn, preloadedFormats, url || pageUrl);
 			return;
 		}
 
@@ -671,22 +1300,33 @@
 
 	/** Show badge when near viewport; prefetch only when close enough to likely click. */
 	function processMediaElement(el) {
-		if (!el || el.getAttribute(SCANNED_ATTR) || document.hidden) return null;
-		const rawUrl = el.tagName === 'A' ? el.href : (el.currentSrc || el.src);
-		if (!rawUrl) return null;
-		const url = resolveDownloadUrl(rawUrl, el);
+		if (!captureActive() || !el || el.getAttribute(SCANNED_ATTR)) return null;
+		if (!isMainYoutubePlayer(el)) return null;
+
+		const tag = el.tagName;
+		let rawUrl = tag === 'A' ? el.href : (el.currentSrc || el.src || '');
+		let url = rawUrl ? resolveDownloadUrl(rawUrl, el) : null;
+
+		// YouTube MSE/blob player often has no src until playback — use the watch URL.
+		if (!url && (tag === 'VIDEO' || tag === 'AUDIO')) {
+			url = canonicalYoutubeUrl() || (isDedicatedMediaPage() ? location.href.split('#')[0] : null);
+			rawUrl = rawUrl || url || '';
+		}
 		if (!url) return null;
+
+		const overlay = findMediaOverlay();
+		if (overlay && !overlay.contains(el)) return null;
 		el.setAttribute(SCANNED_ATTR, '1');
 		try { mediaIo.unobserve(el); } catch { /* ignore */ }
 		const startPrefetch = isNearViewport(el, PREFETCH_MARGIN_PX);
-		if (!badgeKeys.has(normalizeBadgeKey(url))) placeBadge(url, el, rawUrl, startPrefetch);
+		placeBadge(url, el, rawUrl || url, startPrefetch);
 		return url;
 	}
 
-	let watchBudget = 30;
+	let watchBudget = 80;
 
 	function watchElement(el) {
-		if (!el || el.getAttribute(WATCH_ATTR) || watchBudget <= 0) return;
+		if (!captureActive() || !el || el.getAttribute(WATCH_ATTR) || watchBudget <= 0) return;
 		const tag = el.tagName;
 		if (tag === 'A') {
 			if (!shouldWatchLink(el)) return;
@@ -700,7 +1340,7 @@
 	}
 
 	function scanSubtree(root) {
-		if (!root?.querySelectorAll) return;
+		if (!captureActive() || !root?.querySelectorAll) return;
 		if (root.nodeType === 1) watchElement(root);
 		root.querySelectorAll(
 			'a[href]:not([data-veloce-watch]), video:not([data-veloce-watch]), audio:not([data-veloce-watch])'
@@ -709,7 +1349,7 @@
 
 	const mediaIo = new IntersectionObserver(
 		(entries) => {
-			if (document.hidden) return;
+			if (!captureActive()) return;
 			for (const entry of entries) {
 				if (!entry.isIntersecting) continue;
 				processMediaElement(entry.target);
@@ -719,12 +1359,41 @@
 	);
 
 	function scan() {
+		if (!captureActive()) return;
 		pruneBadges();
-		watchBudget = 30;
+		watchBudget = 80;
+		// YouTube: scan the main player first (single primary video).
+		if (isYoutubeWatchPage()) {
+			const player = document.querySelector('#movie_player video, ytd-player video, #player video');
+			if (player) watchElement(player);
+		}
 		scanSubtree(document);
 	}
 
 	document.addEventListener('click', (e) => {
+		const modalBtn = parseDownloadModalButton(e.target);
+		if (modalBtn) {
+			refreshCoordinatorState();
+			interceptLog('step 1: download modal button clicked', {
+				section: modalBtn.sectionKind,
+				label: modalBtn.label,
+				movie: modalBtn.movie,
+				size: modalBtn.size,
+				coordinatorOnline,
+				hint: 'page hook should log createElement <a> next'
+			});
+			if (!coordinatorOnline) {
+				interceptLog('step 1b: coordinator OFFLINE — run: cd backend && pnpm dev, open Veloce popup, refresh this tab');
+			}
+			try {
+				chrome.runtime.sendMessage({
+					type: 'VELOCE_INTERCEPT_LOG',
+					step: 'modal button',
+					detail: { label: modalBtn.label, movie: modalBtn.movie, section: modalBtn.sectionKind }
+				});
+			} catch { /* ignore */ }
+		}
+
 		const a = e.target.closest?.('a[href]');
 		if (!a) return;
 		const href = a.href;
@@ -736,36 +1405,71 @@
 		// lets the browser start a native download, which chrome.downloads.onCreated
 		// would then turn into a duplicate of the one the format menu starts.
 		if (!coordinatorOnline) return;
+		interceptLog('step 1: <a> link click intercepted', { href, download: a.hasAttribute('download'), isTrusted: e.isTrusted });
 		e.preventDefault();
 		e.stopPropagation();
-		openFormatMenu(resolveDownloadUrl(href, a) || href, a, a);
+		const pageUrl = location.href.split('#')[0];
+		const preloaded = a.hasAttribute('download') ? formatsFromDownloadAnchor(a) : null;
+		const listUrl = resolveInterceptListUrl(pageUrl, resolveDownloadUrl(href, a) || href);
+		interceptLog('step 2: opening format menu from link click', { listUrl, preloaded: !!preloaded });
+		openFormatMenu(listUrl, a, a, preloaded || undefined);
 	}, true);
 
 	let scanTimer = null;
 	let pendingMutations = [];
 
 	function scheduleScan() {
+		if (!captureActive()) return;
 		clearTimeout(scanTimer);
 		scanTimer = setTimeout(() => {
+			if (!captureActive()) return;
 			scanTimer = null;
-			watchBudget = 30;
+			cullBackgroundBadges();
+			watchBudget = 80;
 			const batch = pendingMutations.splice(0);
+			const overlay = findMediaOverlay();
 			for (const m of batch) {
 				for (const node of m.addedNodes) {
 					if (node.nodeType !== 1) continue;
+					if (overlay && !overlay.contains(node) && node !== overlay) continue;
 					scanSubtree(node);
 					if (watchBudget <= 0) break;
 				}
 				if (watchBudget <= 0) break;
 			}
+			if (overlay) scanSubtree(overlay);
+			scheduleBadgeLayout();
 		}, 600);
 	}
 
-	scan();
+	// Re-scan when SPA navigates or a modal player opens/closes.
+	window.addEventListener('popstate', () => {
+		cullBackgroundBadges();
+		if (captureActive()) scan();
+	});
+	setInterval(() => {
+		if (!captureActive()) return;
+		cullBackgroundBadges();
+		scheduleBadgeLayout();
+	}, 800);
+
+	queryForegroundState();
+	setTimeout(queryForegroundState, 400);
+	setTimeout(queryForegroundState, 1500);
+	connectTabPort();
+	startTabPing();
 	const observer = new MutationObserver((mutations) => {
+		if (!captureActive()) return;
 		pendingMutations.push(...mutations);
 		scheduleScan();
 	});
 	observer.observe(document.documentElement, { childList: true, subtree: true });
 	setInterval(pruneBadges, 30000);
+	refreshCoordinatorState();
+	setInterval(() => {
+		if (!document.hidden) refreshCoordinatorState();
+	}, 12000);
+	if (/videodownloader\.site/i.test(location.hostname)) {
+		interceptLog('OmniSave site detected — page hook + modal intercept active');
+	}
 })();

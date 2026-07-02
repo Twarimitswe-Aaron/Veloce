@@ -13,6 +13,10 @@ export const downloads = sqliteTable('downloads', {
 		.notNull()
 		.references(() => devices.id),
 	url: text('url').notNull(),
+	/** Direct CDN/media URL when user picked a format (optional). */
+	directUrl: text('direct_url'),
+	/** Browser page referer required by signed CDN links. */
+	referer: text('referer'),
 	fileName: text('file_name').notNull(),
 	savePath: text('save_path').notNull(),
 	status: text('status', { enum: ['queued', 'downloading', 'paused', 'completed', 'error'] })

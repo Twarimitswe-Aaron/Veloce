@@ -38,6 +38,32 @@ function mimeToExt(mime: string): string {
 	return map[m] || '.bin';
 }
 
+function refererForDownload(pageUrl: string, mediaUrl: string, explicitReferer?: string): string | undefined {
+	if (explicitReferer) {
+		try {
+			const u = new URL(explicitReferer);
+			if (u.protocol === 'http:' || u.protocol === 'https:') return u.href;
+		} catch { /* ignore */ }
+	}
+	try {
+		if (!pageUrl || pageUrl === mediaUrl) return undefined;
+		const page = new URL(pageUrl);
+		if (page.protocol !== 'http:' && page.protocol !== 'https:') return undefined;
+		return page.href;
+	} catch {
+		return undefined;
+	}
+}
+
+function isSignedCdnUrl(url: string): boolean {
+	try {
+		const u = new URL(url);
+		return u.searchParams.has('sign') || u.searchParams.has('token') || u.searchParams.has('expires');
+	} catch {
+		return false;
+	}
+}
+
 type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
 
 interface JobSpec {
@@ -51,10 +77,13 @@ interface JobSpec {
 	allowRename: boolean;
 	/** When set, download this URL directly (skip yt-dlp extraction). */
 	directUrl?: string;
+	/** Browser referer for signed CDN URLs. */
+	referer?: string;
 }
 
 // ── Connected clients (broadcast target) ─────────────────────────────────────
 const clients = new Set<WebSocket>();
+
 function broadcast(obj: unknown) {
 	const msg = JSON.stringify(obj);
 	for (const c of clients) {
@@ -144,10 +173,7 @@ function pickDirectory(): string | null {
 	for (const cmd of candidates) {
 		try {
 			const out = execSync(cmd).toString().trim();
-			if (out) {
-				console.log(`✅ Directory picker returned: ${out}`);
-				return out;
-			}
+			if (out) return out;
 			return null; // empty + exit 0 => user cancelled
 		} catch (e: any) {
 			if (e?.status === 1) return null; // user cancelled
@@ -298,7 +324,9 @@ function specFromRow(row: typeof downloads.$inferSelect): JobSpec {
 		savePath: row.savePath,
 		category,
 		threads: 8,
-		allowRename: false
+		allowRename: false,
+		directUrl: row.directUrl ?? undefined,
+		referer: row.referer ?? undefined
 	};
 }
 
@@ -315,7 +343,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 		// MediaFire CDN tokens expire — always resolve a fresh download URL.
 		if (finalUrl.includes('mediafire.com')) {
-			console.log(`🔍 Refreshing Mediafire URL for ${finalUrl}...`);
 			const fresh = await extractMediaUrl(finalUrl);
 			if (!fresh) {
 				console.error(`❌ Mediafire link expired or unavailable: ${finalUrl}`);
@@ -323,9 +350,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				return;
 			}
 			finalUrl = fresh;
-			console.log('🎯 Mediafire URL refreshed');
 		} else if (!spec.directUrl && !isDirectFileUrl(spec.pageUrl) && spec.category === VIDEO_CATEGORY) {
-			console.log(`🔍 Extracting direct URL for ${spec.pageUrl}...`);
 			const directUrl = await extractMediaUrl(spec.pageUrl);
 			if (!directUrl) {
 				console.error(`❌ Could not extract a direct media URL for ${spec.pageUrl}. Aborting.`);
@@ -333,7 +358,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				return;
 			}
 			finalUrl = directUrl;
-			console.log('🎯 Extracted direct URL successfully');
 
 			// Improve a generic filename from the resolved URL — only for fresh downloads.
 			if (spec.allowRename && (fileName.startsWith('file') || fileName.startsWith('download_file'))) {
@@ -367,10 +391,15 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		}
 
 		await setStatus(id, 'downloading');
-		console.log(`🚀 Spawning Rust Core for ID: ${id}`);
-
-		const coreDir = path.resolve(process.cwd(), '../core_engine');
-		const binaryPath = path.join(coreDir, 'target', 'release', 'core_engine');
+		const referer = refererForDownload(spec.pageUrl, finalUrl, spec.referer);
+		if (!referer && isSignedCdnUrl(finalUrl)) {
+			await markError(
+				id,
+				'CDN blocked this link (missing page referer). Reload the Veloce extension, refresh the video page, and download again from the Veloce badge while the video is open.'
+			);
+			return;
+		}
+		const binaryPath = coreEngineBinaryPath();
 		const engineArgs = [
 			'--id', id,
 			'--url', finalUrl,
@@ -378,7 +407,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			'--threads', spec.threads.toString(),
 			'--max-rate', runtime.maxRateBytes.toString()
 		];
-		if (runtime.engineQuiet) engineArgs.push('--quiet');
+		if (runtime.engineQuiet && coreEngineHasQuietFlag()) engineArgs.push('--quiet');
+		if (referer) {
+			engineArgs.push('--referer', referer);
+			try {
+				engineArgs.push('--origin', new URL(referer).origin);
+			} catch { /* ignore */ }
+		}
 		const rustProcess = spawn(binaryPath, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
 		running.set(id, { proc: rustProcess, intent: 'normal' });
 
@@ -440,23 +475,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 							elapsedSecs: progress.elapsed_secs || 0,
 							threads: progress.threads || []
 						});
-					} else if (progress.type === 'info') {
-						const chunkMb = (progress.chunk_size_bytes / 1024 / 1024).toFixed(2);
-						const totalMb = (progress.total_size_bytes / 1024 / 1024).toFixed(2);
-						console.log(`\n[Veloce] Starting ${progress.threads} connections | piece: ${chunkMb} MB | total: ${totalMb} MB`);
 					} else if (progress.type === 'already_exists') {
-						console.log('\n[Veloce] File already fully downloaded — skipping!');
 						await settle('completed');
 					} else if (progress.type === 'fatal') {
 						console.error(`\n[Veloce] Engine fatal: ${progress.error}`);
 						await settle('error', progress.error || 'Engine fatal error');
-					} else if (progress.type === 'done') {
-						const totalMb = (progress.total / 1024 / 1024).toFixed(1);
-						console.log(`\n✅ [Veloce] Download complete! ${totalMb} MB in ${progress.elapsed_secs?.toFixed(1)}s @ avg ${progress.avg_speed_mbps?.toFixed(2)} MB/s`);
 					}
-				} catch {
-					console.log(`\n[Rust Core]: ${line}`);
-				}
+				} catch { /* non-JSON engine line */ }
 			}
 		});
 
@@ -468,7 +493,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		rustProcess.on('close', async (code) => {
 			const intent = running.get(id)?.intent ?? 'normal';
 			running.delete(id);
-			console.log(`\n[Rust Core] Exited with code ${code} (intent=${intent})`);
 			if (intent === 'cancelled') {
 				await finishCancelled();
 			} else if (intent === 'paused') {
@@ -490,6 +514,28 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 const EXTRACTOR_DOMAINS = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'];
 
+/** Cached after first check — avoids passing --quiet to an outdated engine binary. */
+let engineSupportsQuiet: boolean | null = null;
+
+function coreEngineBinaryPath(): string {
+	const coreDir = path.resolve(process.cwd(), '../core_engine');
+	return path.join(coreDir, 'target', 'release', 'core_engine');
+}
+
+function coreEngineHasQuietFlag(): boolean {
+	if (engineSupportsQuiet !== null) return engineSupportsQuiet;
+	try {
+		const help = execSync(`"${coreEngineBinaryPath()}" --help`, { encoding: 'utf8', timeout: 5000 });
+		engineSupportsQuiet = help.includes('--quiet');
+	} catch {
+		engineSupportsQuiet = false;
+	}
+	if (!engineSupportsQuiet && config.engineQuiet) {
+		console.warn('[Veloce] core_engine lacks --quiet — rebuild with: cd core_engine && cargo build --release');
+	}
+	return engineSupportsQuiet;
+}
+
 function categoryFor(sourceUrl: string, rawName: string): { category: string; rawName: string } {
 	let ext = path.extname(rawName).toLowerCase();
 	try {
@@ -510,6 +556,7 @@ interface QueueOpts {
 	threads: number;
 	directUrl?: string;
 	ext?: string;
+	referer?: string;
 }
 
 /**
@@ -584,7 +631,6 @@ async function saveBlobDownload(opts: {
 			etaSecs: 0
 		});
 		broadcast({ type: 'DOWNLOAD_COMPLETED', downloadId, status: 'completed' });
-		console.log(`✅ Blob saved: ${finalName} (${buf.length} bytes)`);
 		return { ok: true, downloadId };
 	} catch (e) {
 		console.error('SAVE_BLOB failed:', e);
@@ -636,7 +682,6 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 		);
 	}
 	if (duplicate) {
-		console.log(`♻️  Duplicate found! Attaching to existing download ID: ${duplicate.id}`);
 		broadcast({ type: 'DOWNLOAD_ACK', downloadId: duplicate.id, fileName: duplicate.fileName, status: duplicate.status });
 		return { ok: true, downloadId: duplicate.id };
 	}
@@ -644,16 +689,19 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	const savePath = await uniqueSavePath(desiredPath);
 	const finalName = path.basename(savePath);
 	const downloadId = crypto.randomUUID();
+	const storedReferer = opts.referer ||
+		refererForDownload(opts.rawUrl, opts.directUrl || opts.rawUrl);
 	await db.insert(downloads).values({
 		id: downloadId,
 		deviceId: opts.macAddress,
 		url: opts.rawUrl,
+		directUrl: opts.directUrl ?? null,
+		referer: storedReferer ?? null,
 		fileName: finalName,
 		savePath,
 		status: 'queued'
 	});
 	broadcast({ type: 'DOWNLOAD_ACK', downloadId, fileName: finalName, status: 'queued' });
-	console.log(`✅ Download queued with ID: ${downloadId}`);
 
 	scheduleDownload(() => runDownloadJob({
 		id: downloadId,
@@ -663,7 +711,8 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 		category,
 		threads: opts.threads,
 		allowRename: !opts.directUrl && !isDirectFileUrl(opts.rawUrl),
-		directUrl: opts.directUrl || (isDirectFileUrl(opts.rawUrl) ? opts.rawUrl : undefined)
+		directUrl: opts.directUrl || (isDirectFileUrl(opts.rawUrl) ? opts.rawUrl : undefined),
+		referer: storedReferer
 	}));
 	return { ok: true, downloadId };
 }
@@ -678,7 +727,6 @@ async function reconcileInterrupted() {
 		const stuck = await db.select().from(downloads)
 			.where(inArray(downloads.status, ['downloading', 'queued']));
 		if (stuck.length === 0) return;
-		console.log(`♻️  Reconciling ${stuck.length} interrupted download(s) after restart...`);
 		for (const row of stuck) {
 			await setStatus(row.id, 'queued');
 			scheduleDownload(() => runDownloadJob(specFromRow(row)));
@@ -690,7 +738,15 @@ async function reconcileInterrupted() {
 
 let reconciled = false;
 
+const WSS_SINGLETON_KEY = '__veloce_wss_attached';
+
 export function setupWebSocketServer(server: Server) {
+	// Vite HMR re-runs this module — never attach a second WebSocketServer to the same HTTP server.
+	if ((server as Server & { [WSS_SINGLETON_KEY]?: boolean })[WSS_SINGLETON_KEY]) {
+		return;
+	}
+	(server as Server & { [WSS_SINGLETON_KEY]?: boolean })[WSS_SINGLETON_KEY] = true;
+
 	const wss = new WebSocketServer({
 		server,
 		path: '/ws',
@@ -708,7 +764,6 @@ export function setupWebSocketServer(server: Server) {
 
 	wss.on('connection', async (ws) => {
 		clients.add(ws);
-		console.log(`Extension connected to Local Coordinator (${clients.size} client${clients.size === 1 ? '' : 's'})`);
 		const macAddress = getMacAddress();
 
 		try {
@@ -761,7 +816,6 @@ export function setupWebSocketServer(server: Server) {
 				}
 
 				if (data.type === 'SAVE_BLOB') {
-					console.log('📥 Received blob save request:', data.payload?.fileName);
 					const payload = data.payload ?? {};
 					let baseDir = payload.baseDirectory;
 					if (!baseDir || String(baseDir).trim() === '') {
@@ -782,8 +836,7 @@ export function setupWebSocketServer(server: Server) {
 				}
 
 				if (data.type === 'NEW_DOWNLOAD') {
-					console.log('📥 Received new download request:', data.payload);
-
+					console.log(`[Veloce] NEW_DOWNLOAD: ${data.payload?.fileName || 'file'} | ${data.payload?.directUrl || data.payload?.url || ''}`);
 					// Validate the URL up front (scheme + SSRF guard).
 					const safety = isSafeDownloadUrl(data.payload.url ?? '');
 					if (!safety.ok) {
@@ -799,7 +852,11 @@ export function setupWebSocketServer(server: Server) {
 					}
 
 					// Normalize URL (strip tracking params).
+					let referer = data.payload.referer || data.payload.pageUrl;
 					let rawUrl = data.payload.url;
+					if (data.payload.directUrl && referer && rawUrl === data.payload.directUrl) {
+						rawUrl = referer;
+					}
 					try {
 						const urlObj = new URL(rawUrl);
 						for (const p of ['utm_source', 'utm_medium', 'utm_campaign', 'igsh', 'fbclid', 'gclid', 'si']) {
@@ -829,7 +886,6 @@ export function setupWebSocketServer(server: Server) {
 							ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: 'No playlist entries found (or not a playlist).' }));
 							return;
 						}
-						console.log(`📃 Expanding playlist into ${entries.length} download(s)`);
 						let queued = 0;
 						for (const entry of entries) {
 							if (!isSafeDownloadUrl(entry.url).ok) continue;
@@ -853,7 +909,8 @@ export function setupWebSocketServer(server: Server) {
 						baseDir,
 						threads,
 						directUrl: data.payload.directUrl,
-						ext: data.payload.ext
+						ext: data.payload.ext,
+						referer: data.payload.referer || data.payload.pageUrl
 					});
 					if (!result.ok) {
 						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: result.error }));
@@ -922,7 +979,6 @@ export function setupWebSocketServer(server: Server) {
 						broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: data.downloadId });
 					}
 				} else if (data.type === 'REQUEST_DIRECTORY_PICKER') {
-					console.log('🔄 Directory picker requested by frontend');
 					const result = pickDirectory();
 					if (result) {
 						runtime.baseDirectory = result;
@@ -960,7 +1016,6 @@ export function setupWebSocketServer(server: Server) {
 
 		ws.on('close', () => {
 			clients.delete(ws);
-			console.log(`Extension disconnected (${clients.size} client${clients.size === 1 ? '' : 's'} remaining)`);
 		});
 	});
 }

@@ -11,6 +11,8 @@ let reconnectTimer = null;
 let reconnectDelay = RECONNECT_BASE_MS;
 let wsPingTimer = null;
 const livePorts = new Set();
+/** Tab id of the active tab in the last-focused window — only it gets badges/prefetch. */
+let foregroundTabId = null;
 const downloads = {};
 let selectedDirectory = null;
 let settings = null;
@@ -18,19 +20,77 @@ const pendingFormatRequests = new Map(); // requestId -> { sendResponse, url? }
 const NOTIF_ICON = 'icons/icon-128.png';
 
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
+const FORMAT_FAIL_TTL_MS = 5 * 60 * 1000;
 const formatCache = new Map(); // url -> { formats, ts }
+const formatFailCache = new Map(); // url -> { ts }
 const inflightFormatUrls = new Set();
 const prefetchQueue = [];
 const prefetchQueued = new Set();
 let prefetchRunning = 0;
 const PREFETCH_LIMIT = 1;
 const PREFETCH_QUEUE_MAX = 8;
-const WS_PING_MS = 50000;
+const WS_PING_MS = 25000;
+
+/** True when the offscreen document (or legacy SW socket) is linked to the coordinator. */
+let useOffscreenWs = false;
+let coordinatorConnectInFlight = null;
+
+function retireLegacySocket() {
+	if (!ws) return;
+	try {
+		ws.onclose = null;
+		ws.onerror = null;
+		ws.close();
+	} catch { /* ignore */ }
+	ws = null;
+	stopWsPing();
+}
+
+/** MV3 service workers sleep — offscreen document keeps the WebSocket alive. */
+async function ensureOffscreenDocument() {
+	if (!chrome.offscreen?.createDocument) return false;
+	try {
+		if (await chrome.offscreen.hasDocument()) {
+			useOffscreenWs = true;
+			retireLegacySocket();
+			return true;
+		}
+		await chrome.offscreen.createDocument({
+			url: 'offscreen.html',
+			reasons: ['WORKERS'],
+			justification: 'Keep a stable WebSocket to the local Veloce download coordinator while the browser is open.'
+		});
+		useOffscreenWs = true;
+		retireLegacySocket();
+		return true;
+	} catch (e) {
+		// Document may already exist if another service-worker instance raced us.
+		try {
+			if (await chrome.offscreen.hasDocument()) {
+				useOffscreenWs = true;
+				retireLegacySocket();
+				return true;
+			}
+		} catch { /* ignore */ }
+		console.warn('[Veloce] Offscreen unavailable, falling back to service-worker socket', e);
+		useOffscreenWs = false;
+		return false;
+	}
+}
 
 function getFormatCache(url) {
 	const hit = formatCache.get(url);
 	if (hit && Date.now() - hit.ts < FORMAT_CACHE_TTL_MS) return hit.formats;
 	return null;
+}
+
+function isFormatFailed(url) {
+	const hit = formatFailCache.get(url);
+	return hit && Date.now() - hit.ts < FORMAT_FAIL_TTL_MS;
+}
+
+function setFormatFail(url) {
+	if (url) formatFailCache.set(url, { ts: Date.now() });
 }
 
 function setFormatCache(url, formats) {
@@ -41,11 +101,39 @@ function setFormatCache(url, formats) {
 }
 
 function notifyFormatFailed(url) {
+	setFormatFail(url);
 	broadcastToExtension({ type: 'VELOCE_FORMATS_FAILED', url });
+}
+
+function isForegroundTab(tabId) {
+	return tabId != null && tabId === foregroundTabId;
+}
+
+async function refreshForegroundTab() {
+	try {
+		const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+		foregroundTabId = tab?.id ?? null;
+	} catch {
+		foregroundTabId = null;
+	}
+	broadcastForegroundState();
+}
+
+function broadcastForegroundState() {
+	chrome.tabs.query({}, (tabs) => {
+		for (const t of tabs) {
+			if (t.id == null) continue;
+			chrome.tabs.sendMessage(t.id, {
+				type: 'VELOCE_FOREGROUND_STATE',
+				active: t.id === foregroundTabId
+			}).catch(() => {});
+		}
+	});
 }
 
 function drainPrefetchQueue() {
 	if (!hasLiveClients()) return;
+	if (foregroundTabId == null) return;
 	connectWs();
 	while (prefetchRunning < PREFETCH_LIMIT && prefetchQueue.length > 0) {
 		const url = prefetchQueue.shift();
@@ -62,7 +150,7 @@ function drainPrefetchQueue() {
 }
 
 function enqueuePrefetch(url, front = false) {
-	if (!url || getFormatCache(url) || inflightFormatUrls.has(url) || prefetchQueued.has(url)) return;
+	if (!url || getFormatCache(url) || isFormatFailed(url) || inflightFormatUrls.has(url) || prefetchQueued.has(url)) return;
 	if (!front && prefetchQueue.length >= PREFETCH_QUEUE_MAX) return;
 	prefetchQueued.add(url);
 	if (front) prefetchQueue.unshift(url);
@@ -209,6 +297,8 @@ function handleWsMessage(data) {
 				if (pending.url) inflightFormatUrls.delete(pending.url);
 				if (data.type === 'FORMATS_LIST' && pending.url && data.formats?.length) {
 					setFormatCache(pending.url, data.formats);
+				} else if (pending.url && (data.type === 'FORMATS_ERROR' || !data.formats?.length)) {
+					setFormatFail(pending.url);
 				}
 				pending.sendResponse(data);
 			}
@@ -221,6 +311,36 @@ function hasLiveClients() {
 	return livePorts.size > 0;
 }
 
+function handleOffscreenWsRelay(msg) {
+	if (msg.type === 'VELOCE_WS_OPEN') {
+		reconnectDelay = RECONNECT_BASE_MS;
+		setConnected(true);
+	} else if (msg.type === 'VELOCE_WS_CLOSE') {
+		setConnected(false);
+	} else if (msg.type === 'VELOCE_WS_MSG' && msg.data) {
+		try {
+			handleWsMessage(JSON.parse(msg.data));
+		} catch (e) {
+			console.error('[Veloce] Bad WS message', e);
+		}
+	}
+}
+
+function isCoordinatorLinked() {
+	if (useOffscreenWs) return connected;
+	return ws?.readyState === WebSocket.OPEN;
+}
+
+async function isCoordinatorLinkedAsync() {
+	if (!useOffscreenWs) return ws?.readyState === WebSocket.OPEN;
+	try {
+		const r = await chrome.runtime.sendMessage({ type: 'VELOCE_WS_STATUS' });
+		return r?.ready === true;
+	} catch {
+		return false;
+	}
+}
+
 function stopWsPing() {
 	if (wsPingTimer) {
 		clearInterval(wsPingTimer);
@@ -229,6 +349,7 @@ function stopWsPing() {
 }
 
 function startWsPing() {
+	if (useOffscreenWs) return;
 	stopWsPing();
 	wsPingTimer = setInterval(() => {
 		if (ws?.readyState === WebSocket.OPEN) {
@@ -238,17 +359,19 @@ function startWsPing() {
 }
 
 function scheduleWsReconnect() {
+	if (useOffscreenWs) return;
 	clearTimeout(reconnectTimer);
 	const delay = hasLiveClients() ? 400 : reconnectDelay;
 	reconnectTimer = setTimeout(() => {
-		connectWs();
+		connectWsLegacy();
 		if (!hasLiveClients()) {
 			reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), RECONNECT_MAX_MS);
 		}
 	}, delay);
 }
 
-function connectWs() {
+function connectWsLegacy() {
+	if (useOffscreenWs) return;
 	if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
 	if (ws?.readyState === WebSocket.CLOSING) return;
 
@@ -278,24 +401,66 @@ function connectWs() {
 	ws.onerror = () => ws?.close();
 }
 
-function ensureConnected(maxWaitMs = 3000) {
-	return new Promise((resolve) => {
-		if (ws?.readyState === WebSocket.OPEN) {
-			resolve(true);
+async function connectCoordinator() {
+	if (coordinatorConnectInFlight) return coordinatorConnectInFlight;
+	coordinatorConnectInFlight = (async () => {
+		const offscreen = await ensureOffscreenDocument();
+		if (offscreen) {
+			try {
+				const status = await chrome.runtime.sendMessage({ type: 'VELOCE_WS_STATUS' });
+				if (!status?.ready) {
+					await chrome.runtime.sendMessage({ type: 'VELOCE_WS_ENSURE' });
+				}
+			} catch { /* offscreen still starting */ }
 			return;
 		}
-		connectWs();
-		const start = Date.now();
-		const poll = () => {
-			if (ws?.readyState === WebSocket.OPEN) resolve(true);
-			else if (Date.now() - start >= maxWaitMs) resolve(false);
-			else setTimeout(poll, 80);
-		};
-		poll();
+		connectWsLegacy();
+	})().finally(() => {
+		coordinatorConnectInFlight = null;
+	});
+	return coordinatorConnectInFlight;
+}
+
+function connectWs() {
+	void connectCoordinator();
+}
+
+function ensureConnected(maxWaitMs = 3000) {
+	return new Promise((resolve) => {
+		void connectCoordinator().then(async () => {
+			if (await isCoordinatorLinkedAsync()) {
+				resolve(true);
+				return;
+			}
+			const start = Date.now();
+			const poll = async () => {
+				if (await isCoordinatorLinkedAsync()) resolve(true);
+				else if (Date.now() - start >= maxWaitMs) resolve(false);
+				else setTimeout(poll, 80);
+			};
+			poll();
+		});
 	});
 }
 
-function wsSend(obj) {
+async function wsSendAsync(obj) {
+	if (useOffscreenWs) {
+		try {
+			const r = await chrome.runtime.sendMessage({ type: 'VELOCE_WS_SEND', payload: obj });
+			if (!r?.ok) {
+				interceptLog('wsSend failed — socket not ready', { type: obj.type, ready: r?.ready });
+				if (!r?.ready) setConnected(false);
+				void connectCoordinator();
+				return false;
+			}
+			return true;
+		} catch (e) {
+			interceptLog('wsSend error', { type: obj.type, error: e?.message || String(e) });
+			setConnected(false);
+			void connectCoordinator();
+			return false;
+		}
+	}
 	if (ws && ws.readyState === WebSocket.OPEN) {
 		ws.send(JSON.stringify(obj));
 		return true;
@@ -303,12 +468,89 @@ function wsSend(obj) {
 	return false;
 }
 
-async function startDownload(payload) {
-	const ok = await ensureConnected();
-	if (!ok || !wsSend({ type: 'NEW_DOWNLOAD', payload })) {
-		console.error('[Veloce] Cannot download — coordinator offline');
+/** @deprecated use wsSendAsync */
+function wsSend(obj) {
+	if (useOffscreenWs) {
+		if (!connected) return false;
+		try {
+			chrome.runtime.sendMessage({ type: 'VELOCE_WS_SEND', payload: obj });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+	if (ws && ws.readyState === WebSocket.OPEN) {
+		ws.send(JSON.stringify(obj));
+		return true;
+	}
+	return false;
+}
+
+/** Attach tab page URL as referer — required for signed CDN links (403 without it). */
+async function enrichDownloadPayload(payload, tabId) {
+	const out = { ...payload };
+	let pageUrl = out.pageUrl || out.referer;
+
+	if (!pageUrl && tabId != null && tabId >= 0) {
+		try {
+			const tab = await chrome.tabs.get(tabId);
+			if (tab?.url && /^https?:/i.test(tab.url)) {
+				pageUrl = tab.url.split('#')[0];
+			}
+		} catch { /* ignore */ }
+	}
+	if (!pageUrl) {
+		try {
+			const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+			if (tab?.url && /^https?:/i.test(tab.url)) {
+				pageUrl = tab.url.split('#')[0];
+			}
+		} catch { /* ignore */ }
+	}
+
+	if (pageUrl) {
+		out.pageUrl = pageUrl;
+		out.referer = out.referer || pageUrl;
+	}
+
+	const mediaUrl = out.directUrl || out.url;
+	if (mediaUrl && out.url === mediaUrl && out.pageUrl) {
+		out.url = out.pageUrl;
+	}
+	if (out.directUrl == null && mediaUrl && out.url !== mediaUrl) {
+		out.directUrl = mediaUrl;
+	}
+
+	return out;
+}
+
+async function startDownload(payload, tabId) {
+	interceptLog('step 6: queue download requested', {
+		fileName: payload?.fileName,
+		url: payload?.url,
+		directUrl: payload?.directUrl
+	});
+	const enriched = await enrichDownloadPayload(payload, tabId);
+	let linked = await ensureConnected(6000);
+	if (!linked) {
+		interceptLog('step 6b: FAILED — coordinator offline (run: cd backend && pnpm dev)');
+		console.error('[Veloce] Cannot download — coordinator offline. Start backend: cd backend && pnpm dev');
+		notify('veloce-offline', 'Veloce offline', 'Start the backend: cd backend && pnpm dev');
 		return false;
 	}
+	let sent = await wsSendAsync({ type: 'NEW_DOWNLOAD', payload: enriched });
+	if (!sent) {
+		interceptLog('step 6c: retrying WS connection…');
+		linked = await ensureConnected(4000);
+		sent = linked && await wsSendAsync({ type: 'NEW_DOWNLOAD', payload: enriched });
+	}
+	if (!sent) {
+		interceptLog('step 6b: FAILED — could not reach coordinator WebSocket');
+		console.error('[Veloce] WS send failed — reload extension and ensure pnpm dev is running on port 14921');
+		notify('veloce-ws-fail', 'Veloce connection failed', 'Reload the extension and check backend on port 14921');
+		return false;
+	}
+	interceptLog('step 7: sent to coordinator OK', { url: enriched.url, directUrl: enriched.directUrl, fileName: enriched.fileName });
 	return true;
 }
 
@@ -322,7 +564,8 @@ async function requestFormatsFromCoordinator(url, sendResponse) {
 	const requestId = crypto.randomUUID();
 	inflightFormatUrls.add(url);
 	pendingFormatRequests.set(requestId, { sendResponse, url });
-	if (!wsSend({ type: 'LIST_FORMATS', requestId, payload: { url } })) {
+	const sent = await wsSendAsync({ type: 'LIST_FORMATS', requestId, payload: { url } });
+	if (!sent) {
 		inflightFormatUrls.delete(url);
 		pendingFormatRequests.delete(requestId);
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
@@ -360,10 +603,104 @@ async function listFormats(url, sendResponse, sender) {
 }
 
 function scheduleKeepaliveAlarm() {
-	chrome.alarms.create('veloce-keepalive', { periodInMinutes: 3 });
+	chrome.alarms.create('veloce-keepalive', { periodInMinutes: 1 });
+}
+
+function interceptLog(step, detail) {
+	const ts = new Date().toISOString();
+	if (detail !== undefined) {
+		console.log(`[Veloce intercept] ${ts} ${step}`, detail);
+	} else {
+		console.log(`[Veloce intercept] ${ts} ${step}`);
+	}
 }
 
 const BROWSER_ONLY_URL = /^(blob:|data:|mediastream:)/i;
+
+const INTERCEPT_MEDIA_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|iso)(\?|#|$)/i;
+
+/** True when the browser started a download of an actual file, not a redirect/API hop. */
+function isInterceptableMediaUrl(url) {
+	try {
+		const u = new URL(url);
+		if (!/^https?:$/i.test(u.protocol)) return false;
+		return INTERCEPT_MEDIA_EXT.test(u.pathname);
+	} catch {
+		return false;
+	}
+}
+
+/** App-store redirects, API endpoints, etc. — not the video the user wanted. */
+function isInterceptTrapUrl(url) {
+	try {
+		const u = new URL(url);
+		const path = u.pathname.toLowerCase();
+		if (/\/redirect|\/pkg\/|\/api\/|\/graphql|\/download\?/i.test(path)) return true;
+		if (/redirect|download/i.test(u.searchParams.get('a') || '')) return true;
+		if (isInterceptableMediaUrl(url)) return false;
+		return !INTERCEPT_MEDIA_EXT.test(u.pathname);
+	} catch {
+		return false;
+	}
+}
+
+/** Pick the URL we ask the coordinator to list formats for. */
+function resolveInterceptListUrl(pageUrl, interceptUrl) {
+	if (interceptUrl && isInterceptableMediaUrl(interceptUrl) && !isInterceptTrapUrl(interceptUrl)) {
+		return interceptUrl;
+	}
+	if (pageUrl && /^https?:/i.test(pageUrl)) return pageUrl;
+	return interceptUrl || pageUrl || '';
+}
+
+async function resolveInterceptTabId(tabId) {
+	if (tabId != null && tabId >= 0) return tabId;
+	try {
+		const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+		if (tab?.id != null && tab.id >= 0) return tab.id;
+	} catch { /* ignore */ }
+	return tabId;
+}
+
+function formatsFromInterceptUrl(url, fileName) {
+	if (!url || !/^https?:/i.test(url)) return null;
+	let name = fileName || 'download';
+	const dot = name.lastIndexOf('.');
+	const ext = dot > 0 ? name.slice(dot) : '.mp4';
+	const label = dot > 0 ? name.slice(0, dot).replace(/_/g, ' ') : name;
+	return [{ id: 'intercept', label, url, ext }];
+}
+
+async function openInterceptFormatMenu(tabId, payload) {
+	const resolvedTabId = await resolveInterceptTabId(tabId);
+	if (resolvedTabId == null || resolvedTabId < 0) {
+		interceptLog('step C2: FAILED — no tab id for format menu', payload);
+		return false;
+	}
+	try {
+		const preloadedFormats = payload.preloadedFormats ||
+			formatsFromInterceptUrl(payload.interceptUrl || payload.url, payload.fileName);
+		await chrome.tabs.sendMessage(resolvedTabId, {
+			type: 'VELOCE_INTERCEPT_OPEN_MENU',
+			...payload,
+			preloadedFormats: preloadedFormats || undefined
+		});
+		interceptLog('step C1: format menu opened in tab', { tabId: resolvedTabId, listUrl: payload.listUrl });
+		return true;
+	} catch (e) {
+		interceptLog('step C2: format menu message failed — refresh the page', {
+			tabId: resolvedTabId,
+			error: e?.message || String(e),
+			listUrl: payload.listUrl
+		});
+		notify(
+			`veloce-intercept-err-${Date.now()}`,
+			'Veloce intercept',
+			'Could not open format picker on this tab. Refresh the page and try again.'
+		);
+		return false;
+	}
+}
 
 function extFromMime(mime) {
 	const m = (mime || '').toLowerCase().split(';')[0].trim();
@@ -395,7 +732,8 @@ function parseDataUrl(url) {
 
 /** Fetch blob bytes from the page context (MAIN world can read page blob URLs). */
 async function materializeBlobUrl(tabId, blobUrl) {
-	if (tabId == null || tabId < 0) return null;
+	const resolvedTabId = await resolveInterceptTabId(tabId);
+	if (resolvedTabId == null || resolvedTabId < 0) return null;
 
 	const fetchInPage = async (u) => {
 		const res = await fetch(u);
@@ -417,7 +755,7 @@ async function materializeBlobUrl(tabId, blobUrl) {
 
 	try {
 		const results = await chrome.scripting.executeScript({
-			target: { tabId },
+			target: { tabId: resolvedTabId },
 			world: 'MAIN',
 			func: fetchInPage,
 			args: [blobUrl]
@@ -428,7 +766,7 @@ async function materializeBlobUrl(tabId, blobUrl) {
 	}
 
 	return new Promise((resolve) => {
-		chrome.tabs.sendMessage(tabId, { type: 'VELOCE_FETCH_BLOB', url: blobUrl }, (resp) => {
+		chrome.tabs.sendMessage(resolvedTabId, { type: 'VELOCE_FETCH_BLOB', url: blobUrl }, (resp) => {
 			if (chrome.runtime.lastError || !resp?.ok) resolve(null);
 			else resolve(resp);
 		});
@@ -445,7 +783,7 @@ async function startBlobDownload({ base64, mime, fileName, baseDirectory, source
 	if (!/\.\w{2,5}$/.test(name) && mime) {
 		name = name.replace(/\.\w+$/, '') + extFromMime(mime);
 	}
-	return wsSend({
+	return wsSendAsync({
 		type: 'SAVE_BLOB',
 		payload: {
 			base64,
@@ -460,16 +798,54 @@ async function startBlobDownload({ base64, mime, fileName, baseDirectory, source
 
 // ── Intercept native browser downloads when coordinator is online ─────────────
 chrome.downloads.onCreated.addListener(async (item) => {
-	if (!connected) return;
-	const { veloce_intercept } = await chrome.storage.local.get('veloce_intercept');
-	if (veloce_intercept === false) return;
-
 	const url = item.url || item.finalUrl;
-	if (!url) return;
+	interceptLog('step A: chrome.downloads.onCreated', {
+		url,
+		id: item.id,
+		tabId: item.tabId,
+		fileName: item.filename,
+		referrer: item.referrer
+	});
+
+	if (!connected) {
+		interceptLog('step A1: waiting for coordinator connection…');
+		await ensureConnected(2000);
+	}
+	if (!connected) {
+		interceptLog('step A2: SKIP — coordinator offline (start backend: pnpm dev)');
+		return;
+	}
+
+	const { veloce_intercept } = await chrome.storage.local.get('veloce_intercept');
+	if (veloce_intercept === false) {
+		interceptLog('step A2: SKIP — intercept disabled in popup');
+		return;
+	}
+
+	if (!url) {
+		interceptLog('step A2: SKIP — empty url');
+		return;
+	}
 
 	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
 	const baseDirectory = veloce_base_dir || selectedDirectory || undefined;
-	const pageUrl = item.referrer || undefined;
+	let pageUrl = item.referrer || undefined;
+	if (!pageUrl && item.tabId >= 0) {
+		try {
+			const tab = await chrome.tabs.get(item.tabId);
+			if (tab?.url && /^https?:/i.test(tab.url)) {
+				pageUrl = tab.url.split('#')[0];
+			}
+		} catch { /* ignore */ }
+	}
+	if (!pageUrl) {
+		try {
+			const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+			if (tab?.url && /^https?:/i.test(tab.url)) {
+				pageUrl = tab.url.split('#')[0];
+			}
+		} catch { /* ignore */ }
+	}
 
 	let fileName = item.filename || '';
 	if (!fileName) {
@@ -481,8 +857,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
 		}
 	}
 
-	// blob:/data: URLs only exist in the browser — materialize bytes before cancelling.
 	if (BROWSER_ONLY_URL.test(url)) {
+		interceptLog('blob/data url — materializing in browser', { url: url.slice(0, 80) });
 		let materialized = null;
 		if (url.startsWith('data:')) {
 			materialized = parseDataUrl(url);
@@ -490,13 +866,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
 			materialized = await materializeBlobUrl(item.tabId, url);
 		}
 		if (!materialized?.base64) {
-			console.warn('[Veloce] Could not read blob/data URL — leaving native download alone');
-			return; // do not cancel; browser keeps the download
+			interceptLog('blob read failed — leaving native download alone');
+			return;
 		}
 		try {
 			await chrome.downloads.cancel(item.id);
+			interceptLog('cancelled native download', { id: item.id });
 		} catch (e) {
-			console.warn('[Veloce] Could not cancel native download', e);
+			interceptLog('cancel failed', e?.message);
 		}
 		await startBlobDownload({
 			base64: materialized.base64,
@@ -506,21 +883,42 @@ chrome.downloads.onCreated.addListener(async (item) => {
 			sourceUrl: url,
 			pageUrl
 		});
+		interceptLog('blob queued to coordinator', { fileName, bytes: materialized.size });
 		return;
 	}
 
 	try {
 		await chrome.downloads.cancel(item.id);
+		interceptLog('step B: cancelled native browser download', { id: item.id });
 	} catch (e) {
-		console.warn('[Veloce] Could not cancel native download', e);
+		interceptLog('step B: cancel failed', e?.message);
 	}
 
-	startDownload({
-		url,
+	const listUrl = resolveInterceptListUrl(pageUrl, url);
+	interceptLog('step C: routing to format menu in tab', {
+		listUrl,
+		interceptUrl: url,
+		pageUrl,
 		fileName,
-		baseDirectory,
-		threads: 8
+		tabId: item.tabId,
+		directFile: isInterceptableMediaUrl(url),
+		trapUrl: isInterceptTrapUrl(url)
 	});
+
+	const opened = await openInterceptFormatMenu(item.tabId, {
+		pageUrl: pageUrl || url,
+		interceptUrl: url,
+		listUrl,
+		fileName
+	});
+	interceptLog(opened ? 'step D: format menu message sent' : 'step D: FAILED to open format menu', { tabId: item.tabId });
+});
+
+// Relay from the persistent offscreen WebSocket holder.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+	if (!msg?.type?.startsWith('VELOCE_WS_')) return;
+	if (!sender?.url?.includes('offscreen.html')) return;
+	handleOffscreenWsRelay(msg);
 });
 
 // ── Messages from popup & content scripts ─────────────────────────────────────
@@ -536,9 +934,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		case 'VELOCE_GET_STATE':
 			(async () => {
 				await ensureConnected(3000);
-				sendResponse({ connected, downloads, selectedDirectory, settings });
+				const really = await isCoordinatorLinkedAsync();
+				if (connected && !really) setConnected(false);
+				else if (!connected && really) setConnected(true);
+				sendResponse({ connected: really, downloads, selectedDirectory, settings });
 			})();
 			return true;
+
+		case 'VELOCE_INTERCEPT_LOG':
+			interceptLog(`content: ${msg.step || 'event'}`, msg.detail);
+			sendResponse({ ok: true });
+			return false;
 
 		case 'VELOCE_SET_SETTINGS':
 			(async () => {
@@ -556,7 +962,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 		case 'VELOCE_NEW_DOWNLOAD':
 			(async () => {
-				sendResponse({ ok: await startDownload(msg.payload) });
+				sendResponse({ ok: await startDownload(msg.payload, _sender.tab?.id) });
 			})();
 			return true;
 
@@ -565,11 +971,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 			return true;
 
 		case 'VELOCE_PREFETCH_FORMATS':
+			if (!isForegroundTab(_sender.tab?.id)) return false;
 			prefetchFormats(msg.url);
 			return false;
 
 		case 'VELOCE_PREFETCH_BATCH':
+			if (!isForegroundTab(_sender.tab?.id)) return false;
 			prefetchBatch(msg.urls);
+			return false;
+
+		case 'VELOCE_AM_I_FOREGROUND':
+			sendResponse({ active: isForegroundTab(_sender.tab?.id) });
 			return false;
 
 		case 'VELOCE_WARMUP':
@@ -616,7 +1028,7 @@ function setupContextMenus() {
 	});
 }
 
-async function downloadFromContext(url) {
+async function downloadFromContext(url, tabId) {
 	if (!url) return;
 	let fileName = 'download';
 	try {
@@ -624,15 +1036,21 @@ async function downloadFromContext(url) {
 		fileName = parts.pop() || 'download';
 	} catch { /* keep default */ }
 	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
-	startDownload({ url, fileName, baseDirectory: veloce_base_dir || selectedDirectory || undefined, threads: 8 });
+	await startDownload({
+		url,
+		directUrl: url,
+		fileName,
+		baseDirectory: veloce_base_dir || selectedDirectory || undefined,
+		threads: 8
+	}, tabId);
 }
 
 if (chrome.contextMenus) {
 	chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 		if (info.menuItemId === 'veloce-download-link') {
-			await downloadFromContext(info.linkUrl);
+			await downloadFromContext(info.linkUrl, tab?.id);
 		} else if (info.menuItemId === 'veloce-download-media') {
-			await downloadFromContext(info.srcUrl || info.linkUrl);
+			await downloadFromContext(info.srcUrl || info.linkUrl, tab?.id);
 		} else if (info.menuItemId === 'veloce-download-page-links' && tab?.id != null) {
 			try {
 				const results = await chrome.scripting.executeScript({
@@ -645,7 +1063,7 @@ if (chrome.contextMenus) {
 					}
 				});
 				const urls = [...new Set((results?.[0]?.result) || [])];
-				for (const u of urls) await downloadFromContext(u);
+				for (const u of urls) await downloadFromContext(u, tab?.id);
 				notify(`veloce-pagelinks-${Date.now()}`, 'Veloce', `Queued ${urls.length} link(s) from the page.`);
 			} catch (e) {
 				console.warn('[Veloce] page-links scan failed', e);
@@ -658,19 +1076,26 @@ chrome.runtime.onInstalled.addListener(() => {
 	chrome.storage.local.set({ veloce_intercept: true });
 	scheduleKeepaliveAlarm();
 	setupContextMenus();
-	connectWs();
+	void connectCoordinator();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+	void connectCoordinator();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-	if (alarm.name === 'veloce-keepalive' && hasLiveClients()) connectWs();
+	if (alarm.name === 'veloce-keepalive' && !connected) void connectCoordinator();
 });
 
 chrome.runtime.onConnect.addListener((port) => {
 	if (!['veloce-popup', 'veloce-busy', 'veloce-tab'].includes(port.name)) return;
 
 	livePorts.add(port);
-	connectWs();
-	drainPrefetchQueue();
+	if (!connected) connectWs();
+	// Prefetch only when the connecting tab is the foreground tab.
+	if (port.name === 'veloce-tab' && isForegroundTab(port.sender?.tab?.id)) {
+		drainPrefetchQueue();
+	}
 
 	port.onMessage.addListener((msg) => {
 		if (msg?.type === 'ping') {
@@ -678,16 +1103,30 @@ chrome.runtime.onConnect.addListener((port) => {
 		}
 	});
 
+	// Tell this tab whether it is the foreground capture target.
+	if (port.name === 'veloce-tab' && port.sender?.tab?.id != null) {
+		try {
+			port.postMessage({
+				type: 'VELOCE_FOREGROUND_STATE',
+				active: isForegroundTab(port.sender.tab.id)
+			});
+		} catch { /* ignore */ }
+	}
+
 	port.onDisconnect.addListener(() => {
 		livePorts.delete(port);
-		if (hasLiveClients()) connectWs();
 	});
 });
 
 chrome.tabs.onRemoved.addListener(() => {
-	// Ports disconnect asynchronously; ensure WS stays up for remaining tabs.
-	if (hasLiveClients()) connectWs();
+	// tab closed — foreground refresh handles prefetch gating
 });
 
+chrome.tabs.onActivated.addListener(() => { void refreshForegroundTab(); });
+chrome.windows.onFocusChanged.addListener((windowId) => {
+	if (windowId !== chrome.windows.WINDOW_ID_NONE) void refreshForegroundTab();
+});
+void refreshForegroundTab();
+
 scheduleKeepaliveAlarm();
-connectWs();
+void connectCoordinator();

@@ -1,7 +1,7 @@
 use clap::Parser;
 use crossbeam_queue::SegQueue;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE, RETRY_AFTER};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, ORIGIN, RANGE, REFERER, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::SeekFrom;
@@ -54,6 +54,15 @@ struct Args {
     /// terminal — machine-readable JSON progress on stdout is unaffected.
     #[arg(long, default_value_t = false)]
     quiet: bool,
+
+    /// Page URL used as Referer — required by many signed CDN links (Instagram,
+    /// third-party video hosts) that return 403 without a browser referer.
+    #[arg(long)]
+    referer: Option<String>,
+
+    /// Origin header (usually referer origin) for CDN hotlink protection.
+    #[arg(long)]
+    origin: Option<String>,
 }
 
 /// Global token-bucket rate limiter shared by every connection. A 1-second
@@ -263,19 +272,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // nodelay (no Nagle latency), HTTP/1.1 only (avoid single-socket H2
     // multiplex throttling). NOTE: only a connect timeout — body reads are
     // governed by a per-read idle timeout, never a total-request deadline.
-    let client = Arc::new(
-        reqwest::Client::builder()
-            // A browser-like User-Agent — many CDNs (Instagram/fbcdn, Cloudflare,
-            // etc.) reject default library agents with 403.
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .tcp_keepalive(Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .no_gzip()
-            .http1_only()
-            .pool_max_idle_per_host(args.threads as usize)
-            .connect_timeout(Duration::from_secs(30))
-            .build()?,
-    );
+    let mut client_builder = reqwest::Client::builder()
+        // A browser-like User-Agent — many CDNs (Instagram/fbcdn, Cloudflare,
+        // etc.) reject default library agents with 403.
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .no_gzip()
+        .http1_only()
+        .pool_max_idle_per_host(args.threads as usize)
+        .connect_timeout(Duration::from_secs(30));
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Some(ref referer) = args.referer {
+        if let Ok(val) = referer.parse() {
+            default_headers.insert(REFERER, val);
+        }
+    }
+    if let Some(ref origin) = args.origin {
+        if let Ok(val) = origin.parse() {
+            default_headers.insert(ORIGIN, val);
+        }
+    }
+    if !default_headers.is_empty() {
+        client_builder = client_builder.default_headers(default_headers);
+    }
+    let client = Arc::new(client_builder.build()?);
 
     // Discover size + validators (HEAD, falling back to a ranged GET).
     let (total_size, etag, last_modified, ranges_hint) = match discover(&client, &args.url).await {

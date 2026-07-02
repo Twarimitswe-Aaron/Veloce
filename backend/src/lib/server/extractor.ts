@@ -23,6 +23,9 @@ const inflight = new Map<string, Promise<MediaFormat[]>>();
 /** Browsers to try for cookie auth (Linux/Kali often uses chromium). */
 const COOKIE_BROWSERS = ['chromium', 'chrome', 'brave', 'firefox'] as const;
 
+const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
+const ytDlpErrorLogged = new Set<string>();
+
 function normalizePageUrl(url: string): string {
 	try {
 		const u = new URL(url);
@@ -51,9 +54,24 @@ function instagramUrlVariants(url: string): string[] {
 }
 
 export function getRecentFormatError(url: string): string | undefined {
-	const hit = failCache.get(normalizePageUrl(url));
-	if (hit && Date.now() - hit.ts < FAIL_CACHE_TTL_MS) return hit.reason;
+	const key = normalizePageUrl(url);
+	const hit = failCache.get(key);
+	if (!hit) return undefined;
+	const ttl = /instagram\.com/i.test(key) ? INSTAGRAM_FAIL_CACHE_TTL_MS : FAIL_CACHE_TTL_MS;
+	if (Date.now() - hit.ts < ttl) return hit.reason;
 	return undefined;
+}
+
+function isTrapDownloadUrl(url: string): boolean {
+	try {
+		const u = new URL(url);
+		const path = u.pathname.toLowerCase();
+		if (/\/redirect|\/pkg\/|\/api\/|\/graphql|\/download\?/i.test(path)) return true;
+		if (/redirect|download/i.test(u.searchParams.get('a') || '')) return true;
+		return false;
+	} catch {
+		return false;
+	}
 }
 
 export function isExtractorDomain(url: string): boolean {
@@ -92,7 +110,10 @@ export async function listFormats(url: string): Promise<MediaFormat[]> {
 	if (cached) return cached;
 
 	const recentFail = failCache.get(key);
-	if (recentFail && Date.now() - recentFail.ts < FAIL_CACHE_TTL_MS) return [];
+	if (recentFail) {
+		const ttl = /instagram\.com/i.test(key) ? INSTAGRAM_FAIL_CACHE_TTL_MS : FAIL_CACHE_TTL_MS;
+		if (Date.now() - recentFail.ts < ttl) return [];
+	}
 
 	if (inflight.has(key)) {
 		return inflight.get(key)!;
@@ -127,6 +148,13 @@ async function listFormatsUncached(cacheKey: string, url: string): Promise<Media
 	}
 
 	if (!isExtractorDomain(url)) {
+		if (isTrapDownloadUrl(url)) {
+			failCache.set(cacheKey, {
+				reason: 'Redirect/API link — use the Veloce intercept format picker on the page instead of this URL directly.',
+				ts: Date.now()
+			});
+			return [];
+		}
 		try {
 			const u = new URL(url);
 			const name = path.basename(u.pathname) || 'download';
@@ -155,19 +183,16 @@ async function raceFormatStrategies(url: string): Promise<MediaFormat[]> {
 	const isInstagram = /instagram\.com/i.test(url);
 
 	if (isInstagram) {
-		let attempts = 0;
-		for (const pageUrl of instagramUrlVariants(url)) {
-			for (const browser of COOKIE_BROWSERS) {
-				if (attempts >= 3) return [];
-				attempts++;
-				const run = runYtDlpJson(pageUrl, ['--cookies-from-browser', browser], 26_000, {
-					allowPlaylist: true,
-					label: `instagram/${browser}`
-				});
-				const formats = await run.promise;
-				run.kill();
-				if (formats.length > 0) return formats;
-			}
+		// One browser + one URL variant first — avoids log spam when cookies are missing.
+		const pageUrl = instagramUrlVariants(url)[0];
+		for (const browser of ['chromium', 'chrome'] as const) {
+			const run = runYtDlpJson(pageUrl, ['--cookies-from-browser', browser], 22_000, {
+				allowPlaylist: true,
+				label: `instagram/${browser}`
+			});
+			const formats = await run.promise;
+			run.kill();
+			if (formats.length > 0) return formats;
 		}
 		return [];
 	}
@@ -245,7 +270,12 @@ function runYtDlpJson(
 			settled = true;
 			clearTimeout(timeout);
 			if (!result.length && lastErr && opts.label) {
-				console.error(`[yt-dlp formats/${opts.label}]: ${lastErr}`);
+				const logKey = `${opts.label}:${url}`;
+				if (!ytDlpErrorLogged.has(logKey)) {
+					ytDlpErrorLogged.add(logKey);
+					console.error(`[yt-dlp formats/${opts.label}]: ${lastErr}`);
+					setTimeout(() => ytDlpErrorLogged.delete(logKey), 120_000);
+				}
 			}
 			resolve(result);
 		};
@@ -282,7 +312,13 @@ function runYtDlpJson(
 }
 
 function parseYtDlpFormats(output: string): MediaFormat[] {
-	const info = JSON.parse(output);
+	let info: Record<string, unknown> | null;
+	try {
+		info = JSON.parse(output);
+	} catch {
+		return [];
+	}
+	if (!info || typeof info !== 'object') return [];
 
 	if (info._type === 'playlist' && Array.isArray(info.entries)) {
 		const merged: MediaFormat[] = [];
@@ -432,7 +468,6 @@ async function resolveMediafireDownload(url: string): Promise<string | null> {
 		if (live) return live;
 		const filePage = mediafireFilePageFromCdn(url);
 		if (filePage) {
-			console.log(`[Extractor] Mediafire CDN expired — refreshing via ${filePage}`);
 			return parseMediafirePage(filePage);
 		}
 	}
@@ -546,7 +581,6 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         const label = cookieArgs.length ? cookieArgs[1] : 'no-cookies';
         const directUrl = await runYtDlp(url, cookieArgs);
         if (directUrl) {
-            console.log(`[Extractor] Resolved via yt-dlp (${label})`);
             return directUrl;
         }
         console.error(`[Extractor] yt-dlp attempt failed (${label}) for ${url}`);
