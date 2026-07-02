@@ -494,9 +494,10 @@
 	const badgeKeys = new Set();
 	const localFormatCache = new Map();
 	const prefetchStarted = new Set();
-	const MAX_PREFETCH_BATCH = 3;
+	const MAX_PREFETCH_BATCH = 8;
 	const BADGE_MARGIN_PX = 200;
-	const PREFETCH_MARGIN_PX = 80;
+	/** Prefetch uses same margin as badges — start loading formats when the badge appears. */
+	const PREFETCH_MARGIN_PX = BADGE_MARGIN_PX;
 	const SCANNED_ATTR = 'data-veloce-scanned';
 	const WATCH_ATTR = 'data-veloce-watch';
 	const TAB_PING_MS = 25000;
@@ -916,6 +917,20 @@
 		return true;
 	}
 
+	/** Start format prefetch when a badge is placed — YouTube always (badge is already near viewport). */
+	function shouldStartPrefetch(resolvedUrl, anchor) {
+		if (!shouldPrefetchUrl(resolvedUrl)) return false;
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) return true;
+		return isNearViewport(anchor, PREFETCH_MARGIN_PX);
+	}
+
+	function cardViewportScore(card) {
+		const r = card?.getBoundingClientRect?.();
+		if (!r) return Infinity;
+		const cardCy = r.top + r.height / 2;
+		return Math.abs(cardCy - window.innerHeight / 2);
+	}
+
 	/** Queue format fetch — skips when tab hidden; caps batch size. */
 	function prefetchPageUrls(entries) {
 		if (!captureActive() || document.hidden) return;
@@ -1332,6 +1347,9 @@
 			e.stopPropagation();
 			openFormatMenu(resolvedUrl, anchor, el);
 		});
+		el.addEventListener('mouseenter', () => {
+			if (shouldPrefetchUrl(resolvedUrl)) eagerPrefetch(resolvedUrl);
+		}, { passive: true });
 
 		shadow.appendChild(el);
 		badgeKeys.add(badgeKey);
@@ -1339,7 +1357,8 @@
 
 		if (localFormatCache.has(badgeKey)) {
 			markBadgeReady(badgeKey);
-		} else if (startPrefetch && shouldPrefetchUrl(resolvedUrl)) {
+		} else if (startPrefetch) {
+			el.classList.add('badge-loading');
 			prefetchPageUrls([{ url: resolvedUrl }]);
 		}
 
@@ -1524,36 +1543,67 @@
 			return;
 		}
 
+		const loading = showLoadingStatus(menu, closeBtn);
+		pendingMenuUrl = badgeKey;
+		eagerPrefetch(url);
+
+		const finishWithFormats = (formats, fromCache = false) => {
+			if (!openMenu || pendingMenuUrl !== badgeKey) return;
+			if (formats?.length) storeFormats(url, formats);
+			if (fromCache) loading.setInstant();
+			loading.stop();
+			if (!formats?.length) {
+				const err = document.createElement('div');
+				err.className = 'menu-status';
+				err.textContent = 'No formats found. Is the backend running?';
+				menu.insertBefore(err, closeBtn);
+				pendingMenuUrl = null;
+				return;
+			}
+			showFormatsInMenu(menu, closeBtn, formats, url, null);
+			pendingMenuUrl = null;
+		};
+
+		const finishWithError = (error) => {
+			if (!openMenu || pendingMenuUrl !== badgeKey) return;
+			loading.stop();
+			const err = document.createElement('div');
+			err.className = 'menu-status';
+			err.textContent = error || 'No formats found. Is the backend running?';
+			menu.insertBefore(err, closeBtn);
+			pendingMenuUrl = null;
+		};
+
 		let busyPort = null;
 		try {
 			busyPort = chrome.runtime.connect({ name: 'veloce-busy' });
 		} catch { /* ignore */ }
 
-		const loading = showLoadingStatus(menu, closeBtn);
-		pendingMenuUrl = badgeKey;
-		eagerPrefetch(url);
-
-		chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
-			if (busyPort) {
-				try { busyPort.disconnect(); } catch { /* ignore */ }
-				busyPort = null;
-			}
-			if (!openMenu) return;
-
-			if (resp?.formats?.length) storeFormats(url, resp.formats);
-			if (resp?.cached) loading.setInstant();
-			loading.stop();
-
-			if (!resp || resp.type === 'FORMATS_ERROR' || !resp.formats?.length) {
-				const err = document.createElement('div');
-				err.className = 'menu-status';
-				err.textContent = resp?.error || 'No formats found. Is the backend running?';
-				menu.insertBefore(err, closeBtn);
+		// Background SW may already have formats from prefetch — show instantly without a new yt-dlp run.
+		chrome.runtime.sendMessage({ type: 'VELOCE_PEEK_FORMATS', url: badgeKey }, (peek) => {
+			if (chrome.runtime.lastError) { /* fall through */ }
+			else if (peek?.formats?.length) {
+				if (busyPort) {
+					try { busyPort.disconnect(); } catch { /* ignore */ }
+					busyPort = null;
+				}
+				finishWithFormats(peek.formats, true);
 				return;
 			}
 
-			showFormatsInMenu(menu, closeBtn, resp.formats, url, null);
-			pendingMenuUrl = null;
+			chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
+				if (busyPort) {
+					try { busyPort.disconnect(); } catch { /* ignore */ }
+					busyPort = null;
+				}
+				if (!openMenu || pendingMenuUrl !== badgeKey) return;
+
+				if (resp?.type === 'FORMATS_ERROR' || !resp?.formats?.length) {
+					finishWithError(resp?.error);
+					return;
+				}
+				finishWithFormats(resp.formats, !!resp?.cached);
+			});
 		});
 	}
 
@@ -1615,7 +1665,7 @@
 
 		if (!shouldBadgeYoutubeElement(anchor)) return null;
 
-		const startPrefetch = isNearViewport(card, PREFETCH_MARGIN_PX);
+		const startPrefetch = shouldStartPrefetch(url, anchor);
 		const placed = placeBadge(url, anchor, url, startPrefetch);
 		if (!placed) return null;
 
@@ -1659,7 +1709,7 @@
 		const overlay = findMediaOverlay();
 		if (overlay && !overlay.contains(el) && !overlay.contains(anchor)) return null;
 
-		const startPrefetch = isNearViewport(anchor, PREFETCH_MARGIN_PX);
+		const startPrefetch = shouldStartPrefetch(url, anchor);
 		const placed = placeBadge(url, anchor, rawUrl || url, startPrefetch);
 		if (!placed) return null;
 
@@ -1728,8 +1778,10 @@
 
 	function scanYoutubeFeedCardsVisible() {
 		if (!captureActive() || !/youtube\.com|youtu\.be/i.test(location.hostname)) return;
-		for (const card of queryYoutubeFeedCards()) {
-			if (!isNearViewport(card, BADGE_MARGIN_PX)) continue;
+		const cards = queryYoutubeFeedCards()
+			.filter((card) => isNearViewport(card, BADGE_MARGIN_PX))
+			.sort((a, b) => cardViewportScore(a) - cardViewportScore(b));
+		for (const card of cards) {
 			watchYoutubeFeedCard(card);
 			processYoutubeFeedCard(card);
 		}
@@ -1778,6 +1830,10 @@
 				'video.html5-main-video'
 			]) {
 				document.querySelectorAll(sel).forEach((player) => watchElement(player));
+			}
+			if (isYoutubeWatchPage()) {
+				const watchUrl = canonicalYoutubeUrl();
+				if (watchUrl) eagerPrefetch(watchUrl);
 			}
 			scanYoutubeFeedCards();
 			scanYoutubeFeedCardsVisible();

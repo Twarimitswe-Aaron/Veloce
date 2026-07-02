@@ -28,8 +28,8 @@ const inflightFormatUrls = new Set();
 const prefetchQueue = [];
 const prefetchQueued = new Set();
 let prefetchRunning = 0;
-const PREFETCH_LIMIT = 1;
-const PREFETCH_QUEUE_MAX = 8;
+const PREFETCH_LIMIT = 2;
+const PREFETCH_QUEUE_MAX = 24;
 const WS_PING_MS = 25000;
 
 /** True when the offscreen document (or legacy SW socket) is linked to the coordinator. */
@@ -224,7 +224,7 @@ async function waitForInflightFormats(url, maxMs = 25000) {
 		const hit = getFormatCache(key);
 		if (hit?.length) return hit;
 		if (!inflightFormatUrls.has(key)) break;
-		await new Promise((r) => setTimeout(r, 200));
+		await new Promise((r) => setTimeout(r, 75));
 	}
 	return getFormatCache(key);
 }
@@ -1024,6 +1024,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		case 'VELOCE_LIST_FORMATS':
 			listFormats(msg.url, sendResponse, _sender, msg.force === true);
 			return true;
+
+		case 'VELOCE_PEEK_FORMATS': {
+			const key = normalizeFormatUrl(msg.url);
+			const cached = getFormatCache(key);
+			sendResponse(cached?.length ? { formats: cached, cached: true } : { formats: [] });
+			return false;
+		}
 
 		case 'VELOCE_PREFETCH_FORMATS':
 			if (!isForegroundTab(_sender.tab?.id)) return false;
