@@ -145,7 +145,7 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 
 | Site / family | Signature | Behavior class | Format source | Notes |
 |---------------|-----------|----------------|---------------|-------|
-| YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; shadow DOM scan |
+| YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; **2025+ homepage** uses flat `#content` inside `ytd-rich-item-renderer` (no `#video-title`); deep shadow-DOM link scan; lazy-load retry when `#content` empty |
 | Instagram | `instagram` | A | yt-dlp + cookies | Chrome profile; reel/p variants |
 | TikTok | `tiktok` | A | yt-dlp | |
 | X/Twitter | `twitter` | A | yt-dlp | |
