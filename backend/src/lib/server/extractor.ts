@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from 'child_process';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {
 	detectMediaSource,
@@ -35,8 +37,36 @@ const formatCache = new Map<string, { formats: MediaFormat[]; ts: number }>();
 const failCache = new Map<string, { reason: string; ts: number; source?: MediaSource }>();
 const inflight = new Map<string, Promise<MediaFormat[]>>();
 
-/** Browsers to try for cookie auth (Linux/Kali often uses chromium). */
-const COOKIE_BROWSERS = ['chromium', 'chrome', 'brave', 'firefox'] as const;
+/** Browsers to try for cookie auth — chrome first (most users log in there). */
+const COOKIE_BROWSER_ORDER = ['chrome', 'chromium', 'firefox', 'brave'] as const;
+
+const BROWSER_COOKIE_PATHS: Partial<Record<(typeof COOKIE_BROWSER_ORDER)[number], string>> = {
+	chrome: path.join(os.homedir(), '.config/google-chrome/Default/Cookies'),
+	chromium: path.join(os.homedir(), '.config/chromium/Default/Cookies'),
+	brave: path.join(os.homedir(), '.config/BraveSoftware/Brave-Browser/Default/Cookies')
+};
+
+/** Skip browsers with no cookie DB (avoids brave spam on machines without Brave). */
+function availableCookieBrowsers(): (typeof COOKIE_BROWSER_ORDER)[number][] {
+	const out: (typeof COOKIE_BROWSER_ORDER)[number][] = [];
+	for (const browser of COOKIE_BROWSER_ORDER) {
+		if (browser === 'firefox') {
+			out.push(browser);
+			continue;
+		}
+		const cookiePath = BROWSER_COOKIE_PATHS[browser];
+		if (cookiePath && fs.existsSync(cookiePath)) out.push(browser);
+	}
+	return out.length ? out : ['chrome'];
+}
+
+/**
+ * YouTube requires solving JS challenges (n-parameter / signatures). yt-dlp needs a JS runtime.
+ * @see https://github.com/yt-dlp/yt-dlp/wiki/EJS
+ */
+function ytdlpSharedArgs(): string[] {
+	return ['--js-runtimes', 'node'];
+}
 
 const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
 const ytDlpErrorLogged = new Set<string>();
@@ -276,25 +306,25 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 
 function youtubeAttempts(force: boolean): YtDlpAttempt[] {
 	const out: YtDlpAttempt[] = [];
-	const timeout = force ? 28_000 : 20_000;
-	for (const browser of COOKIE_BROWSERS) {
+	const timeout = force ? 28_000 : 18_000;
+	for (const browser of availableCookieBrowsers()) {
 		out.push({
 			cookieArgs: ['--cookies-from-browser', browser],
 			timeoutMs: timeout,
 			label: `youtube/${browser}`
 		});
 	}
-	for (const client of ['web', 'android', 'ios'] as const) {
+	for (const client of ['android', 'web', 'ios'] as const) {
 		out.push({
 			cookieArgs: ['--cookies-from-browser', 'chrome'],
 			extraArgs: ['--extractor-args', `youtube:player_client=${client}`],
-			timeoutMs: force ? 26_000 : 16_000,
+			timeoutMs: force ? 24_000 : 14_000,
 			label: `youtube/chrome/${client}`
 		});
 	}
 	out.push({
 		cookieArgs: [],
-		timeoutMs: 12_000,
+		timeoutMs: 10_000,
 		label: 'youtube/no-cookies'
 	});
 	return out;
@@ -318,7 +348,23 @@ async function raceYoutubeFormats(url: string, force: boolean): Promise<FormatLi
 		return { formats: [], lastErr };
 	}
 
-	const runners = attempts.slice(0, 4).map((attempt) =>
+	// Fast path: one chrome/chromium attempt usually succeeds in ~7s once JS runtime is enabled.
+	const primary = attempts[0];
+	if (primary) {
+		const run = runYtDlpJson(url, primary.cookieArgs, primary.timeoutMs, {
+			label: primary.label,
+			extraArgs: primary.extraArgs
+		});
+		const primaryFormats = tagFormats(await run.promise, 'youtube');
+		lastErr = run.getError() || lastErr;
+		run.kill();
+		if (primaryFormats.length) return { formats: primaryFormats, lastErr: '' };
+	}
+
+	const fallbacks = attempts.slice(1, 5);
+	if (!fallbacks.length) return { formats: [], lastErr };
+
+	const runners = fallbacks.map((attempt) =>
 		runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, {
 			label: attempt.label,
 			extraArgs: attempt.extraArgs
@@ -328,7 +374,7 @@ async function raceYoutubeFormats(url: string, force: boolean): Promise<FormatLi
 	return new Promise((resolve) => {
 		let finished = 0;
 		let resolved = false;
-		let bestErr = '';
+		let bestErr = lastErr;
 
 		const finishAll = (formats: MediaFormat[]) => {
 			if (!resolved) {
@@ -436,6 +482,7 @@ function runYtDlpJson(
 	const promise = new Promise<MediaFormat[]>((resolve) => {
 		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
 		const args = [
+			...ytdlpSharedArgs(),
 			...cookieArgs,
 			...(opts.extraArgs ?? []),
 			'--no-warnings',
@@ -544,7 +591,8 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 
 	for (const f of raw) {
 		if (!f.url) continue;
-		if (f.ext === 'mhtml' || f.format_note === 'storyboard') continue;
+		const formatId = String(f.format_id ?? '');
+		if (f.ext === 'mhtml' || f.format_note === 'storyboard' || formatId.startsWith('sb')) continue;
 		const hasVideo = f.vcodec && f.vcodec !== 'none';
 		const hasAudio = f.acodec && f.acodec !== 'none';
 		if (!hasVideo && !hasAudio) continue;
@@ -702,6 +750,7 @@ function runYtDlpFlatPlaylist(url: string, cookieArgs: string[]): Promise<Playli
 	return new Promise((resolve) => {
 		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
 		const proc = spawn(ytdlpPath, [
+			...ytdlpSharedArgs(),
 			...cookieArgs,
 			'--flat-playlist',
 			'--no-warnings',
@@ -789,6 +838,7 @@ function runYtDlp(url: string, cookieArgs: string[]): Promise<string | null> {
     return new Promise((resolve) => {
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
         const ytdlp = spawn(ytdlpPath, [
+            ...ytdlpSharedArgs(),
             ...cookieArgs,
             '-f', 'b/best',
             '--no-playlist',

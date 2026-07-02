@@ -55,6 +55,13 @@ export function failReasonForSource(source: MediaSource, lastErr?: string): stri
 	}
 
 	if (source === 'youtube') {
+		if (
+			err.includes('challenge solving') ||
+			err.includes('signature solving') ||
+			err.includes('only images are available')
+		) {
+			return 'YouTube blocked format extraction (JS challenge). Ensure Node.js is installed on your system, restart the Veloce backend, then retry from the badge.';
+		}
 		if (err.includes('not available') || err.includes('private')) {
 			return 'YouTube reports this video is unavailable (region, sign-in, or age gate). Open it in your browser, sign in if needed, then retry from the Veloce badge.';
 		}

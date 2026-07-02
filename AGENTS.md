@@ -35,7 +35,7 @@ Detected in `formatSources.ts` → `detectMediaSource(url)`:
 
 | Signature | Host patterns | List formats | Download notes |
 |-----------|---------------|--------------|----------------|
-| `youtube` | `youtube.com`, `youtu.be` | yt-dlp: Chrome → Chromium → player clients `web`/`android`/`ios` → no cookies | Progressive googlevideo URLs need **referer** = watch page |
+| `youtube` | `youtube.com`, `youtu.be` | yt-dlp + **`--js-runtimes node`** (required for YouTube JS challenges); Chrome → Chromium → player clients `android`/`web`/`ios` → no cookies | Progressive googlevideo URLs need **referer** = watch page |
 | `instagram` | `instagram.com` | yt-dlp + cookies; try **Chrome first**, then Chromium; `/p/` and `/reel/` variants | Carousel = playlist; cookies must match browser user actually uses |
 | `tiktok` | `tiktok.com` | Generic yt-dlp race | Login often required |
 | `twitter` | `twitter.com`, `x.com` | Generic yt-dlp race | |
