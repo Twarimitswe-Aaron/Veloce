@@ -1,5 +1,16 @@
 import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
+import {
+	detectMediaSource,
+	failCacheTtlMs,
+	failReasonForSource,
+	inferFormatKind,
+	isManifestFormatUrl,
+	type FormatKind,
+	type MediaSource
+} from './formatSources';
+
+export type { FormatKind, MediaSource };
 
 export interface MediaFormat {
 	id: string;
@@ -7,6 +18,10 @@ export interface MediaFormat {
 	url: string;
 	ext: string;
 	filesize?: number;
+	/** Platform that produced this format (youtube, instagram, …). */
+	source?: MediaSource;
+	/** How the engine should fetch it. */
+	kind?: FormatKind;
 }
 
 const EXTRACTOR_DOMAINS = [
@@ -17,7 +32,7 @@ const EXTRACTOR_DOMAINS = [
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const FAIL_CACHE_TTL_MS = 90 * 1000;
 const formatCache = new Map<string, { formats: MediaFormat[]; ts: number }>();
-const failCache = new Map<string, { reason: string; ts: number }>();
+const failCache = new Map<string, { reason: string; ts: number; source?: MediaSource }>();
 const inflight = new Map<string, Promise<MediaFormat[]>>();
 
 /** Browsers to try for cookie auth (Linux/Kali often uses chromium). */
@@ -26,10 +41,26 @@ const COOKIE_BROWSERS = ['chromium', 'chrome', 'brave', 'firefox'] as const;
 const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
 const ytDlpErrorLogged = new Set<string>();
 
-function normalizePageUrl(url: string): string {
+/** Canonical cache key — same video/post must map to one key across content, SW, and backend. */
+export function normalizeFormatUrl(url: string): string {
 	try {
 		const u = new URL(url);
 		u.hash = '';
+		const host = u.hostname.toLowerCase();
+		if (host === 'youtu.be') {
+			const id = u.pathname.split('/').filter(Boolean)[0];
+			if (id) return `https://www.youtube.com/watch?v=${id}`;
+		}
+		if (host.includes('youtube.com')) {
+			if (u.pathname.startsWith('/shorts/')) {
+				const id = u.pathname.split('/').filter(Boolean)[1];
+				if (id) return `https://www.youtube.com/shorts/${id}`;
+			}
+			if (u.pathname === '/watch') {
+				const v = u.searchParams.get('v');
+				if (v) return `https://www.youtube.com/watch?v=${v}`;
+			}
+		}
 		if (/instagram\.com/i.test(u.hostname)) {
 			u.search = '';
 			u.pathname = u.pathname.replace(/\/+$/, '');
@@ -38,6 +69,10 @@ function normalizePageUrl(url: string): string {
 	} catch {
 		return url;
 	}
+}
+
+function normalizePageUrl(url: string): string {
+	return normalizeFormatUrl(url);
 }
 
 /** Reel and /p/ URLs share the same shortcode — try both if one fails. */
@@ -57,7 +92,8 @@ export function getRecentFormatError(url: string): string | undefined {
 	const key = normalizePageUrl(url);
 	const hit = failCache.get(key);
 	if (!hit) return undefined;
-	const ttl = /instagram\.com/i.test(key) ? INSTAGRAM_FAIL_CACHE_TTL_MS : FAIL_CACHE_TTL_MS;
+	const source = hit.source ?? detectMediaSource(key);
+	const ttl = failCacheTtlMs(source, key);
 	if (Date.now() - hit.ts < ttl) return hit.reason;
 	return undefined;
 }
@@ -83,6 +119,8 @@ export function isExtractorDomain(url: string): boolean {
 	}
 }
 
+export { detectMediaSource, isManifestFormatUrl } from './formatSources';
+
 function formatBytes(n: number): string {
 	if (!n) return '';
 	const units = ['B', 'KB', 'MB', 'GB'];
@@ -104,27 +142,34 @@ function setCached(url: string, formats: MediaFormat[]) {
  * List downloadable formats for a URL. Video/social pages go through yt-dlp;
  * direct file links return a single "Direct" entry.
  */
-export async function listFormats(url: string): Promise<MediaFormat[]> {
+export async function listFormats(url: string, opts?: { force?: boolean }): Promise<MediaFormat[]> {
 	const key = normalizePageUrl(url);
 	const cached = getCached(key);
 	if (cached) return cached;
 
-	const recentFail = failCache.get(key);
-	if (recentFail) {
-		const ttl = /instagram\.com/i.test(key) ? INSTAGRAM_FAIL_CACHE_TTL_MS : FAIL_CACHE_TTL_MS;
-		if (Date.now() - recentFail.ts < ttl) return [];
+	if (!opts?.force) {
+		const recentFail = failCache.get(key);
+		if (recentFail) {
+			const ttl = /instagram\.com/i.test(key) ? INSTAGRAM_FAIL_CACHE_TTL_MS : FAIL_CACHE_TTL_MS;
+			if (Date.now() - recentFail.ts < ttl) return [];
+		}
 	}
 
 	if (inflight.has(key)) {
 		return inflight.get(key)!;
 	}
 
-	const work = listFormatsUncached(key, url).finally(() => inflight.delete(key));
+	const work = listFormatsUncached(key, url, opts).finally(() => inflight.delete(key));
 	inflight.set(key, work);
 	return work;
 }
 
-async function listFormatsUncached(cacheKey: string, url: string): Promise<MediaFormat[]> {
+async function listFormatsUncached(
+	cacheKey: string,
+	url: string,
+	opts?: { force?: boolean }
+): Promise<MediaFormat[]> {
+	const source = detectMediaSource(url);
 	if (url.includes('mediafire.com')) {
 		const direct = await resolveMediafireDownload(url);
 		if (!direct) {
@@ -135,14 +180,14 @@ async function listFormatsUncached(cacheKey: string, url: string): Promise<Media
 			return [];
 		}
 		const name = path.basename(new URL(direct).pathname) || 'download';
-		const formats = [{ id: 'direct', label: `Direct — ${name}`, url: direct, ext: path.extname(name) || '.bin' }];
+		const formats = [{ id: 'direct', label: `Direct — ${name}`, url: direct, ext: path.extname(name) || '.bin', source: 'mediafire' as MediaSource, kind: 'direct' as FormatKind }];
 		setCached(cacheKey, formats);
 		return formats;
 	}
 
 	if (isDirectFileUrl(url)) {
 		const name = path.basename(new URL(url).pathname) || 'download';
-		const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext: path.extname(name) || '.bin' }];
+		const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext: path.extname(name) || '.bin', source: 'direct' as MediaSource, kind: 'direct' as FormatKind }];
 		setCached(cacheKey, formats);
 		return formats;
 	}
@@ -159,7 +204,7 @@ async function listFormatsUncached(cacheKey: string, url: string): Promise<Media
 			const u = new URL(url);
 			const name = path.basename(u.pathname) || 'download';
 			const ext = path.extname(name) || '.bin';
-			const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext }];
+			const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext, source: 'direct' as MediaSource, kind: 'direct' as FormatKind }];
 			setCached(cacheKey, formats);
 			return formats;
 		} catch {
@@ -167,51 +212,129 @@ async function listFormatsUncached(cacheKey: string, url: string): Promise<Media
 		}
 	}
 
-	const formats = await raceFormatStrategies(url);
+	const { formats, lastErr } = await listFormatsBySource(url, source, opts);
 	if (formats.length > 0) {
 		setCached(cacheKey, formats);
 	} else {
-		const reason = /instagram\.com/i.test(url)
-			? 'Instagram returned no formats. Stay logged in to Instagram in Chrome/Chromium, reload the page, and retry. Image-only posts have no video formats.'
-			: 'No downloadable formats found for this URL.';
-		failCache.set(cacheKey, { reason, ts: Date.now() });
+		failCache.set(cacheKey, {
+			reason: failReasonForSource(source, lastErr),
+			ts: Date.now(),
+			source
+		});
 	}
 	return formats;
 }
 
-async function raceFormatStrategies(url: string): Promise<MediaFormat[]> {
-	const isInstagram = /instagram\.com/i.test(url);
+type YtDlpAttempt = {
+	cookieArgs: string[];
+	extraArgs?: string[];
+	timeoutMs: number;
+	label: string;
+	allowPlaylist?: boolean;
+};
 
-	if (isInstagram) {
-		// One browser + one URL variant first — avoids log spam when cookies are missing.
-		const pageUrl = instagramUrlVariants(url)[0];
-		for (const browser of ['chromium', 'chrome'] as const) {
-			const run = runYtDlpJson(pageUrl, ['--cookies-from-browser', browser], 22_000, {
+type FormatListResult = { formats: MediaFormat[]; lastErr: string };
+
+async function listFormatsBySource(
+	url: string,
+	source: MediaSource,
+	opts?: { force?: boolean }
+): Promise<FormatListResult> {
+	switch (source) {
+		case 'instagram':
+			return raceInstagramFormats(url, opts?.force === true);
+		case 'youtube':
+			return raceYoutubeFormats(url, opts?.force === true);
+		default:
+			return raceGenericYtDlpFormats(url, source, opts?.force === true);
+	}
+}
+
+async function raceInstagramFormats(url: string, force: boolean): Promise<FormatListResult> {
+	const urls = instagramUrlVariants(url);
+	// Chrome first — most users log in there; Chromium-only misses cookies on Linux.
+	const browsers = force
+		? (['chrome', 'chromium', 'brave', 'firefox'] as const)
+		: (['chrome', 'chromium'] as const);
+	const timeoutMs = force ? 24_000 : 14_000;
+	let lastErr = '';
+
+	for (const pageUrl of urls) {
+		for (const browser of browsers) {
+			const run = runYtDlpJson(pageUrl, ['--cookies-from-browser', browser], timeoutMs, {
 				allowPlaylist: true,
 				label: `instagram/${browser}`
 			});
-			const formats = await run.promise;
+			const formats = tagFormats(await run.promise, 'instagram');
 			run.kill();
-			if (formats.length > 0) return formats;
+			if (formats.length) return { formats, lastErr: '' };
+			lastErr = run.getError() || lastErr;
 		}
-		return [];
+	}
+	return { formats: [], lastErr };
+}
+
+function youtubeAttempts(force: boolean): YtDlpAttempt[] {
+	const out: YtDlpAttempt[] = [];
+	const timeout = force ? 28_000 : 20_000;
+	for (const browser of COOKIE_BROWSERS) {
+		out.push({
+			cookieArgs: ['--cookies-from-browser', browser],
+			timeoutMs: timeout,
+			label: `youtube/${browser}`
+		});
+	}
+	for (const client of ['web', 'android', 'ios'] as const) {
+		out.push({
+			cookieArgs: ['--cookies-from-browser', 'chrome'],
+			extraArgs: ['--extractor-args', `youtube:player_client=${client}`],
+			timeoutMs: force ? 26_000 : 16_000,
+			label: `youtube/chrome/${client}`
+		});
+	}
+	out.push({
+		cookieArgs: [],
+		timeoutMs: 12_000,
+		label: 'youtube/no-cookies'
+	});
+	return out;
+}
+
+async function raceYoutubeFormats(url: string, force: boolean): Promise<FormatListResult> {
+	const attempts = youtubeAttempts(force);
+	let lastErr = '';
+
+	if (force) {
+		for (const attempt of attempts) {
+			const run = runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, {
+				label: attempt.label,
+				extraArgs: attempt.extraArgs
+			});
+			const formats = tagFormats(await run.promise, 'youtube');
+			run.kill();
+			if (formats.length) return { formats, lastErr: '' };
+			lastErr = run.getError() || lastErr;
+		}
+		return { formats: [], lastErr };
 	}
 
-	const runners = [
-		runYtDlpJson(url, [], 10_000, { label: 'no-cookies' }),
-		runYtDlpJson(url, ['--cookies-from-browser', 'chromium'], 22_000, { label: 'chromium' }),
-		runYtDlpJson(url, ['--cookies-from-browser', 'chrome'], 22_000, { label: 'chrome' })
-	];
+	const runners = attempts.slice(0, 4).map((attempt) =>
+		runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, {
+			label: attempt.label,
+			extraArgs: attempt.extraArgs
+		})
+	);
 
 	return new Promise((resolve) => {
 		let finished = 0;
 		let resolved = false;
+		let bestErr = '';
 
 		const finishAll = (formats: MediaFormat[]) => {
 			if (!resolved) {
 				resolved = true;
 				for (const r of runners) r.kill();
-				resolve(formats);
+				resolve({ formats: tagFormats(formats, 'youtube'), lastErr: bestErr });
 			}
 		};
 
@@ -221,6 +344,7 @@ async function raceFormatStrategies(url: string): Promise<MediaFormat[]> {
 					finishAll(formats);
 					return;
 				}
+				bestErr = r.getError() || bestErr;
 				finished++;
 				if (finished === runners.length && !resolved) finishAll([]);
 			});
@@ -228,15 +352,78 @@ async function raceFormatStrategies(url: string): Promise<MediaFormat[]> {
 	});
 }
 
-type YtDlpRunOpts = { allowPlaylist?: boolean; label?: string };
+async function raceGenericYtDlpFormats(
+	url: string,
+	source: MediaSource,
+	force: boolean
+): Promise<FormatListResult> {
+	const attempts: YtDlpAttempt[] = [
+		{ cookieArgs: ['--cookies-from-browser', 'chrome'], timeoutMs: force ? 24_000 : 20_000, label: `${source}/chrome` },
+		{ cookieArgs: ['--cookies-from-browser', 'chromium'], timeoutMs: force ? 24_000 : 20_000, label: `${source}/chromium` },
+		{ cookieArgs: [], timeoutMs: 12_000, label: `${source}/no-cookies` }
+	];
+	let lastErr = '';
+
+	if (force) {
+		for (const attempt of attempts) {
+			const run = runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, { label: attempt.label });
+			const formats = tagFormats(await run.promise, source);
+			run.kill();
+			if (formats.length) return { formats, lastErr: '' };
+			lastErr = run.getError() || lastErr;
+		}
+		return { formats: [], lastErr };
+	}
+
+	const runners = attempts.map((attempt) =>
+		runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, { label: attempt.label })
+	);
+
+	return new Promise((resolve) => {
+		let finished = 0;
+		let resolved = false;
+		let bestErr = '';
+
+		const finishAll = (formats: MediaFormat[]) => {
+			if (!resolved) {
+				resolved = true;
+				for (const r of runners) r.kill();
+				resolve({ formats: tagFormats(formats, source), lastErr: bestErr });
+			}
+		};
+
+		for (const r of runners) {
+			r.promise.then((formats) => {
+				if (!resolved && formats.length > 0) {
+					finishAll(formats);
+					return;
+				}
+				bestErr = r.getError() || bestErr;
+				finished++;
+				if (finished === runners.length && !resolved) finishAll([]);
+			});
+		}
+	});
+}
+
+function tagFormats(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
+	return formats.map((f) => ({
+		...f,
+		source: f.source ?? source,
+		kind: f.kind ?? (isManifestFormatUrl(f.url) ? 'manifest' : 'progressive')
+	}));
+}
+
+type YtDlpRunOpts = { allowPlaylist?: boolean; label?: string; extraArgs?: string[] };
 
 function runYtDlpJson(
 	url: string,
 	cookieArgs: string[],
 	timeoutMs: number,
 	opts: YtDlpRunOpts = {}
-): { promise: Promise<MediaFormat[]>; kill: () => void } {
+): { promise: Promise<MediaFormat[]>; kill: () => void; getError: () => string } {
 	let proc: ChildProcess | null = null;
+	let lastErr = '';
 
 	const kill = () => {
 		try {
@@ -244,10 +431,13 @@ function runYtDlpJson(
 		} catch { /* ignore */ }
 	};
 
+	const getError = () => lastErr;
+
 	const promise = new Promise<MediaFormat[]>((resolve) => {
 		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
 		const args = [
 			...cookieArgs,
+			...(opts.extraArgs ?? []),
 			'--no-warnings',
 			'--no-progress',
 			'--socket-timeout', '12',
@@ -263,7 +453,6 @@ function runYtDlpJson(
 		proc = spawn(ytdlpPath, args);
 
 		let output = '';
-		let lastErr = '';
 		let settled = false;
 		const done = (result: MediaFormat[]) => {
 			if (settled) return;
@@ -291,7 +480,7 @@ function runYtDlpJson(
 			if (line.startsWith('ERROR:')) lastErr = line.replace(/^ERROR:\s*/, '');
 		});
 
-		proc.on('close', (code) => {
+		proc.on('close', () => {
 			if (!output.trim()) {
 				done([]);
 				return;
@@ -308,7 +497,7 @@ function runYtDlpJson(
 		proc.on('error', () => done([]));
 	});
 
-	return { promise, kill };
+	return { promise, kill, getError };
 }
 
 function parseYtDlpFormats(output: string): MediaFormat[] {
@@ -372,7 +561,8 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 			label: `${safeTitle} — ${label}`.trim(),
 			url: f.url as string,
 			ext: ext.startsWith('.') ? ext : `.${ext}`,
-			filesize: size
+			filesize: size,
+			kind: inferFormatKind(f.url as string, f.protocol as string | undefined)
 		});
 	}
 
@@ -571,10 +761,10 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
 		return url;
 	}
     const cookieStrategies: string[][] = [
-        [],
-        ['--cookies-from-browser', 'chromium'],
         ['--cookies-from-browser', 'chrome'],
+        ['--cookies-from-browser', 'chromium'],
         ['--cookies-from-browser', 'firefox'],
+        [],
     ];
 
     for (const cookieArgs of cookieStrategies) {

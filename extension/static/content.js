@@ -13,6 +13,37 @@
 	const FILE_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|csv|json|xml|iso)(\?|#|$)/i;
 	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
 	const CDN_IMAGE = /fbcdn\.net|cdninstagram\.com/i;
+	const YT_FEED_CARD =
+		'ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ' +
+		'ytd-compact-video-renderer, ytd-playlist-video-renderer, yt-lockup-view-model';
+
+	function findYoutubeFeedCard(el) {
+		return el?.closest?.(YT_FEED_CARD) || null;
+	}
+
+	function isYoutubeMainPlayerEl(el) {
+		return !!el?.closest?.(
+			'#movie_player, #player-container, #player, ytd-watch-flexy #player, ' +
+			'.html5-video-player, ytd-shorts[disable-persistence]'
+		);
+	}
+
+	/** YouTube reuses one <video> for hover previews — never badge it. */
+	function isYoutubeHoverPreview(el) {
+		if (!el || el.tagName !== 'VIDEO') return false;
+		if (el.closest('ytd-video-preview, ytd-miniplayer, #preview, .video-preview')) return true;
+		if (!/youtube\.com|youtu\.be/i.test(location.hostname)) return false;
+		if (isYoutubeMainPlayerEl(el)) return false;
+		if (findYoutubeFeedCard(el)) return false;
+		return true;
+	}
+
+	function findYoutubeThumbnailInCard(card) {
+		if (!card) return null;
+		return card.querySelector(
+			'a#thumbnail-link[href], a#thumbnail[href], a.ytd-thumbnail[href], ytd-thumbnail a[href]'
+		);
+	}
 
 	/** YouTube uses /watch?v=ID — not /watch/ID. */
 	function canonicalYoutubeUrl(href = location.href) {
@@ -133,6 +164,32 @@
 		return null;
 	}
 
+	/** YouTube homepage/feed preview videos use blob: — resolve to this card's /watch?v= link only. */
+	function findYoutubeWatchUrl(el) {
+		if (!el) return null;
+		const card = findYoutubeFeedCard(el);
+		if (card) {
+			const link = findYoutubeThumbnailInCard(card);
+			if (link) {
+				return canonicalYoutubeUrl(link.getAttribute('href') || link.href);
+			}
+		}
+		if (isYoutubeMainPlayerEl(el)) {
+			return canonicalYoutubeUrl();
+		}
+		if (/^\/shorts\/[^/?#]+/.test(location.pathname)) {
+			return canonicalYoutubeUrl();
+		}
+		let node = el;
+		for (let i = 0; i < 10 && node; i++) {
+			if (node.matches?.('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"]')) {
+				return canonicalYoutubeUrl(node.getAttribute('href') || node.href);
+			}
+			node = node.parentElement;
+		}
+		return null;
+	}
+
 	/**
 	 * Map a raw media URL to something the backend / yt-dlp can fetch.
 	 * Instagram feed cards play video via blob: — the real target is the post link
@@ -143,6 +200,11 @@
 
 		if (isBrowserOnlyUrl(raw)) {
 			if (!VIDEO_SITES.test(location.hostname)) return null;
+			if (/youtube\.com|youtu\.be/i.test(location.hostname) && anchor) {
+				const yt = findYoutubeWatchUrl(anchor);
+				if (yt) return yt;
+				return null;
+			}
 			const post = anchor ? findPostUrl(anchor) : null;
 			if (post) return post;
 			const yt = canonicalYoutubeUrl();
@@ -155,9 +217,10 @@
 
 		if (!isHttpUrl(raw)) return null;
 
-		// YouTube streams via googlevideo.com — badge/yt-dlp target is the watch page.
-		if (/googlevideo\.com/i.test(raw) && /youtube\.com|youtu\.be/i.test(location.hostname)) {
-			const yt = canonicalYoutubeUrl();
+		// YouTube streams via googlevideo.com — map to the card or main player watch URL.
+		if (/googlevideo\.com/i.test(raw) && /youtube\.com|youtu\.be/i.test(location.hostname) && anchor) {
+			const yt = findYoutubeWatchUrl(anchor) ||
+				(isYoutubeMainPlayerEl(anchor) ? canonicalYoutubeUrl() : null);
 			if (yt) return yt;
 		}
 
@@ -173,14 +236,24 @@
 		return raw;
 	}
 
-	/** Canonical key so /p/X/, /p/X, and query variants dedupe to one badge. */
+	/** Canonical cache key — must match backend/background normalizeFormatUrl. */
 	function normalizeBadgeKey(url) {
 		try {
 			const u = new URL(url);
 			u.hash = '';
-			if (/youtube\.com|youtu\.be/i.test(u.hostname)) {
+			const host = u.hostname.toLowerCase();
+			if (host === 'youtu.be') {
+				const id = u.pathname.split('/').filter(Boolean)[0];
+				if (id) return `https://www.youtube.com/watch?v=${id}`;
+			}
+			if (host.includes('youtube.com')) {
 				const canon = canonicalYoutubeUrl(u.href);
 				if (canon) return canon;
+			}
+			if (/instagram\.com/i.test(u.hostname)) {
+				u.search = '';
+				u.pathname = u.pathname.replace(/\/+$/, '');
+				return u.href;
 			}
 			if (VIDEO_SITES.test(u.hostname) && /\/(p|reel|tv)\//.test(u.pathname)) {
 				const path = u.pathname.replace(/\/+$/, '');
@@ -206,6 +279,14 @@
 
 		const semantic = anchor.closest('article, [role="article"], [data-testid="tweet"]');
 		if (semantic) return semantic;
+
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			const card = findYoutubeFeedCard(anchor);
+			if (card) return card;
+			const player = anchor.closest('#movie_player, ytd-player, .html5-video-player, ytd-shorts');
+			if (player) return player;
+			return anchor;
+		}
 
 		if (VIDEO_SITES.test(location.hostname)) {
 			let node = anchor;
@@ -361,7 +442,8 @@
 	// returns, and chrome.downloads.onCreated would create a second copy.
 	let coordinatorOnline = false;
 	/** Only the active tab in the focused window may show badges or prefetch. */
-	let isForegroundTab = false;
+	let isForegroundTab = !document.hidden;
+	let suspendTimer = null;
 
 	function captureActive() {
 		return isForegroundTab && !document.hidden;
@@ -389,11 +471,12 @@
 
 	function syncForegroundState(active) {
 		const was = isForegroundTab;
-		isForegroundTab = active === true;
-		if (!isForegroundTab) {
-			suspendCapture();
-			ensureForegroundPolling();
-		} else {
+		if (suspendTimer) {
+			clearTimeout(suspendTimer);
+			suspendTimer = null;
+		}
+		if (active === true) {
+			isForegroundTab = true;
 			if (ensureForegroundPolling.timer) {
 				clearInterval(ensureForegroundPolling.timer);
 				ensureForegroundPolling.timer = null;
@@ -401,7 +484,16 @@
 			if (!was || document.visibilityState === 'visible') {
 				resumeCapture();
 			}
+			return;
 		}
+		// Debounce suspend — SW can report false once before foregroundTabId is ready.
+		suspendTimer = setTimeout(() => {
+			suspendTimer = null;
+			if (document.hidden) return;
+			isForegroundTab = false;
+			suspendCapture();
+			ensureForegroundPolling();
+		}, 450);
 	}
 
 	function queryForegroundState() {
@@ -525,10 +617,11 @@
 		return /\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
 	}
 
-	function isMainYoutubePlayer(el) {
+	function shouldBadgeYoutubeElement(el) {
 		if (!/youtube\.com/i.test(location.hostname)) return true;
+		if (el.tagName === 'VIDEO' && isYoutubeHoverPreview(el)) return false;
 		if (!isYoutubeWatchPage()) return true;
-		return !!el.closest('#movie_player, #player, ytd-player, .html5-video-player, ytd-shorts');
+		return isYoutubeMainPlayerEl(el) || !!findYoutubeFeedCard(el);
 	}
 
 	/** Primary modal player — largest visible video dialog (main reel, not DM sidebar). */
@@ -675,13 +768,23 @@
 		const vis = mediaVisibleRect(el);
 		if (!vis || vis.width < 48 || vis.height < 48) return false;
 
-		// Dedicated watch/reel pages: skip hit-test (players stack UI over the video).
-		if (isDedicatedMediaPage() && !overlay) return true;
+		// Dedicated watch/reel pages: main player only — sidebar tiles use feed rules below.
+		if (isDedicatedMediaPage() && !overlay) {
+			if (isYoutubeWatchPage() && findYoutubeFeedCard(el) && !isYoutubeMainPlayerEl(el)) {
+				if (!isNearViewport(el, 0)) return false;
+				const vis = mediaVisibleRect(el);
+				return !!(vis && vis.width >= 64 && vis.height >= 64);
+			}
+			return true;
+		}
 
 		// Modal player: visible in-viewport video inside the dialog counts as foreground.
 		if (overlay && overlay.contains(el)) return true;
 
-		// Feed tiles: sample a few points — center is often covered by controls/overlays.
+		// Feed tiles: hit-test when possible; fall back to visible size (IG/TikTok overlays block center).
+		if (isSocialFeedPage()) {
+			return vis.width >= 64 && vis.height >= 64;
+		}
 		const points = [
 			[vis.left + vis.width * 0.5, vis.top + vis.height * 0.38],
 			[vis.left + vis.width * 0.82, vis.top + vis.height * 0.18],
@@ -727,12 +830,22 @@
 		prefetchPageUrls([{ url, priority: true }]);
 	}
 
+	function shouldPrefetchUrl(url) {
+		try {
+			const h = new URL(url).hostname;
+			// Instagram feed prefetch rarely succeeds without cookies and blocks the queue for ~20s each.
+			if (/instagram\.com/i.test(h)) return false;
+		} catch { /* ignore */ }
+		return true;
+	}
+
 	/** Queue format fetch — skips when tab hidden; caps batch size. */
 	function prefetchPageUrls(entries) {
 		if (!captureActive() || document.hidden) return;
 		const sorted = [...entries].sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
 		const batch = [];
 		for (const { url, priority } of sorted) {
+			if (!shouldPrefetchUrl(url)) continue;
 			const key = normalizeBadgeKey(url);
 			if (localFormatCache.has(key) || prefetchStarted.has(key)) continue;
 			if (batch.length >= MAX_PREFETCH_BATCH) break;
@@ -1001,7 +1114,7 @@
 				}
 			}
 			if (msg.type === 'VELOCE_FORMATS_FAILED' && msg.url) {
-				// Keep prefetchStarted set — background fail cache prevents re-queue for 5 min.
+				prefetchStarted.delete(normalizeBadgeKey(msg.url));
 			}
 		});
 	}
@@ -1123,7 +1236,7 @@
 		if (!isElementForeground(anchor)) return;
 
 		const el = document.createElement('div');
-		el.className = 'badge badge-loading';
+		el.className = 'badge badge-ready';
 		el.appendChild(iconSvg());
 		const label = document.createElement('span');
 		label.textContent = 'Veloce';
@@ -1141,7 +1254,7 @@
 
 		if (localFormatCache.has(badgeKey)) {
 			markBadgeReady(badgeKey);
-		} else if (startPrefetch) {
+		} else if (startPrefetch && shouldPrefetchUrl(resolvedUrl)) {
 			prefetchPageUrls([{ url: resolvedUrl }]);
 		}
 
@@ -1226,6 +1339,12 @@
 		setTimeout(() => t.remove(), isError ? 6000 : 3500);
 	}
 
+	function isManifestFormat(fmt) {
+		return fmt.kind === 'manifest' ||
+			/\.m3u8(\?|$)/i.test(fmt.url || '') ||
+			/\.mpd(\?|$)/i.test(fmt.url || '');
+	}
+
 	function renderFormatButtons(menu, closeBtn, formats, url) {
 		for (const fmt of formats) {
 			const btn = document.createElement('button');
@@ -1238,10 +1357,11 @@
 				const fileName = `${stem}${fmt.ext || '.mp4'}`.replace(/[\\/:*?"<>|]/g, '_');
 				const pageUrl = location.href.split('#')[0];
 				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
+				const manifest = isManifestFormat(fmt);
 				chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
 					const payload = {
 						url: sourceUrl,
-						directUrl: fmt.url,
+						directUrl: manifest ? undefined : fmt.url,
 						pageUrl,
 						referer: pageUrl,
 						fileName,
@@ -1327,7 +1447,7 @@
 		pendingMenuUrl = badgeKey;
 		eagerPrefetch(url);
 
-		chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url }, (resp) => {
+		chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
 			if (busyPort) {
 				try { busyPort.disconnect(); } catch { /* ignore */ }
 				busyPort = null;
@@ -1357,6 +1477,9 @@
 			const href = a.href;
 			if (!href || href.startsWith('javascript:') || !isHttpUrl(href)) return false;
 			if (CDN_IMAGE.test(href) && /\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(href)) return false;
+			if (/youtube\.com|youtu\.be/i.test(location.hostname) && canonicalYoutubeUrl(href)) {
+				return !!findYoutubeFeedCard(a);
+			}
 			// Feed pages: video nodes resolve the same post URL — skip link observers.
 			if (VIDEO_SITES.test(location.hostname) && /\/(p|reel|tv)\//.test(href)) {
 				return !isSocialFeedPage();
@@ -1367,28 +1490,68 @@
 		}
 	}
 
+	function resetScanStateDeep(root) {
+		function walk(node) {
+			if (!node || node.nodeType !== 1) return;
+			if (node.hasAttribute?.(WATCH_ATTR) || node.hasAttribute?.(SCANNED_ATTR)) {
+				try { mediaIo.unobserve(node); } catch { /* ignore */ }
+				node.removeAttribute(WATCH_ATTR);
+				node.removeAttribute(SCANNED_ATTR);
+			}
+			for (const child of node.children || []) walk(child);
+			if (node.shadowRoot) walk(node.shadowRoot);
+		}
+		if (root?.nodeType === 1) walk(root);
+	}
+
+	function resetYoutubeCapture() {
+		closeMenu();
+		for (const key of [...badgeKeys]) removeBadge(key);
+		resetScanStateDeep(document.documentElement);
+	}
+
 	/** Show badge when near viewport; prefetch only when close enough to likely click. */
 	function processMediaElement(el) {
 		if (!captureActive() || !el || el.getAttribute(SCANNED_ATTR)) return null;
-		if (!isMainYoutubePlayer(el)) return null;
+		if (!shouldBadgeYoutubeElement(el)) return null;
 
 		const tag = el.tagName;
+		let anchor = el;
+
+		// Pin badge to the stable thumbnail link — not YouTube's shared hover-preview <video>.
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			const card = findYoutubeFeedCard(el);
+			if (card) {
+				const thumb = findYoutubeThumbnailInCard(card);
+				if (thumb) anchor = thumb;
+			}
+		}
+
 		let rawUrl = tag === 'A' ? el.href : (el.currentSrc || el.src || '');
-		let url = rawUrl ? resolveDownloadUrl(rawUrl, el) : null;
+		let url = rawUrl ? resolveDownloadUrl(rawUrl, anchor) : null;
+
+		if (!url && tag === 'A' && /youtube\.com|youtu\.be/i.test(location.hostname)) {
+			url = canonicalYoutubeUrl(el.href);
+		}
 
 		// YouTube MSE/blob player often has no src until playback — use the watch URL.
 		if (!url && (tag === 'VIDEO' || tag === 'AUDIO')) {
-			url = canonicalYoutubeUrl() || (isDedicatedMediaPage() ? location.href.split('#')[0] : null);
+			if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+				url = findYoutubeWatchUrl(anchor);
+			} else {
+				url = canonicalYoutubeUrl() || (isDedicatedMediaPage() ? location.href.split('#')[0] : null);
+			}
 			rawUrl = rawUrl || url || '';
 		}
 		if (!url) return null;
 
 		const overlay = findMediaOverlay();
-		if (overlay && !overlay.contains(el)) return null;
-		el.setAttribute(SCANNED_ATTR, '1');
+		if (overlay && !overlay.contains(el) && !overlay.contains(anchor)) return null;
+		anchor.setAttribute(SCANNED_ATTR, '1');
+		if (el !== anchor) el.setAttribute(SCANNED_ATTR, '1');
 		try { mediaIo.unobserve(el); } catch { /* ignore */ }
-		const startPrefetch = isNearViewport(el, PREFETCH_MARGIN_PX);
-		placeBadge(url, el, rawUrl || url, startPrefetch);
+		const startPrefetch = isNearViewport(anchor, PREFETCH_MARGIN_PX);
+		placeBadge(url, anchor, rawUrl || url, startPrefetch);
 		return url;
 	}
 
@@ -1408,10 +1571,30 @@
 		if (isNearViewport(el, BADGE_MARGIN_PX)) processMediaElement(el);
 	}
 
+	function queryMediaElementsDeep(root) {
+		const out = [];
+		const seen = new WeakSet();
+		function walk(node) {
+			if (!node || node.nodeType !== 1 || seen.has(node)) return;
+			seen.add(node);
+			if (node.matches?.('video, audio, a[href]') && !node.getAttribute?.(WATCH_ATTR)) {
+				out.push(node);
+			}
+			for (const child of node.children || []) walk(child);
+			if (node.shadowRoot) walk(node.shadowRoot);
+		}
+		if (root?.nodeType === 1) walk(root);
+		return out;
+	}
+
 	function scanSubtree(root) {
-		if (!captureActive() || !root?.querySelectorAll) return;
+		if (!captureActive() || !root) return;
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			for (const el of queryMediaElementsDeep(root)) watchElement(el);
+			return;
+		}
 		if (root.nodeType === 1) watchElement(root);
-		root.querySelectorAll(
+		root.querySelectorAll?.(
 			'a[href]:not([data-veloce-watch]), video:not([data-veloce-watch]), audio:not([data-veloce-watch])'
 		).forEach(watchElement);
 	}
@@ -1427,16 +1610,42 @@
 		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
 	);
 
+	function scanYoutubeFeedCards() {
+		const cards = [];
+		function walk(node) {
+			if (!node || node.nodeType !== 1) return;
+			if (node.matches?.(YT_FEED_CARD)) cards.push(node);
+			for (const child of node.children || []) walk(child);
+			if (node.shadowRoot) walk(node.shadowRoot);
+		}
+		walk(document.documentElement);
+		for (const card of cards) {
+			if (watchBudget <= 0) break;
+			const thumb = findYoutubeThumbnailInCard(card);
+			if (thumb) watchElement(thumb);
+		}
+	}
+
 	function scan() {
 		if (!captureActive()) return;
 		pruneBadges();
 		watchBudget = 80;
-		// YouTube: scan the main player first (single primary video).
-		if (isYoutubeWatchPage()) {
-			const player = document.querySelector('#movie_player video, ytd-player video, #player video');
-			if (player) watchElement(player);
+		// YouTube: scan the main player first (watch page, Shorts viewer, embedded player).
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			watchBudget = 200;
+			for (const sel of [
+				'#movie_player video',
+				'ytd-watch-flexy #player video',
+				'#player video',
+				'ytd-shorts video',
+				'video.html5-main-video'
+			]) {
+				const player = document.querySelector(sel);
+				if (player) watchElement(player);
+			}
+			scanYoutubeFeedCards();
 		}
-		scanSubtree(document);
+		scanSubtree(document.documentElement);
 	}
 
 	document.addEventListener('click', (e) => {
@@ -1531,12 +1740,20 @@
 			}
 			if (overlay) scanSubtree(overlay);
 			scheduleBadgeLayout();
-		}, 600);
+		}, 200);
 	}
 
 	// Re-scan when SPA navigates or a modal player opens/closes.
 	window.addEventListener('popstate', () => {
 		cullBackgroundBadges();
+		if (captureActive()) scan();
+	});
+	window.addEventListener('yt-navigate-finish', () => {
+		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			resetYoutubeCapture();
+		} else {
+			cullBackgroundBadges();
+		}
 		if (captureActive()) scan();
 	});
 	setInterval(() => {
@@ -1545,11 +1762,27 @@
 		scheduleBadgeLayout();
 	}, 800);
 
+	document.addEventListener('visibilitychange', () => {
+		if (document.hidden) {
+			if (suspendTimer) {
+				clearTimeout(suspendTimer);
+				suspendTimer = null;
+			}
+			isForegroundTab = false;
+			suspendCapture();
+		} else {
+			isForegroundTab = true;
+			queryForegroundState();
+			connectTabPort();
+			startTabPing();
+			scan();
+		}
+	});
 	queryForegroundState();
-	setTimeout(queryForegroundState, 400);
-	setTimeout(queryForegroundState, 1500);
+	setTimeout(queryForegroundState, 200);
 	connectTabPort();
 	startTabPing();
+	if (!document.hidden) scan();
 	const observer = new MutationObserver((mutations) => {
 		if (!captureActive()) return;
 		pendingMutations.push(...mutations);

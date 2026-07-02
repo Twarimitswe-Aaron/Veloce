@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isDirectFileUrl, isExtractorDomain } from '../src/lib/server/extractor';
+import { isDirectFileUrl, isExtractorDomain, normalizeFormatUrl } from '../src/lib/server/extractor';
 
 describe('isDirectFileUrl', () => {
 	it('detects direct media/file links by extension', () => {
@@ -18,6 +18,23 @@ describe('isDirectFileUrl', () => {
 		expect(isDirectFileUrl('https://www.mediafire.com/file/key/name')).toBe(false);
 		expect(isDirectFileUrl('ftp://host/file.mp4')).toBe(false);
 		expect(isDirectFileUrl('not a url')).toBe(false);
+	});
+});
+
+describe('normalizeFormatUrl', () => {
+	it('canonicalizes YouTube watch URLs', () => {
+		expect(normalizeFormatUrl('https://www.youtube.com/watch?v=abc123&list=PLx')).toBe(
+			'https://www.youtube.com/watch?v=abc123'
+		);
+		expect(normalizeFormatUrl('https://youtu.be/abc123')).toBe(
+			'https://www.youtube.com/watch?v=abc123'
+		);
+	});
+
+	it('canonicalizes Instagram post URLs', () => {
+		expect(normalizeFormatUrl('https://www.instagram.com/reel/AbCd/?igsh=1')).toBe(
+			'https://www.instagram.com/reel/AbCd'
+		);
 	});
 });
 

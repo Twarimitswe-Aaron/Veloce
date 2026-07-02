@@ -21,8 +21,9 @@ const NOTIF_ICON = 'icons/icon-128.png';
 
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const FORMAT_FAIL_TTL_MS = 5 * 60 * 1000;
-const formatCache = new Map(); // url -> { formats, ts }
-const formatFailCache = new Map(); // url -> { ts }
+const PREFETCH_FAIL_TTL_MS = 45 * 1000;
+const formatCache = new Map(); // normalized url -> { formats, ts }
+const formatFailCache = new Map(); // normalized url -> { ts, prefetch?: boolean }
 const inflightFormatUrls = new Set();
 const prefetchQueue = [];
 const prefetchQueued = new Set();
@@ -78,31 +79,73 @@ async function ensureOffscreenDocument() {
 	}
 }
 
+/** Match backend normalizeFormatUrl — one cache entry per video/post. */
+function normalizeFormatUrl(url) {
+	try {
+		const u = new URL(url);
+		u.hash = '';
+		const host = u.hostname.toLowerCase();
+		if (host === 'youtu.be') {
+			const id = u.pathname.split('/').filter(Boolean)[0];
+			if (id) return `https://www.youtube.com/watch?v=${id}`;
+		}
+		if (host.includes('youtube.com')) {
+			if (u.pathname.startsWith('/shorts/')) {
+				const id = u.pathname.split('/').filter(Boolean)[1];
+				if (id) return `https://www.youtube.com/shorts/${id}`;
+			}
+			if (u.pathname === '/watch') {
+				const v = u.searchParams.get('v');
+				if (v) return `https://www.youtube.com/watch?v=${v}`;
+			}
+		}
+		if (/instagram\.com/i.test(u.hostname)) {
+			u.search = '';
+			u.pathname = u.pathname.replace(/\/+$/, '');
+		}
+		return u.href;
+	} catch {
+		return url;
+	}
+}
+
 function getFormatCache(url) {
-	const hit = formatCache.get(url);
+	const key = normalizeFormatUrl(url);
+	const hit = formatCache.get(key);
 	if (hit && Date.now() - hit.ts < FORMAT_CACHE_TTL_MS) return hit.formats;
 	return null;
 }
 
 function isFormatFailed(url) {
-	const hit = formatFailCache.get(url);
-	return hit && Date.now() - hit.ts < FORMAT_FAIL_TTL_MS;
+	const key = normalizeFormatUrl(url);
+	const hit = formatFailCache.get(key);
+	if (!hit) return false;
+	const ttl = hit.prefetch ? PREFETCH_FAIL_TTL_MS : FORMAT_FAIL_TTL_MS;
+	return Date.now() - hit.ts < ttl;
 }
 
-function setFormatFail(url) {
-	if (url) formatFailCache.set(url, { ts: Date.now() });
+function setFormatFail(url, prefetch = false) {
+	const key = normalizeFormatUrl(url);
+	if (!key) return;
+	formatFailCache.set(key, { ts: Date.now(), prefetch });
+}
+
+function clearFormatFail(url) {
+	formatFailCache.delete(normalizeFormatUrl(url));
 }
 
 function setFormatCache(url, formats) {
+	const key = normalizeFormatUrl(url);
 	if (formats?.length) {
-		formatCache.set(url, { formats, ts: Date.now() });
-		broadcastToExtension({ type: 'VELOCE_FORMATS_READY', url, formats });
+		formatCache.set(key, { formats, ts: Date.now() });
+		clearFormatFail(key);
+		broadcastToExtension({ type: 'VELOCE_FORMATS_READY', url: key, formats });
 	}
 }
 
-function notifyFormatFailed(url) {
-	setFormatFail(url);
-	broadcastToExtension({ type: 'VELOCE_FORMATS_FAILED', url });
+function notifyFormatFailed(url, prefetch = false) {
+	setFormatFail(url, prefetch);
+	broadcastToExtension({ type: 'VELOCE_FORMATS_FAILED', url: normalizeFormatUrl(url), prefetch });
 }
 
 function isForegroundTab(tabId) {
@@ -143,18 +186,19 @@ function drainPrefetchQueue() {
 		void requestFormatsFromCoordinator(url, (data) => {
 			prefetchRunning--;
 			if (data.formats?.length) setFormatCache(url, data.formats);
-			else notifyFormatFailed(url);
+			else notifyFormatFailed(url, true);
 			drainPrefetchQueue();
-		});
+		}, true);
 	}
 }
 
 function enqueuePrefetch(url, front = false) {
-	if (!url || getFormatCache(url) || isFormatFailed(url) || inflightFormatUrls.has(url) || prefetchQueued.has(url)) return;
+	const key = normalizeFormatUrl(url);
+	if (!key || getFormatCache(key) || isFormatFailed(key) || inflightFormatUrls.has(key) || prefetchQueued.has(key)) return;
 	if (!front && prefetchQueue.length >= PREFETCH_QUEUE_MAX) return;
-	prefetchQueued.add(url);
-	if (front) prefetchQueue.unshift(url);
-	else prefetchQueue.push(url);
+	prefetchQueued.add(key);
+	if (front) prefetchQueue.unshift(key);
+	else prefetchQueue.push(key);
 	drainPrefetchQueue();
 }
 
@@ -173,15 +217,16 @@ function prefetchBatch(urls) {
 }
 
 async function waitForInflightFormats(url, maxMs = 25000) {
-	if (!inflightFormatUrls.has(url)) return getFormatCache(url);
+	const key = normalizeFormatUrl(url);
+	if (!inflightFormatUrls.has(key)) return getFormatCache(key);
 	const start = Date.now();
 	while (Date.now() - start < maxMs) {
-		const hit = getFormatCache(url);
+		const hit = getFormatCache(key);
 		if (hit?.length) return hit;
-		if (!inflightFormatUrls.has(url)) break;
+		if (!inflightFormatUrls.has(key)) break;
 		await new Promise((r) => setTimeout(r, 200));
 	}
-	return getFormatCache(url);
+	return getFormatCache(key);
 }
 
 function broadcastToExtension(msg) {
@@ -298,7 +343,7 @@ function handleWsMessage(data) {
 				if (data.type === 'FORMATS_LIST' && pending.url && data.formats?.length) {
 					setFormatCache(pending.url, data.formats);
 				} else if (pending.url && (data.type === 'FORMATS_ERROR' || !data.formats?.length)) {
-					setFormatFail(pending.url);
+					setFormatFail(pending.url, pending.prefetch === true);
 				}
 				pending.sendResponse(data);
 			}
@@ -554,7 +599,8 @@ async function startDownload(payload, tabId) {
 	return true;
 }
 
-async function requestFormatsFromCoordinator(url, sendResponse) {
+async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false, force = false) {
+	const key = normalizeFormatUrl(url);
 	const ok = await ensureConnected(2500);
 	if (!ok) {
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
@@ -562,44 +608,53 @@ async function requestFormatsFromCoordinator(url, sendResponse) {
 	}
 
 	const requestId = crypto.randomUUID();
-	inflightFormatUrls.add(url);
-	pendingFormatRequests.set(requestId, { sendResponse, url });
-	const sent = await wsSendAsync({ type: 'LIST_FORMATS', requestId, payload: { url } });
+	inflightFormatUrls.add(key);
+	pendingFormatRequests.set(requestId, { sendResponse, url: key, prefetch });
+	const sent = await wsSendAsync({
+		type: 'LIST_FORMATS',
+		requestId,
+		payload: { url: key, force: force === true }
+	});
 	if (!sent) {
-		inflightFormatUrls.delete(url);
+		inflightFormatUrls.delete(key);
 		pendingFormatRequests.delete(requestId);
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
 		return;
 	}
 	setTimeout(() => {
 		if (pendingFormatRequests.has(requestId)) {
-			inflightFormatUrls.delete(url);
+			inflightFormatUrls.delete(key);
 			pendingFormatRequests.delete(requestId);
 			sendResponse({ type: 'FORMATS_ERROR', error: 'Format list timed out' });
 		}
 	}, 50000);
 }
 
-async function listFormats(url, sendResponse, sender) {
-	let cached = getFormatCache(url);
+async function listFormats(url, sendResponse, sender, force = false) {
+	const key = normalizeFormatUrl(url);
+	if (force) clearFormatFail(key);
+
+	let cached = getFormatCache(key);
 	if (!cached?.length) {
-		cached = await waitForInflightFormats(url);
+		cached = await waitForInflightFormats(key);
 	}
 	if (cached?.length) {
 		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
 		return;
 	}
 
-	// User click — jump the queue for this URL.
-	enqueuePrefetch(url, true);
-	await waitForInflightFormats(url);
-	cached = getFormatCache(url);
-	if (cached?.length) {
-		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
-		return;
+	// User click — jump the queue; never block on a prefetch-only fail.
+	if (!force) {
+		enqueuePrefetch(key, true);
+		await waitForInflightFormats(key);
+		cached = getFormatCache(key);
+		if (cached?.length) {
+			sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
+			return;
+		}
 	}
 
-	await requestFormatsFromCoordinator(url, sendResponse);
+	await requestFormatsFromCoordinator(key, sendResponse, false, force);
 }
 
 function scheduleKeepaliveAlarm() {
@@ -967,7 +1022,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 			return true;
 
 		case 'VELOCE_LIST_FORMATS':
-			listFormats(msg.url, sendResponse, _sender);
+			listFormats(msg.url, sendResponse, _sender, msg.force === true);
 			return true;
 
 		case 'VELOCE_PREFETCH_FORMATS':
@@ -981,8 +1036,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 			return false;
 
 		case 'VELOCE_AM_I_FOREGROUND':
-			sendResponse({ active: isForegroundTab(_sender.tab?.id) });
-			return false;
+			(async () => {
+				if (foregroundTabId == null) await refreshForegroundTab();
+				sendResponse({ active: isForegroundTab(_sender.tab?.id) });
+			})();
+			return true;
 
 		case 'VELOCE_WARMUP':
 			connectWs();
@@ -1105,12 +1163,16 @@ chrome.runtime.onConnect.addListener((port) => {
 
 	// Tell this tab whether it is the foreground capture target.
 	if (port.name === 'veloce-tab' && port.sender?.tab?.id != null) {
-		try {
-			port.postMessage({
-				type: 'VELOCE_FOREGROUND_STATE',
-				active: isForegroundTab(port.sender.tab.id)
-			});
-		} catch { /* ignore */ }
+		const tabId = port.sender.tab.id;
+		void (async () => {
+			if (foregroundTabId == null) await refreshForegroundTab();
+			try {
+				port.postMessage({
+					type: 'VELOCE_FOREGROUND_STATE',
+					active: isForegroundTab(tabId)
+				});
+			} catch { /* ignore */ }
+		})();
 	}
 
 	port.onDisconnect.addListener(() => {

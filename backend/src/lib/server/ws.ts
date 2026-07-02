@@ -11,7 +11,7 @@ import { statfs, unlink, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import { extractMediaUrl, listFormats, listPlaylistEntries, getRecentFormatError, isDirectFileUrl } from './extractor';
+import { extractMediaUrl, listFormats, listPlaylistEntries, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl } from './extractor';
 import { config } from './config';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from './util';
 
@@ -341,8 +341,18 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	try {
 		let finalUrl = spec.directUrl || spec.pageUrl;
 
-		// MediaFire CDN tokens expire — always resolve a fresh download URL.
-		if (finalUrl.includes('mediafire.com')) {
+		// HLS/DASH manifest URLs cannot be fetched by the Rust engine — resolve via yt-dlp on the page URL.
+		if (spec.directUrl && isManifestFormatUrl(spec.directUrl)) {
+			const extracted = await extractMediaUrl(spec.pageUrl);
+			if (!extracted) {
+				await markError(
+					id,
+					'Stream manifest format — yt-dlp could not resolve a direct file. Open the video page in Chrome, then retry from the Veloce badge.'
+				);
+				return;
+			}
+			finalUrl = extracted;
+		} else if (finalUrl.includes('mediafire.com')) {
 			const fresh = await extractMediaUrl(finalUrl);
 			if (!fresh) {
 				console.error(`❌ Mediafire link expired or unavailable: ${finalUrl}`);
@@ -934,7 +944,7 @@ export function setupWebSocketServer(server: Server) {
 						return;
 					}
 					try {
-						const formats = await listFormats(pageUrl);
+						const formats = await listFormats(pageUrl, { force: data.payload?.force === true });
 						if (!formats.length) {
 							const hint = getRecentFormatError(pageUrl);
 							ws.send(JSON.stringify({
