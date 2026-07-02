@@ -29,6 +29,9 @@
 	let sDefaultThreads = $state(8);
 	let sMaxRateMB = $state(0);
 	let sEngineQuiet = $state(true);
+	let plMediaType = $state<'audio' | 'video'>('audio');
+	let plVideoQuality = $state<'1080' | '720' | '480' | '360' | 'best'>('720');
+	let plAudioFallback = $state<'video' | 'skip'>('video');
 
 	let ws: WebSocket | null = null;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,6 +62,11 @@
 					sMaxRateMB = Math.round((data.settings.maxRateBytes / 1048576) * 10) / 10;
 					sEngineQuiet = data.settings.engineQuiet;
 					if (data.settings.baseDirectory) baseDir = data.settings.baseDirectory;
+					if (data.settings.playlistFormats) {
+						plMediaType = data.settings.playlistFormats.mediaType;
+						plVideoQuality = data.settings.playlistFormats.videoQuality;
+						plAudioFallback = data.settings.playlistFormats.audioMissingFallback;
+					}
 				}
 				break;
 			case 'DOWNLOAD_SNAPSHOT':
@@ -90,6 +98,33 @@
 			case 'DOWNLOAD_REMOVED': {
 				const next = { ...items };
 				delete next[data.downloadId];
+				items = next;
+				break;
+			}
+			case 'PLAYLIST_QUEUED':
+				if (data.playlistId) {
+					upsert(data.playlistId, {
+						fileName: `${data.title || 'Playlist'} (0/${data.total} tracks)`,
+						status: 'queued'
+					});
+				}
+				break;
+			case 'PLAYLIST_UPDATE':
+				if (data.playlistId) {
+					upsert(data.playlistId, {
+						fileName: data.fileName || 'Playlist',
+						status: data.status === 'cancelled' ? 'error' : (data.status || 'downloading'),
+						downloaded: data.downloaded ?? 0,
+						total: data.totalBytes ?? 0,
+						speedBps: data.speedBps ?? 0,
+						etaSecs: data.etaSecs ?? 0,
+						error: data.error
+					});
+				}
+				break;
+			case 'PLAYLIST_REMOVED': {
+				const next = { ...items };
+				delete next[data.playlistId];
 				items = next;
 				break;
 			}
@@ -130,7 +165,12 @@
 			maxConcurrentDownloads: sMaxConcurrent,
 			defaultThreads: sDefaultThreads,
 			maxRateBytes: Math.round(sMaxRateMB * 1048576),
-			engineQuiet: sEngineQuiet
+			engineQuiet: sEngineQuiet,
+			playlistFormats: {
+				mediaType: plMediaType,
+				videoQuality: plVideoQuality,
+				audioMissingFallback: plAudioFallback
+			}
 		}});
 	}
 
@@ -161,7 +201,7 @@
 		<h2>New download</h2>
 		<input placeholder="https://…" bind:value={url} />
 		<input placeholder="Filename (optional)" bind:value={fileName} />
-		<label class="chk"><input type="checkbox" bind:checked={asPlaylist} /> Treat URL as a playlist</label>
+		<label class="chk"><input type="checkbox" bind:checked={asPlaylist} /> Treat URL as a playlist (one job, uses settings below)</label>
 		<button class="primary" disabled={!connected || !url} onclick={startDownload}>Download</button>
 		<p class="hint">Saving to <code>{baseDir || '~/Downloads/Veloce'}</code></p>
 	</section>
@@ -173,6 +213,30 @@
 			<label>Default connections<input type="number" min="1" max="64" bind:value={sDefaultThreads} /></label>
 			<label>Speed cap (MB/s, 0 = ∞)<input type="number" min="0" step="0.1" bind:value={sMaxRateMB} /></label>
 			<label class="chk"><input type="checkbox" bind:checked={sEngineQuiet} /> Quiet engine</label>
+		</div>
+		<div class="playlist-settings">
+			<h3>Playlist downloads</h3>
+			<label>Media type
+				<select bind:value={plMediaType}>
+					<option value="audio">Audio only (preferred)</option>
+					<option value="video">Video with audio</option>
+				</select>
+			</label>
+			<label>Video quality (when video or fallback)
+				<select bind:value={plVideoQuality}>
+					<option value="1080">1080p (step down if missing)</option>
+					<option value="720">720p (step down if missing)</option>
+					<option value="480">480p (step down if missing)</option>
+					<option value="360">360p</option>
+					<option value="best">Best available</option>
+				</select>
+			</label>
+			<label>If audio-only and no audio stream
+				<select bind:value={plAudioFallback}>
+					<option value="video">Download video at quality above</option>
+					<option value="skip">Skip track</option>
+				</select>
+			</label>
 		</div>
 		<button class="primary" disabled={!connected} onclick={saveSettings}>Save settings</button>
 	</section>
@@ -237,6 +301,10 @@
 	}
 	.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-bottom: 12px; }
 	.grid label { display: flex; flex-direction: column; font-size: 11px; opacity: 0.7; gap: 4px; }
+	.playlist-settings { border-top: 1px solid rgba(255,255,255,0.15); margin: 12px 0; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+	.playlist-settings h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.6; margin: 0; font-weight: normal; }
+	.playlist-settings label { display: flex; flex-direction: column; font-size: 11px; opacity: 0.75; gap: 4px; }
+	.playlist-settings select { background: #001028; border: 1px solid rgba(255,255,255,0.3); color: #fff; padding: 8px 10px; font-size: 13px; }
 	.chk { display: flex; align-items: center; gap: 8px; font-size: 13px; opacity: 0.85; margin-bottom: 10px; }
 	.chk input { width: auto; margin: 0; }
 	button { background: transparent; border: 1px solid rgba(255,255,255,0.25); color: #fff; padding: 4px 10px; font-size: 12px; cursor: pointer; }

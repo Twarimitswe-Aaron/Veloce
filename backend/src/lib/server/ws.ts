@@ -29,7 +29,7 @@ import {
 	type PlaylistRuntime
 } from './playlistRunner';
 import { config } from './config';
-import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from './util';
+import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
@@ -161,10 +161,6 @@ function isAllowedOrigin(origin?: string): boolean {
 }
 
 // ── Filesystem / disk helpers ────────────────────────────────────────────────
-
-function completedFileStillExists(savePath: string): boolean {
-	return existsSync(`${savePath}.veloce_done`) || existsSync(savePath);
-}
 
 /**
  * Avoid silently overwriting an unrelated existing file: if `savePath` is taken
@@ -860,6 +856,14 @@ export function setupWebSocketServer(server: Server) {
 			if (ws.readyState === 1 && snapshot.length > 0) {
 				ws.send(JSON.stringify({ type: 'DOWNLOAD_SNAPSHOT', downloads: snapshot }));
 			}
+			for (const pl of playlists) {
+				if (['queued', 'downloading'].includes(pl.status) && !isActivePlaylistJob(pl.id)) {
+					if (pl.status === 'downloading') {
+						await db.update(playlistJobs).set({ status: 'queued' }).where(eq(playlistJobs.id, pl.id));
+					}
+					schedulePlaylistJob(pl.id, playlistRuntimeFromSettings(), broadcast);
+				}
+			}
 		} catch (err) {
 			console.error('Failed to send download snapshot:', err);
 		}
@@ -943,6 +947,7 @@ export function setupWebSocketServer(server: Server) {
 							baseDir,
 							threads,
 							formatSettings: runtime.playlistFormats,
+							runtime: playlistRuntimeFromSettings(),
 							broadcast
 						});
 						if (!result.ok) {
@@ -1019,7 +1024,7 @@ export function setupWebSocketServer(server: Server) {
 					}
 				} else if (data.type === 'RESUME_DOWNLOAD') {
 					const pl = await getPlaylistJob(data.downloadId);
-					if (pl && ['paused', 'queued', 'error'].includes(pl.status) && !isActivePlaylistJob(pl.id)) {
+					if (pl && pl.status === 'paused' && !isActivePlaylistJob(pl.id)) {
 						await resumePlaylistJob(pl.id, playlistRuntimeFromSettings(), broadcast);
 						return;
 					}
@@ -1048,6 +1053,12 @@ export function setupWebSocketServer(server: Server) {
 						broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: data.downloadId });
 					}
 				} else if (data.type === 'REMOVE_DOWNLOAD') {
+					const pl = await getPlaylistJob(data.downloadId);
+					if (pl && !isActivePlaylistJob(pl.id)) {
+						await db.delete(playlistJobs).where(eq(playlistJobs.id, pl.id));
+						broadcast({ type: 'PLAYLIST_REMOVED', playlistId: pl.id });
+						return;
+					}
 					// Remove from history only (keeps any completed file on disk).
 					if (!running.has(data.downloadId)) {
 						await db.delete(downloads).where(eq(downloads.id, data.downloadId));
@@ -1068,6 +1079,12 @@ export function setupWebSocketServer(server: Server) {
 						}));
 					}
 				} else if (data.type === 'OPEN_FILE' || data.type === 'REVEAL_FILE') {
+					const pl = await getPlaylistJob(data.downloadId);
+					if (pl?.saveDir && existsSync(pl.saveDir)) {
+						if (data.type === 'OPEN_FILE') xdgOpen(pl.saveDir);
+						else revealInFileManager(pl.saveDir);
+						return;
+					}
 					const row = (await db.select().from(downloads).where(eq(downloads.id, data.downloadId)))[0];
 					if (!row) return;
 					if (!existsSync(row.savePath)) {

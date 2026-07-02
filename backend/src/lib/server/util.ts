@@ -1,4 +1,5 @@
 import path from 'path';
+import { existsSync } from 'fs';
 import { config } from './config';
 
 /**
@@ -80,4 +81,9 @@ export function categoryForExt(ext: string): string {
 	if (['.pdf', '.doc', '.docx', '.txt'].includes(e)) return 'documents';
 	if (['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2'].includes(e)) return 'archives';
 	return 'others';
+}
+
+/** True when a download finished and the bytes (or done sidecar) are still on disk. */
+export function completedFileStillExists(savePath: string): boolean {
+	return existsSync(`${savePath}.veloce_done`) || existsSync(savePath);
 }

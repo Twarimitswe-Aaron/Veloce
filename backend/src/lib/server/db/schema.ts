@@ -46,6 +46,7 @@ export const playlistJobs = sqliteTable('playlist_jobs', {
 	threads: integer('threads').notNull().default(8),
 	currentTrackTitle: text('current_track_title'),
 	error: text('error'),
+	failedIndices: text('failed_indices', { mode: 'json' }).$type<number[]>().default([]),
 	downloadedBytes: integer('downloaded_bytes').default(0),
 	totalBytes: integer('total_bytes').default(0),
 	createdAt: integer('created_at', { mode: 'timestamp' }).notNull()

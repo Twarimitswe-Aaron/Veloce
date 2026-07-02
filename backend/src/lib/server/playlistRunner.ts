@@ -1,9 +1,8 @@
 import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
-import { existsSync } from 'fs';
 import { mkdir } from 'fs/promises';
 import crypto from 'crypto';
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray, not } from 'drizzle-orm';
 import { db } from './db';
 import { playlistJobs } from './db/schema';
 import { resolvePlaylist, extractMediaWithFormat, type PlaylistEntry } from './extractor';
@@ -13,6 +12,7 @@ import {
 	formatAttemptsForTrack,
 	parsePlaylistFormatSettings
 } from './playlistSettings';
+import { findCompletedTrackFile, isTrackCompleteOnDisk, parseFailedIndices, trackStem } from './playlistTrack';
 import { sanitizeFileName, sanitizeFolderName } from './util';
 
 export type PlaylistRuntime = {
@@ -80,6 +80,35 @@ function broadcastPlaylist(
 
 async function patchJob(id: string, patch: Partial<typeof playlistJobs.$inferInsert>) {
 	await db.update(playlistJobs).set(patch).where(eq(playlistJobs.id, id));
+}
+
+async function finishPlaylistJob(
+	playlistId: string,
+	ctx: RunningPlaylist,
+	row: typeof playlistJobs.$inferSelect,
+	patch: Partial<typeof playlistJobs.$inferInsert>
+) {
+	await patchJob(playlistId, patch);
+	if (patch.status === 'completed') {
+		ctx.broadcast({
+			type: 'PLAYLIST_FINISHED',
+			playlistId,
+			title: row.title,
+			saveDir: row.saveDir,
+			completed: (patch.completedTracks as number | undefined) ?? row.completedTracks,
+			failed: (patch.failedTracks as number | undefined) ?? row.failedTracks,
+			total: row.totalTracks
+		});
+	} else {
+		ctx.broadcast({ type: 'PLAYLIST_REMOVED', playlistId });
+	}
+	await db.delete(playlistJobs).where(eq(playlistJobs.id, playlistId));
+	runningPlaylists.delete(playlistId);
+}
+
+function markTrackFailed(failedIndices: number[], index: number): number[] {
+	if (failedIndices.includes(index)) return failedIndices;
+	return [...failedIndices, index];
 }
 
 function runEngine(
@@ -165,6 +194,7 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 	let index = row.currentIndex;
 	let completed = row.completedTracks;
 	let failed = row.failedTracks;
+	let failedIndices = parseFailedIndices(row.failedIndices);
 
 	await patchJob(playlistId, { status: 'downloading', error: null });
 	row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
@@ -175,15 +205,23 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 		if (!run) break;
 
 		if (run.intent === 'cancelled') {
-			await patchJob(playlistId, { status: 'cancelled', currentIndex: index, completedTracks: completed, failedTracks: failed });
-			row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
-			broadcastPlaylist(ctx.broadcast, row, { status: 'cancelled' });
-			runningPlaylists.delete(playlistId);
-			ctx.broadcast({ type: 'PLAYLIST_REMOVED', playlistId });
+			await finishPlaylistJob(playlistId, ctx, row, {
+				status: 'cancelled',
+				currentIndex: index,
+				completedTracks: completed,
+				failedTracks: failed,
+				failedIndices
+			});
 			return;
 		}
 		if (run.intent === 'paused') {
-			await patchJob(playlistId, { status: 'paused', currentIndex: index, completedTracks: completed, failedTracks: failed });
+			await patchJob(playlistId, {
+				status: 'paused',
+				currentIndex: index,
+				completedTracks: completed,
+				failedTracks: failed,
+				failedIndices
+			});
 			row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
 			broadcastPlaylist(ctx.broadcast, row, { status: 'paused' });
 			runningPlaylists.delete(playlistId);
@@ -191,9 +229,23 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 		}
 
 		const entry = entries[index];
-		const num = String(entry.index ?? index + 1).padStart(2, '0');
+		const stem = trackStem(entry, index);
 		const trackTitle = entry.title || `Track ${index + 1}`;
-		const stem = sanitizeFileName(`${num} - ${trackTitle}`);
+
+		if (failedIndices.includes(index)) {
+			index++;
+			await patchJob(playlistId, { currentIndex: index, failedIndices });
+			continue;
+		}
+
+		if (findCompletedTrackFile(row.saveDir, stem)) {
+			completed++;
+			index++;
+			await patchJob(playlistId, { currentIndex: index, completedTracks: completed, failedIndices });
+			row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
+			broadcastPlaylist(ctx.broadcast, row, { currentIndex: index, completedTracks: completed, failedTracks: failed });
+			continue;
+		}
 
 		await patchJob(playlistId, { currentIndex: index, currentTrackTitle: trackTitle, downloadedBytes: 0, totalBytes: 0 });
 
@@ -204,9 +256,10 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 		}
 
 		if (!media) {
+			failedIndices = markTrackFailed(failedIndices, index);
 			failed++;
 			index++;
-			await patchJob(playlistId, { currentIndex: index, failedTracks: failed });
+			await patchJob(playlistId, { currentIndex: index, failedTracks: failed, failedIndices });
 			row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
 			broadcastPlaylist(ctx.broadcast, row, { currentIndex: index, failedTracks: failed, completedTracks: completed });
 			continue;
@@ -215,10 +268,10 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 		const fileName = sanitizeFileName(`${stem}${media.ext.startsWith('.') ? media.ext : '.' + media.ext}`);
 		const fullPath = path.join(row.saveDir, fileName);
 
-		if (existsSync(fullPath)) {
+		if (isTrackCompleteOnDisk(fullPath)) {
 			completed++;
 			index++;
-			await patchJob(playlistId, { currentIndex: index, completedTracks: completed });
+			await patchJob(playlistId, { currentIndex: index, completedTracks: completed, failedIndices });
 			continue;
 		}
 
@@ -250,25 +303,54 @@ async function runPlaylistJob(playlistId: string): Promise<void> {
 		);
 
 		if (result === 'paused' || result === 'cancelled') {
-			await patchJob(playlistId, { status: result, currentIndex: index, completedTracks: completed, failedTracks: failed });
-			row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
-			broadcastPlaylist(ctx.broadcast, row, { status: result });
-			if (result === 'cancelled') ctx.broadcast({ type: 'PLAYLIST_REMOVED', playlistId });
-			runningPlaylists.delete(playlistId);
+			if (result === 'cancelled') {
+				await finishPlaylistJob(playlistId, ctx, row, {
+					status: 'cancelled',
+					currentIndex: index,
+					completedTracks: completed,
+					failedTracks: failed,
+					failedIndices
+				});
+			} else {
+				await patchJob(playlistId, {
+					status: 'paused',
+					currentIndex: index,
+					completedTracks: completed,
+					failedTracks: failed,
+					failedIndices
+				});
+				row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
+				broadcastPlaylist(ctx.broadcast, row, { status: 'paused' });
+				runningPlaylists.delete(playlistId);
+			}
 			return;
 		}
 
-		if (result === 'completed') completed++;
-		else failed++;
+		if (result === 'completed') {
+			completed++;
+		} else {
+			failedIndices = markTrackFailed(failedIndices, index);
+			failed++;
+		}
 
 		index++;
-		await patchJob(playlistId, { currentIndex: index, completedTracks: completed, failedTracks: failed, downloadedBytes: 0, totalBytes: 0 });
+		await patchJob(playlistId, {
+			currentIndex: index,
+			completedTracks: completed,
+			failedTracks: failed,
+			failedIndices,
+			downloadedBytes: 0,
+			totalBytes: 0
+		});
 	}
 
-	await patchJob(playlistId, { status: 'completed', currentIndex: index, completedTracks: completed, failedTracks: failed });
-	row = (await db.select().from(playlistJobs).where(eq(playlistJobs.id, playlistId)))[0]!;
-	broadcastPlaylist(ctx.broadcast, row, { status: 'completed' });
-	runningPlaylists.delete(playlistId);
+	await finishPlaylistJob(playlistId, ctx, row, {
+		status: 'completed',
+		currentIndex: index,
+		completedTracks: completed,
+		failedTracks: failed,
+		failedIndices
+	});
 }
 
 function pumpPlaylistQueue() {
@@ -311,13 +393,14 @@ export async function cancelPlaylistJob(playlistId: string, broadcast: Broadcast
 		run.engineProc?.kill('SIGTERM');
 		return;
 	}
-	await patchJob(playlistId, { status: 'cancelled' });
 	await db.delete(playlistJobs).where(eq(playlistJobs.id, playlistId));
 	broadcast({ type: 'PLAYLIST_REMOVED', playlistId });
 }
 
 export async function resumePlaylistJob(playlistId: string, runtime: PlaylistRuntime, broadcast: BroadcastFn) {
 	if (runningPlaylists.has(playlistId)) return;
+	const row = await getPlaylistJob(playlistId);
+	if (!row || row.status === 'completed' || row.status === 'cancelled') return;
 	await patchJob(playlistId, { status: 'queued' });
 	schedulePlaylistJob(playlistId, runtime, broadcast);
 }
@@ -329,8 +412,24 @@ export async function queuePlaylistDownload(opts: {
 	baseDir: string;
 	threads: number;
 	formatSettings: PlaylistFormatSettings;
+	runtime: PlaylistRuntime;
 	broadcast: BroadcastFn;
 }): Promise<{ ok: true; playlistId: string; total: number; title: string; saveDir: string } | { ok: false; error: string }> {
+	const active = await db.select().from(playlistJobs)
+		.where(and(
+			eq(playlistJobs.deviceId, opts.macAddress),
+			eq(playlistJobs.playlistUrl, opts.playlistUrl),
+			inArray(playlistJobs.status, ['queued', 'downloading', 'paused'])
+		))
+		.limit(1);
+	if (active[0]) {
+		const row = active[0];
+		if (row.status === 'paused' || row.status === 'queued') {
+			schedulePlaylistJob(row.id, opts.runtime, opts.broadcast);
+		}
+		return { ok: true, playlistId: row.id, total: row.totalTracks, title: row.title, saveDir: row.saveDir };
+	}
+
 	const pl = await resolvePlaylist(opts.playlistUrl);
 	if (!pl?.entries.length) {
 		return { ok: false, error: 'No playlist entries found (or not a playlist).' };
@@ -357,6 +456,7 @@ export async function queuePlaylistDownload(opts: {
 		totalTracks: pl.entries.length,
 		completedTracks: 0,
 		failedTracks: 0,
+		failedIndices: [],
 		entries: pl.entries,
 		settings: opts.formatSettings,
 		referer: opts.referer ?? null,
@@ -374,7 +474,10 @@ export async function queuePlaylistDownload(opts: {
 
 export async function listPlaylistJobsForDevice(deviceId: string) {
 	return db.select().from(playlistJobs)
-		.where(eq(playlistJobs.deviceId, deviceId))
+		.where(and(
+			eq(playlistJobs.deviceId, deviceId),
+			not(inArray(playlistJobs.status, ['completed', 'cancelled']))
+		))
 		.orderBy(desc(playlistJobs.createdAt))
 		.limit(20);
 }
