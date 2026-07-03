@@ -112,27 +112,37 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 - **Download:** Always refresh CDN URL in `runDownloadJob` before engine spawn
 - **Never** treat `www.mediafire.com/file/...` as direct
 
-### D — OmniSave / videodownloader.site (and future **MovieBox**-style sites)
+### D — OmniSave / MovieBox / netfilm (Class D intercept)
 
 **Classification:** `intercept-preloaded` — formats come from the **site’s own API**, not yt-dlp.
 
 | Piece | Location |
 |-------|----------|
-| XHR cache | `inject-intercept.js` hooks axios/fetch → `sessionStorage` key `veloce_omni_links` |
-| Modal parse | `content.js` → `parseDownloadModalButton`, `#download-modal-title` |
-| Preloaded format | `formatFromOmniSaveLink()` → `{ id: 'intercept', url, ext, label }` |
+| Site registry | `extension/static/sites/registry.js` — `__veloceRegisterSite` / `__veloceCreateSiteHandlers` |
+| YouTube handler | `extension/static/sites/youtube.js` — feed cards, watch/Shorts, playlists |
+| Instagram handler | `extension/static/sites/instagram.js` — feed, post/reel, Stories |
+| OmniSave / MovieBox | `extension/static/sites/omnisave.js` — download-modal intercept |
+| Orchestrator | `extension/static/content.js` — badges, menu, scan loop; delegates to site handlers |
+| XHR/fetch cache | `inject-intercept.js` hooks axios/fetch → `sessionStorage` key `veloce_omni_links` |
 | Open menu | `openFormatMenu(..., preloadedFormats)` — skips `LIST_FORMATS` |
 | Download | `directUrl` = API CDN link; `pageUrl` + `referer` = current tab |
 
-**Adding MovieBox or similar:**
+**MovieBox flow (moviebox.ph, netfilm.world, videodownloader.site):**
 
-1. Identify API endpoint (like OmniSave `/wefeed-h5api-bff/subject/download`)
-2. Hook in `inject-intercept.js` (MAIN world, `document_start`)
-3. Cache links in `sessionStorage` with a **site-specific key** (e.g. `veloce_moviebox_links`)
-4. Map quality buttons in `content.js` (modal or button selectors)
-5. Build preloaded `MediaFormat[]` with `kind: 'direct'`, `source: 'generic'`
-6. Document hostname + API shape in the table below
-7. **Do not** route these URLs through yt-dlp `listFormats` unless fallback needed
+1. Homepage — catalog only; **no download URLs**.
+2. `/moviedetail/...` — metadata + “Watch Online”; still no CDN until player opens.
+3. Player (`netfilm.world/spa/videoPlayPage/...`) — open **Download Options** modal; site calls `h5-api.aoneroom.com/wefeed-h5api-bff/subject/download`.
+4. Veloce caches `list[]` → video qualities, `captions`/`extCaptions[]` → subtitles.
+5. Click quality or subtitle in modal → Veloce menu with filename `{Title}_{720p|English}.ext`.
+
+**Adding a new well-known site:**
+
+1. Create `extension/static/sites/<name>.js` exporting `create<Name>Site(ctx)` via `__veloceRegisterSite`
+2. Add the file to `manifest.json` `content_scripts` **before** `content.js`
+3. Implement handler methods used by `content.js` (`isHost`, `scan`, `processMediaElement`, etc. — copy from YouTube/Instagram)
+4. Document in the site registry table below
+
+**API response shape (v2):** `{ list: [{ resourceLink, resolution }], captions: [{ lanName, url }] }` or `{ downloads, captions }`.
 
 ### E — Trap / redirect URLs
 
@@ -146,12 +156,12 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 | Site / family | Signature | Behavior class | Format source | Notes |
 |---------------|-----------|----------------|---------------|-------|
 | YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; **2025+ homepage** uses flat `#content` inside `ytd-rich-item-renderer` (no `#video-title`); deep shadow-DOM link scan; lazy-load retry when `#content` empty |
-| Instagram | `instagram` | A | yt-dlp + cookies | Chrome profile; reel/p variants |
+| Instagram | `instagram` | A | yt-dlp + cookies | **Feed:** `main article`. **Post/reel page** (`/p/ID`, `/reel/ID`): badge on main viewer `video` (URL from address bar). **Stories:** `/stories/user/ID`. Photo-only = no badge. **No prefetch** on feed. |
 | TikTok | `tiktok` | A | yt-dlp | |
 | X/Twitter | `twitter` | A | yt-dlp | |
 | MediaFire | `mediafire` | C | HTML scrape | Re-resolve each download |
-| OmniSave / videodownloader.site | — | D | Site API (XHR) | `inject-intercept.js` + modal |
-| MovieBox | — | D *(planned)* | Site API *(TBD)* | Same pattern as OmniSave; add row when implemented |
+| OmniSave / videodownloader.site | — | D | Site API (XHR/fetch) | `inject-intercept.js` + modal |
+| MovieBox / netfilm.world | — | D | `subject/download` API | Same as OmniSave; player page + Download Options modal |
 | Generic CDN `.mp4` | `direct` | B | Direct | |
 
 When you implement a new row, **save the link behavior class and handler here** before merging.

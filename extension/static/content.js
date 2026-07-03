@@ -13,135 +13,32 @@
 	const FILE_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|csv|json|xml|iso)(\?|#|$)/i;
 	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
 	const CDN_IMAGE = /fbcdn\.net|cdninstagram\.com/i;
-	const YT_FEED_CARD =
-		'ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ' +
-		'ytd-compact-video-renderer, ytd-playlist-video-renderer, yt-lockup-view-model, ' +
-		'ytd-reel-item-renderer, ytd-reel-video-renderer';
 	const CARD_WATCH_ATTR = 'data-veloce-card-watch';
 
-	function findYoutubeFeedCard(el) {
-		return el?.closest?.(YT_FEED_CARD) || null;
+	/** Site handlers — see extension/static/sites/*.js */
+	let siteHandlers = [];
+	let yt = null;
+	let ig = null;
+	let omni = null;
+
+	function initSiteHandlers(ctx) {
+		siteHandlers = window.__veloceCreateSiteHandlers?.(ctx) || [];
+		yt = siteHandlers.find((h) => h.id === 'youtube') || null;
+		ig = siteHandlers.find((h) => h.id === 'instagram') || null;
+		omni = siteHandlers.find((h) => h.id === 'omnisave') || null;
 	}
 
-	function isYoutubeMainPlayerEl(el) {
-		return !!el?.closest?.(
-			'#movie_player, #player-container, #player, ytd-watch-flexy #player, ' +
-			'.html5-video-player, ytd-shorts[disable-persistence], ytd-shorts #shorts-container, ' +
-			'ytd-reel-video-renderer'
-		);
-	}
-
-	/** YouTube reuses one <video> for hover previews — never badge it. */
-	function isYoutubeHoverPreview(el) {
-		if (!el || el.tagName !== 'VIDEO') return false;
-		if (el.closest('ytd-video-preview, ytd-miniplayer, #preview, .video-preview')) return true;
-		if (!/youtube\.com|youtu\.be/i.test(location.hostname)) return false;
-		if (isYoutubeMainPlayerEl(el)) return false;
-		if (findYoutubeFeedCard(el)) return false;
-		return true;
-	}
-
-	/** Walk a feed card including shadow roots (2025+ homepage nests links inside shadow DOM). */
-	function walkCardDeep(card, visit) {
-		if (!card || typeof visit !== 'function') return;
-		function walk(node) {
-			if (!node || node.nodeType !== 1) return;
-			visit(node);
-			for (const child of node.children || []) walk(child);
-			if (node.shadowRoot) walk(node.shadowRoot);
-		}
-		walk(card);
-	}
-
-	/**
-	 * YouTube 2025+ homepage: cards are ytd-rich-item-renderer with flat #content —
-	 * no nested ytd-rich-grid-video-renderer and #video-title is often null until lazy-load.
-	 */
-	function findYoutubeWatchLinkInCard(card) {
-		if (!card) return null;
-		let best = null;
-		let bestScore = -1;
-		const scoreLink = (a, url) => {
-			let s = 0;
-			const id = a.id || '';
-			if (id === 'thumbnail-link' || id === 'thumbnail') s += 100;
-			if (a.closest?.('ytd-thumbnail')) s += 50;
-			if (a.classList?.contains('ytd-reel-item-thumbnail')) s += 40;
-			if (url.includes('/shorts/')) s += 10;
-			if (a.classList?.contains('yt-simple-endpoint')) s += 5;
-			return s;
-		};
-		walkCardDeep(card, (node) => {
-			if (node.tagName !== 'A') return;
-			const href = node.getAttribute('href') || node.href;
-			if (!href || href.startsWith('#')) return;
-			const url = canonicalYoutubeUrl(href);
-			if (!url) return;
-			const s = scoreLink(node, url);
-			if (s > bestScore) {
-				bestScore = s;
-				best = { anchor: node, url };
-			}
-		});
-		return best;
-	}
-
-	function findYoutubeThumbnailInCard(card) {
-		return findYoutubeWatchLinkInCard(card)?.anchor || null;
-	}
-
-	function findYoutubeLayoutElInCard(card) {
-		if (!card) return null;
-		let thumb = null;
-		walkCardDeep(card, (node) => {
-			if (thumb) return;
-			if (node.tagName === 'YTD-THUMBNAIL') thumb = node;
-			if (node.id === 'thumbnail' || node.id === 'thumbnail-link') thumb = node;
-		});
-		return thumb || card.querySelector?.('#content') || card;
-	}
-
-	/** Empty #content = card not lazy-loaded yet — retry on next intersection pass. */
-	function isYoutubeCardReady(card) {
-		if (!card) return false;
-		if (findYoutubeWatchLinkInCard(card)) return true;
-		let content = null;
-		walkCardDeep(card, (node) => {
-			if (content) return;
-			if (node.id === 'content') content = node;
-		});
-		if (!content) content = card.querySelector?.('#content');
-		return !!(content && content.textContent?.trim());
-	}
-
-	/** YouTube uses /watch?v=ID — not /watch/ID. */
-	function canonicalYoutubeUrl(href = location.href) {
-		try {
-			const u = new URL(href, location.origin);
-			const host = u.hostname.toLowerCase();
-			if (host === 'youtu.be') {
-				const id = u.pathname.split('/').filter(Boolean)[0];
-				if (id) return `https://www.youtube.com/watch?v=${id}`;
-			}
-			if (host.includes('youtube.com')) {
-				if (u.pathname.startsWith('/shorts/')) {
-					const id = u.pathname.split('/').filter(Boolean)[1];
-					if (id) return `https://www.youtube.com/shorts/${id}`;
-				}
-				if (u.pathname === '/watch') {
-					const v = u.searchParams.get('v');
-					if (v) return `https://www.youtube.com/watch?v=${v}`;
-				}
-			}
-		} catch { /* ignore */ }
-		return null;
-	}
-
-	function isYoutubeWatchPage() {
-		if (!/youtube\.com/i.test(location.hostname)) return false;
-		if (/^\/shorts\/[^/?#]+/.test(location.pathname)) return true;
-		return location.pathname === '/watch' && !!new URL(location.href).searchParams.get('v');
-	}
+	function isYoutubeHost() { return !!yt?.isHost?.(); }
+	function isInstagramHost() { return !!ig?.isHost?.(); }
+	function isInstagramStoriesPage() { return !!ig?.isStoriesPage?.(); }
+	function isInstagramPostPage() { return !!ig?.isPostPage?.(); }
+	function isYoutubeWatchPage() { return !!yt?.isWatchPage?.(); }
+	function canonicalYoutubeUrl(href) { return yt?.canonicalUrl?.(href) ?? null; }
+	function canonicalInstagramPostUrl(href) { return ig?.canonicalPostUrl?.(href) ?? null; }
+	function canonicalInstagramStoryUrl(href) { return ig?.canonicalStoryUrl?.(href) ?? null; }
+	function findYoutubeFeedCard(el) { return yt?.findFeedCard?.(el) ?? null; }
+	function findYoutubeWatchUrl(el) { return yt?.findWatchUrl?.(el) ?? null; }
+	function findPostUrl(el) { return ig?.findPostUrl?.(el) ?? null; }
 
 	function isHttpUrl(url) {
 		try {
@@ -181,9 +78,14 @@
 			}
 		}
 		const dot = fileName.lastIndexOf('.');
-		const ext = dot > 0 ? fileName.slice(dot) : '.mp4';
-		const label = dot > 0 ? fileName.slice(0, dot).replace(/_/g, ' ') : fileName;
-		return [{ id: 'intercept', label, url: href, ext }];
+		const ext = dot > 0 ? fileName.slice(dot) : (
+			/\.(srt|vtt|ass|ssa)(\?|#|$)/i.test(href) ? '.srt' : '.mp4'
+		);
+		let formats = [{ id: 'intercept', label: dot > 0 ? fileName.slice(0, dot).replace(/_/g, ' ') : fileName, url: href, ext, fileName }];
+		if (omni?.patchDownloadAnchorFormats) {
+			formats = omni.patchDownloadAnchorFormats(formats, fileName, href);
+		}
+		return formats;
 	}
 
 	const INTERCEPT_MEDIA_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|iso)(\?|#|$)/i;
@@ -211,51 +113,7 @@
 		}
 	}
 
-	/** Walk up the DOM from a video/card and find the canonical post/reel URL. */
-	function findPostUrl(el) {
-		let node = el;
-		for (let i = 0; i < 25 && node; i++) {
-			const link = node.querySelector?.(
-				'a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]'
-			);
-			if (link) {
-				try {
-					return new URL(link.getAttribute('href') || link.href, location.origin).href.split('?')[0];
-				} catch { /* keep walking */ }
-			}
-			if (node.matches?.('a[href*="/p/"], a[href*="/reel/"], a[href*="/tv/"]')) {
-				try {
-					return new URL(node.href, location.origin).href.split('?')[0];
-				} catch { /* keep walking */ }
-			}
-			node = node.parentElement;
-		}
-		return null;
-	}
 
-	/** YouTube homepage/feed preview videos use blob: — resolve to this card's /watch?v= link only. */
-	function findYoutubeWatchUrl(el) {
-		if (!el) return null;
-		const card = findYoutubeFeedCard(el);
-		if (card) {
-			const hit = findYoutubeWatchLinkInCard(card);
-			if (hit) return hit.url;
-		}
-		if (isYoutubeMainPlayerEl(el)) {
-			return canonicalYoutubeUrl();
-		}
-		if (/^\/shorts\/[^/?#]+/.test(location.pathname)) {
-			return canonicalYoutubeUrl();
-		}
-		let node = el;
-		for (let i = 0; i < 10 && node; i++) {
-			if (node.matches?.('a[href*="/watch"], a[href*="/shorts/"], a[href*="youtu.be/"]')) {
-				return canonicalYoutubeUrl(node.getAttribute('href') || node.href);
-			}
-			node = node.parentElement;
-		}
-		return null;
-	}
 
 	/**
 	 * Map a raw media URL to something the backend / yt-dlp can fetch.
@@ -265,66 +123,41 @@
 	function resolveDownloadUrl(raw, anchor) {
 		if (!raw) return null;
 
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.resolveDownloadUrl) continue;
+			const resolved = h.resolveDownloadUrl(raw, anchor);
+			if (resolved) return resolved;
+		}
+
 		if (isBrowserOnlyUrl(raw)) {
 			if (!VIDEO_SITES.test(location.hostname)) return null;
-			if (/youtube\.com|youtu\.be/i.test(location.hostname) && anchor) {
-				const yt = findYoutubeWatchUrl(anchor);
-				if (yt) return yt;
-				return null;
-			}
 			const post = anchor ? findPostUrl(anchor) : null;
 			if (post) return post;
-			const yt = canonicalYoutubeUrl();
-			if (yt) return yt;
+			const ytUrl = canonicalYoutubeUrl();
+			if (ytUrl) return ytUrl;
 			if (/\/(p|reel|tv)\//.test(location.pathname)) {
-				return location.href.split('?')[0];
+				return canonicalInstagramPostUrl(location.href) || location.href.split('?')[0];
 			}
 			return null;
 		}
 
 		if (!isHttpUrl(raw)) return null;
-
-		// YouTube streams via googlevideo.com — map to the card or main player watch URL.
-		if (/googlevideo\.com/i.test(raw) && /youtube\.com|youtu\.be/i.test(location.hostname) && anchor) {
-			const yt = findYoutubeWatchUrl(anchor) ||
-				(isYoutubeMainPlayerEl(anchor) ? canonicalYoutubeUrl() : null);
-			if (yt) return yt;
-		}
-
-		// Skip CDN still/thumbnail images on social feeds (not the video file).
-		if (anchor && /instagram\.com/i.test(location.hostname) && CDN_IMAGE.test(raw)) {
-			const tag = anchor.tagName?.toLowerCase();
-			if (tag === 'video' || tag === 'audio' || anchor.querySelector?.('video,audio')) {
-				return findPostUrl(anchor) || null;
-			}
-			if (/\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(raw)) return null;
-		}
-
 		return raw;
 	}
 
 	/** Canonical cache key — must match backend/background normalizeFormatUrl. */
 	function normalizeBadgeKey(url) {
+		for (const h of siteHandlers) {
+			if (!h.normalizeKey) continue;
+			const key = h.normalizeKey(url);
+			if (key) return key;
+		}
 		try {
 			const u = new URL(url);
 			u.hash = '';
-			const host = u.hostname.toLowerCase();
-			if (host === 'youtu.be') {
-				const id = u.pathname.split('/').filter(Boolean)[0];
-				if (id) return `https://www.youtube.com/watch?v=${id}`;
-			}
-			if (host.includes('youtube.com')) {
-				const canon = canonicalYoutubeUrl(u.href);
-				if (canon) return canon;
-			}
-			if (/instagram\.com/i.test(u.hostname)) {
-				u.search = '';
-				u.pathname = u.pathname.replace(/\/+$/, '');
-				return u.href;
-			}
-			if (VIDEO_SITES.test(u.hostname) && /\/(p|reel|tv)\//.test(u.pathname)) {
-				const path = u.pathname.replace(/\/+$/, '');
-				return `${u.origin}${path}`;
+			if (VIDEO_SITES.test(u.hostname) && /\/(p|reels?|tv)\//.test(u.pathname)) {
+				const p = u.pathname.replace(/\/reels\//i, '/reel/').replace(/\/+$/, '');
+				return `${u.origin}${p}`;
 			}
 			return `${u.origin}${u.pathname}${u.search}`;
 		} catch {
@@ -347,12 +180,10 @@
 		const semantic = anchor.closest('article, [role="article"], [data-testid="tweet"]');
 		if (semantic) return semantic;
 
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
-			const card = findYoutubeFeedCard(anchor);
-			if (card) return card;
-			const player = anchor.closest('#movie_player, ytd-player, .html5-video-player, ytd-shorts');
-			if (player) return player;
-			return anchor;
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.findBadgeRoot) continue;
+			const root = h.findBadgeRoot(anchor);
+			if (root) return root;
 		}
 
 		if (VIDEO_SITES.test(location.hostname)) {
@@ -689,14 +520,17 @@
 		if (!VIDEO_SITES.test(location.hostname)) return false;
 		if (isYoutubeWatchPage()) return true;
 		if (/youtu\.be/i.test(location.hostname) && location.pathname.length > 1) return true;
+		if (isInstagramHost() && isInstagramStoriesPage()) return true;
 		return /\/(p|reel|tv)\/[^/?#]+/.test(location.pathname);
 	}
 
-	function shouldBadgeYoutubeElement(el) {
-		if (!/youtube\.com/i.test(location.hostname)) return true;
-		if (el.tagName === 'VIDEO' && isYoutubeHoverPreview(el)) return false;
-		if (!isYoutubeWatchPage()) return true;
-		return isYoutubeMainPlayerEl(el) || !!findYoutubeFeedCard(el);
+	function shouldBadgeMediaElement(el) {
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.shouldBadgeElement) continue;
+			const ok = h.shouldBadgeElement(el);
+			if (ok === false) return false;
+		}
+		return true;
 	}
 
 	/** Primary modal player — largest visible video dialog (main reel, not DM sidebar). */
@@ -843,23 +677,13 @@
 		const vis = mediaVisibleRect(el);
 		if (!vis || vis.width < 48 || vis.height < 48) return false;
 
-		// YouTube home / grid / Shorts shelf — badge every visible tile (thumbnail anchor).
-		if (/youtube\.com|youtu\.be/i.test(location.hostname) && findYoutubeFeedCard(el)) {
-			const card = findYoutubeFeedCard(el);
-			const layoutEl = findYoutubeLayoutElInCard(card) || el;
-			const cardVis = mediaVisibleRect(layoutEl) || clipRectToViewport(card.getBoundingClientRect());
-			return isNearViewport(card, BADGE_MARGIN_PX) && cardVis && cardVis.width >= 48 && cardVis.height >= 36;
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.isElementForeground) continue;
+			const siteFg = h.isElementForeground(el);
+			if (siteFg !== null && siteFg !== undefined) return siteFg;
 		}
 
-		// Dedicated watch/reel pages: main player only — sidebar tiles use feed rules below.
-		if (isDedicatedMediaPage() && !overlay) {
-			if (isYoutubeWatchPage() && findYoutubeFeedCard(el) && !isYoutubeMainPlayerEl(el)) {
-				if (!isNearViewport(el, 0)) return false;
-				const vis = mediaVisibleRect(el);
-				return !!(vis && vis.width >= 64 && vis.height >= 64);
-			}
-			return true;
-		}
+		if (isDedicatedMediaPage() && !overlay) return true;
 
 		// Modal player: visible in-viewport video inside the dialog counts as foreground.
 		if (overlay && overlay.contains(el)) return true;
@@ -899,7 +723,8 @@
 				removeBadge(key);
 				continue;
 			}
-			if (overlay && !overlay.contains(entry.anchor)) {
+			const keepOnOverlay = ig?.shouldCullOnOverlay?.() === false;
+			if (overlay && !overlay.contains(entry.anchor) && !keepOnOverlay) {
 				removeBadge(key);
 				continue;
 			}
@@ -916,18 +741,22 @@
 	}
 
 	function shouldPrefetchUrl(url) {
-		try {
-			const h = new URL(url).hostname;
-			// Instagram feed prefetch rarely succeeds without cookies and blocks the queue for ~20s each.
-			if (/instagram\.com/i.test(h)) return false;
-		} catch { /* ignore */ }
+		for (const h of siteHandlers) {
+			if (!h.shouldPrefetchUrl) continue;
+			const r = h.shouldPrefetchUrl(url);
+			if (r === false) return false;
+		}
 		return true;
 	}
 
 	/** Start format prefetch when a badge is placed — YouTube always (badge is already near viewport). */
 	function shouldStartPrefetch(resolvedUrl, anchor) {
 		if (!shouldPrefetchUrl(resolvedUrl)) return false;
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) return true;
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.shouldStartPrefetch) continue;
+			const r = h.shouldStartPrefetch(resolvedUrl, anchor);
+			if (r === true) return true;
+		}
 		return isNearViewport(anchor, PREFETCH_MARGIN_PX);
 	}
 
@@ -954,6 +783,32 @@
 		if (!batch.length) return;
 		try {
 			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_BATCH', urls: batch });
+		} catch { /* ignore */ }
+	}
+
+	/**
+	 * Instagram Reels: prefetch the reel being watched (priority) and keep the
+	 * previous reel in the queue so scrolling back is instant. Drops other queued reels.
+	 */
+	function setReelsPrefetchFocus(activeUrl, previousUrl) {
+		if (!captureActive() || document.hidden) return;
+		const activeKey = activeUrl ? normalizeBadgeKey(activeUrl) : '';
+		const previousKey = previousUrl ? normalizeBadgeKey(previousUrl) : '';
+		const keep = new Set([activeKey, previousKey].filter(Boolean));
+
+		for (const key of [...prefetchStarted]) {
+			if (!keep.has(key)) prefetchStarted.delete(key);
+		}
+
+		if (activeUrl && shouldPrefetchUrl(activeUrl)) {
+			eagerPrefetch(activeUrl);
+		}
+		if (previousUrl && previousKey !== activeKey && shouldPrefetchUrl(previousUrl)) {
+			prefetchPageUrls([{ url: previousUrl, priority: false }]);
+		}
+
+		try {
+			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FOCUS', keep: [...keep] });
 		} catch { /* ignore */ }
 	}
 
@@ -985,50 +840,27 @@
 	}
 	syncInjectCoordinatorState.lastOnline = null;
 
-	let omniSaveLinks = [];
-	let omniSaveMovieTitle = '';
-	const OMNI_STORAGE_KEY = 'veloce_omni_links';
-
-	function loadOmniLinksFromStorage() {
-		try {
-			const raw = sessionStorage.getItem(OMNI_STORAGE_KEY);
-			if (!raw) return;
-			const data = JSON.parse(raw);
-			if (!data?.links?.length || Date.now() - (data.ts || 0) > 600000) return;
-			omniSaveLinks = data.links;
-			if (data.movie) omniSaveMovieTitle = data.movie;
-		} catch { /* ignore */ }
+	function setupInjectBridge() {
+		window.addEventListener('message', (e) => {
+			if (e.source !== window || !e.data) return;
+			const data = e.data;
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_HOOK_LOG') {
+				if (data.important) interceptLog(`page hook: ${data.step}`, data.detail);
+				return;
+			}
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_DOWNLOAD_LINKS') {
+				omni?.onDownloadLinksMessage?.(data);
+				return;
+			}
+			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_INTERCEPT') {
+				if (!omni?.handleInterceptRequest?.(data)) {
+					handleGenericInterceptRequest(data);
+				}
+			}
+		});
 	}
 
-	function normalizeQualityKey(label) {
-		return String(label || '').replace(/\s+/g, '').replace(/p$/i, '').toLowerCase();
-	}
-
-	function findOmniSaveLink(qualityLabel) {
-		const key = normalizeQualityKey(qualityLabel);
-		if (!key || !omniSaveLinks.length) return null;
-		return omniSaveLinks.find((l) => {
-			const r = normalizeQualityKey(l.resolution ?? l.res ?? l.quality ?? l.label ?? '');
-			return r === key;
-		}) || null;
-	}
-
-	function formatFromOmniSaveLink(link, qualityLabel, movieTitle) {
-		const url = link.url || link.downloadUrl || link.href;
-		if (!url || !isHttpUrl(url)) return null;
-		const res = link.resolution ?? link.res ?? qualityLabel ?? 'download';
-		const fmt = (link.format || 'mp4').toLowerCase();
-		const title = (movieTitle || 'download').replace(/[\\/:*?"<>|]/g, '_');
-		const fileName = `${title}_${res}p.${fmt}`;
-		return [{
-			id: 'intercept',
-			label: `${qualityLabel} — ${fmt.toUpperCase()}`,
-			url,
-			ext: `.${fmt.replace(/^\./, '')}`
-		}];
-	}
-
-	function handleInterceptRequest(detail) {
+	function handleGenericInterceptRequest(detail) {
 		const { href, download, source } = detail || {};
 		interceptLog('step 4: page hook → content script', { href, download, source, coordinatorOnline });
 		if (!coordinatorOnline) {
@@ -1039,7 +871,8 @@
 			href,
 			getAttribute: (k) => (k === 'download' ? (download || '') : null)
 		};
-		const formats = formatsFromDownloadAnchor(fake);
+		let formats = formatsFromDownloadAnchor(fake);
+		if (omni?.renameInterceptFormats) formats = omni.renameInterceptFormats(formats);
 		if (!formats) {
 			interceptLog('step 4b: ABORT — could not build format', { href, download });
 			return;
@@ -1049,86 +882,7 @@
 		openFormatMenu(location.href.split('#')[0], document.body, document.body, formats);
 	}
 
-	// When OmniSave "Download Options" modal opens, reload cached API links.
-	try {
-		const omniModalObs = new MutationObserver(() => {
-			if (document.getElementById('download-modal-title')) {
-				loadOmniLinksFromStorage();
-				if (omniSaveLinks.length) {
-					interceptLog('step 0: OmniSave modal open — links ready', {
-						count: omniSaveLinks.length,
-						qualities: omniSaveLinks.map((l) => l.resolution ?? l.res)
-					});
-				}
-			}
-		});
-		omniModalObs.observe(document.documentElement, { childList: true, subtree: true });
-	} catch { /* ignore */ }
-
-	function setupInjectBridge() {
-		window.addEventListener('message', (e) => {
-			if (e.source !== window || !e.data) return;
-			const data = e.data;
-			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_HOOK_LOG') {
-				if (data.important) interceptLog(`page hook: ${data.step}`, data.detail);
-				return;
-			}
-			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_DOWNLOAD_LINKS') {
-				omniSaveLinks = Array.isArray(data.links) ? data.links : [];
-				if (data.movie) omniSaveMovieTitle = data.movie;
-				interceptLog('step 0: cached OmniSave links', {
-					count: omniSaveLinks.length,
-					qualities: omniSaveLinks.map((l) => l.resolution || l.res || l.quality)
-				});
-				return;
-			}
-			if (data.source === 'veloce-page-hook' && data.type === 'VELOCE_INTERCEPT') {
-				handleInterceptRequest(data);
-			}
-		});
-
-		// Coordinator sync happens after chrome.storage.local loads (see above).
-	}
-
 	setupInjectBridge();
-
-	/** OmniSave / videodownloader.site download modal (#download-modal-title). */
-	function parseDownloadModalButton(target) {
-		const title = document.getElementById('download-modal-title');
-		if (!title) return null;
-		// Modal: fixed overlay z-[80], role=dialog, inner .animate-modal
-		const modal = title.closest('[role="dialog"]')
-			|| title.closest('.animate-modal')
-			|| title.closest('[class*="z-[80]"]')
-			|| title.closest('.fixed.inset-0');
-		if (!modal) return null;
-		const btn = target.closest?.('button');
-		if (!btn || !modal.contains(btn)) return null;
-
-		let sectionKind = 'unknown';
-		// Walk up to the section block containing this button
-		let section = btn.parentElement;
-		for (let i = 0; i < 8 && section && section !== modal; i++) {
-			const h3 = section.querySelector(':scope > h3, :scope > div > h3');
-			const heading = h3?.textContent || '';
-			if (/select quality|quality/i.test(heading)) { sectionKind = 'quality'; break; }
-			if (/select subtitle|subtitle/i.test(heading)) { sectionKind = 'subtitle'; break; }
-			section = section.parentElement;
-		}
-		if (sectionKind === 'unknown') {
-			const labelGuess = btn.querySelector('.font-semibold')?.textContent?.trim()
-				|| btn.textContent?.replace(/\s+/g, ' ').trim() || '';
-			if (/^\d{3,4}\s*P$/i.test(labelGuess)) sectionKind = 'quality';
-		}
-
-		const label = btn.querySelector('.font-semibold')?.textContent?.trim()
-			|| btn.textContent?.replace(/\s+/g, ' ').trim().slice(0, 48);
-		// Movie title is in the grid card at top of modal (h3.mb-1), NOT the modal title h2
-		const movie = modal.querySelector('h3.mb-1')?.textContent?.trim()
-			|| modal.querySelector('.grid h3')?.textContent?.trim();
-
-		return { modal, btn, sectionKind, label, movie };
-	}
 
 	function refreshCoordinatorState(cb) {
 		if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
@@ -1321,7 +1075,8 @@
 
 	window.addEventListener('scroll', () => {
 		scheduleBadgeLayout();
-		scheduleYoutubeScrollScan();
+		yt?.scheduleScrollScan?.();
+		ig?.scheduleScrollScan?.();
 	}, { passive: true });
 	window.addEventListener('resize', scheduleBadgeLayout, { passive: true });
 
@@ -1352,6 +1107,14 @@
 		el.addEventListener('click', (e) => {
 			e.preventDefault();
 			e.stopPropagation();
+			const pageUrl = location.href.split('#')[0];
+			try {
+				const u = new URL(pageUrl);
+				if (/youtube\.com/i.test(location.hostname) && u.pathname === '/playlist' && u.searchParams.get('list')) {
+					openPlaylistOnlyMenu(pageUrl, el);
+					return;
+				}
+			} catch { /* ignore */ }
 			openFormatMenu(resolvedUrl, anchor, el);
 		});
 		el.addEventListener('mouseenter', () => {
@@ -1451,69 +1214,8 @@
 		setTimeout(() => t.remove(), isError ? 6000 : 3500);
 	}
 
-	function isYoutubePlaylistContext(href = location.href) {
-		try {
-			const u = new URL(href);
-			if (u.pathname === '/playlist' && u.searchParams.get('list')) return true;
-			return u.pathname === '/watch' && !!u.searchParams.get('list');
-		} catch { return false; }
-	}
-
-	function youtubePlaylistTargetUrl(href = location.href) {
-		try {
-			const u = new URL(href);
-			const list = u.searchParams.get('list');
-			if (!list) return null;
-			if (u.pathname === '/playlist') {
-				u.hash = '';
-				return u.href;
-			}
-			const v = u.searchParams.get('v');
-			if (u.pathname === '/watch' && v) {
-				return `https://www.youtube.com/watch?v=${v}&list=${list}`;
-			}
-			return `https://www.youtube.com/playlist?list=${list}`;
-		} catch { return null; }
-	}
-
-	function queuePlaylistDownload(playlistUrl, pageUrl) {
-		closeMenu();
-		const titleStem = (document.title || 'playlist').replace(/\s*-\s*YouTube\s*$/i, '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
-		chrome.storage.local.get(['veloce_base_dir'], (cfg) => {
-			const payload = {
-				url: playlistUrl,
-				pageUrl,
-				referer: pageUrl,
-				fileName: titleStem || 'playlist',
-				playlistFolder: titleStem || undefined,
-				baseDirectory: cfg.veloce_base_dir || undefined,
-				threads: 8,
-				playlist: true,
-				playlistMode: 'audio-then-720'
-			};
-			chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
-				if (chrome.runtime.lastError || !resp?.ok) {
-					showVeloceToast('Veloce: could not queue playlist — is the backend running?', true);
-					return;
-				}
-				showVeloceToast(`Veloce: queuing playlist to folder "${titleStem}"…`, false);
-			});
-		});
-	}
-
 	function appendPlaylistDownloadOption(menu, closeBtn, pageUrl) {
-		if (!/youtube\.com/i.test(location.hostname)) return;
-		if (!isYoutubePlaylistContext(pageUrl)) return;
-		const playlistUrl = youtubePlaylistTargetUrl(pageUrl);
-		if (!playlistUrl) return;
-		const btn = document.createElement('button');
-		btn.className = 'menu-item menu-item-playlist';
-		btn.textContent = 'Download entire playlist (folder · audio or 720p)';
-		btn.addEventListener('click', (e) => {
-			e.stopPropagation();
-			queuePlaylistDownload(playlistUrl, pageUrl);
-		});
-		menu.insertBefore(btn, closeBtn);
+		yt?.appendPlaylistDownloadOption?.(menu, closeBtn, pageUrl);
 	}
 
 	function isManifestFormat(fmt) {
@@ -1532,7 +1234,7 @@
 				e.stopPropagation();
 				closeMenu();
 				const stem = fmt.label.split(' — ')[0] || 'download';
-				const fileName = `${stem}${fmt.ext || '.mp4'}`.replace(/[\\/:*?"<>|]/g, '_');
+				const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
 				const pageUrl = location.href.split('#')[0];
 				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 				const manifest = isManifestFormat(fmt);
@@ -1574,6 +1276,30 @@
 		const pageUrl = location.href.split('#')[0];
 		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
 		renderFormatButtons(menu, closeBtn, formats, url);
+	}
+
+	/** Playlist pages: settings-driven download only — no per-track format list. */
+	function openPlaylistOnlyMenu(pageUrl, badgeEl) {
+		closeMenu();
+		const menu = document.createElement('div');
+		menu.className = 'menu';
+		const title = document.createElement('div');
+		title.className = 'menu-title';
+		title.textContent = 'Playlist';
+		menu.appendChild(title);
+		const closeBtn = document.createElement('button');
+		closeBtn.className = 'menu-close';
+		closeBtn.textContent = 'Close';
+		closeBtn.addEventListener('click', closeMenu);
+		menu.appendChild(closeBtn);
+		shadow.appendChild(menu);
+		openMenu = menu;
+		positionMenu(menu, badgeEl);
+		const hint = document.createElement('div');
+		hint.className = 'menu-status';
+		hint.textContent = 'Format rules come from Veloce Settings → Playlist downloads (audio / 720p / etc.).';
+		menu.insertBefore(hint, closeBtn);
+		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
 	}
 
 	function openFormatMenu(resolvedUrl, anchor, badgeEl, preloadedFormats) {
@@ -1689,8 +1415,9 @@
 			const href = a.href;
 			if (!href || href.startsWith('javascript:') || !isHttpUrl(href)) return false;
 			if (CDN_IMAGE.test(href) && /\.(jpe?g|webp|png|gif)(\?|#|$)/i.test(href)) return false;
-			if (/youtube\.com|youtu\.be/i.test(location.hostname) && canonicalYoutubeUrl(href)) {
-				return !!findYoutubeFeedCard(a);
+			if (yt?.shouldWatchLink) {
+				const ytWatch = yt.shouldWatchLink(a);
+				if (ytWatch !== null && ytWatch !== undefined) return ytWatch;
 			}
 			// Feed pages: video nodes resolve the same post URL — skip link observers.
 			if (VIDEO_SITES.test(location.hostname) && /\/(p|reel|tv)\//.test(href)) {
@@ -1708,6 +1435,7 @@
 			if (node.hasAttribute?.(WATCH_ATTR) || node.hasAttribute?.(SCANNED_ATTR) || node.hasAttribute?.(CARD_WATCH_ATTR)) {
 				try { mediaIo.unobserve(node); } catch { /* ignore */ }
 				try { cardIo.unobserve(node); } catch { /* ignore */ }
+				try { igCardIo.unobserve(node); } catch { /* ignore */ }
 				node.removeAttribute(WATCH_ATTR);
 				node.removeAttribute(SCANNED_ATTR);
 				node.removeAttribute(CARD_WATCH_ATTR);
@@ -1718,63 +1446,54 @@
 		if (root?.nodeType === 1) walk(root);
 	}
 
-	function resetYoutubeCapture() {
-		closeMenu();
-		for (const key of [...badgeKeys]) removeBadge(key);
-		resetScanStateDeep(document.documentElement);
-	}
+	const cardIo = new IntersectionObserver(
+		(entries) => {
+			if (!captureActive()) return;
+			for (const entry of entries) {
+				if (!entry.isIntersecting) continue;
+				yt?.processFeedCard?.(entry.target);
+			}
+		},
+		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
+	);
 
-	/** Show badge when near viewport; prefetch only when close enough to likely click. */
-	function processYoutubeFeedCard(card) {
-		if (!captureActive() || !card) return null;
-		if (!isYoutubeCardReady(card)) return null;
-
-		const hit = findYoutubeWatchLinkInCard(card);
-		if (!hit) return null;
-
-		const { anchor, url } = hit;
-		const urlKey = normalizeBadgeKey(url);
-		if (anchor.getAttribute(SCANNED_ATTR)) {
-			if (!badges.has(urlKey)) anchor.removeAttribute(SCANNED_ATTR);
-			else return url;
-		}
-
-		if (!shouldBadgeYoutubeElement(anchor)) return null;
-
-		const startPrefetch = shouldStartPrefetch(url, anchor);
-		const placed = placeBadge(url, anchor, url, startPrefetch);
-		if (!placed) return null;
-
-		anchor.setAttribute(SCANNED_ATTR, '1');
-		return url;
-	}
+	const igCardIo = new IntersectionObserver(
+		(entries) => {
+			if (!captureActive()) return;
+			for (const entry of entries) {
+				if (!entry.isIntersecting) continue;
+				if (entry.target.tagName === 'ARTICLE') {
+					ig?.processFeedArticle?.(entry.target);
+				}
+			}
+		},
+		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
+	);
 
 	function processMediaElement(el) {
 		if (!captureActive() || !el || el.getAttribute(SCANNED_ATTR)) return null;
-		if (!shouldBadgeYoutubeElement(el)) return null;
+		if (!shouldBadgeMediaElement(el)) return null;
+
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.processMediaElement) continue;
+			const siteResult = h.processMediaElement(el);
+			if (siteResult) return siteResult;
+		}
 
 		const tag = el.tagName;
 		let anchor = el;
-
-		// Pin badge to the stable thumbnail link — not YouTube's shared hover-preview <video>.
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
-			const card = findYoutubeFeedCard(el);
-			if (card) {
-				return processYoutubeFeedCard(card);
-			}
-		}
-
 		let rawUrl = tag === 'A' ? el.href : (el.currentSrc || el.src || '');
 		let url = rawUrl ? resolveDownloadUrl(rawUrl, anchor) : null;
 
-		if (!url && tag === 'A' && /youtube\.com|youtu\.be/i.test(location.hostname)) {
+		if (!url && tag === 'A' && isYoutubeHost()) {
 			url = canonicalYoutubeUrl(el.href);
 		}
 
-		// YouTube MSE/blob player often has no src until playback — use the watch URL.
 		if (!url && (tag === 'VIDEO' || tag === 'AUDIO')) {
-			if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
+			if (isYoutubeHost()) {
 				url = findYoutubeWatchUrl(anchor);
+			} else if (ig?.resolveVideoPageUrl) {
+				url = ig.resolveVideoPageUrl(anchor);
 			} else {
 				url = canonicalYoutubeUrl() || (isDedicatedMediaPage() ? location.href.split('#')[0] : null);
 			}
@@ -1813,9 +1532,8 @@
 
 	function scanSubtree(root) {
 		if (!captureActive() || !root) return;
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
-			scanYoutubeFeedCardsVisible();
-			return;
+		for (const h of siteHandlers) {
+			if (h.isHost?.() && h.scanSubtree?.()) return;
 		}
 		if (root.nodeType === 1) watchElement(root);
 		root.querySelectorAll?.(
@@ -1834,136 +1552,32 @@
 		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
 	);
 
-	function queryYoutubeFeedCards() {
-		const cards = [];
-		function walk(node) {
-			if (!node || node.nodeType !== 1) return;
-			if (node.matches?.(YT_FEED_CARD)) cards.push(node);
-			for (const child of node.children || []) walk(child);
-			if (node.shadowRoot) walk(node.shadowRoot);
-		}
-		walk(document.documentElement);
-		return cards;
-	}
-
-	function watchYoutubeFeedCard(card) {
-		if (!captureActive() || !card || card.getAttribute(CARD_WATCH_ATTR)) return;
-		card.setAttribute(CARD_WATCH_ATTR, '1');
-		cardIo.observe(card);
-	}
-
-	function scanYoutubeFeedCardsVisible() {
-		if (!captureActive() || !/youtube\.com|youtu\.be/i.test(location.hostname)) return;
-		const cards = queryYoutubeFeedCards()
-			.filter((card) => isNearViewport(card, BADGE_MARGIN_PX))
-			.sort((a, b) => cardViewportScore(a) - cardViewportScore(b));
-		for (const card of cards) {
-			watchYoutubeFeedCard(card);
-			processYoutubeFeedCard(card);
-		}
-	}
-
-	let scrollScanTimer = null;
-	function scheduleYoutubeScrollScan() {
-		if (!/youtube\.com|youtu\.be/i.test(location.hostname)) return;
-		clearTimeout(scrollScanTimer);
-		scrollScanTimer = setTimeout(scanYoutubeFeedCardsVisible, 120);
-	}
-
-	const cardIo = new IntersectionObserver(
-		(entries) => {
-			if (!captureActive()) return;
-			for (const entry of entries) {
-				if (!entry.isIntersecting) continue;
-				processYoutubeFeedCard(entry.target);
-			}
-		},
-		{ rootMargin: `${BADGE_MARGIN_PX}px`, threshold: 0.01 }
-	);
-
-	function scanYoutubeFeedCards() {
-		for (const card of queryYoutubeFeedCards()) {
-			watchYoutubeFeedCard(card);
-			if (watchBudget <= 0) continue;
-			if (isNearViewport(card, BADGE_MARGIN_PX)) {
-				watchBudget--;
-				processYoutubeFeedCard(card);
-			}
-		}
-	}
-
 	function scan() {
 		if (!captureActive()) return;
 		pruneBadges();
-		watchBudget = /youtube\.com|youtu\.be/i.test(location.hostname) ? 600 : 80;
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
-			for (const sel of [
-				'#movie_player video',
-				'ytd-watch-flexy #player video',
-				'#player video',
-				'ytd-shorts video',
-				'ytd-reel-video-renderer video',
-				'video.html5-main-video'
-			]) {
-				document.querySelectorAll(sel).forEach((player) => watchElement(player));
-			}
-			if (isYoutubeWatchPage()) {
-				const watchUrl = canonicalYoutubeUrl();
-				if (watchUrl) eagerPrefetch(watchUrl);
-			}
-			scanYoutubeFeedCards();
-			scanYoutubeFeedCardsVisible();
-			return;
+		watchBudget = 80;
+		for (const h of siteHandlers) {
+			const budget = h.getWatchBudget?.();
+			if (budget != null) watchBudget = budget;
+		}
+		const budgetRef = { value: watchBudget };
+		for (const h of siteHandlers) {
+			if (h.isHost?.() && h.scan?.(budgetRef)) return;
 		}
 		scanSubtree(document.documentElement);
 	}
 
 	document.addEventListener('click', (e) => {
-		const modalBtn = parseDownloadModalButton(e.target);
-		if (modalBtn) {
-			loadOmniLinksFromStorage();
+		try {
+			document.documentElement.setAttribute('data-veloce-coordinator', coordinatorOnline ? '1' : '0');
+			window.postMessage({
+				source: 'veloce-extension',
+				type: 'VELOCE_COORDINATOR',
+				online: coordinatorOnline
+			}, '*');
+		} catch { /* ignore */ }
 
-			try {
-				document.documentElement.setAttribute('data-veloce-coordinator', coordinatorOnline ? '1' : '0');
-				window.postMessage({
-					source: 'veloce-extension',
-					type: 'VELOCE_COORDINATOR',
-					online: coordinatorOnline
-				}, '*');
-			} catch { /* ignore */ }
-
-			interceptLog('step 1: OmniSave modal button', {
-				section: modalBtn.sectionKind,
-				label: modalBtn.label,
-				movie: modalBtn.movie,
-				coordinatorOnline,
-				cachedLinks: omniSaveLinks.length,
-				qualities: omniSaveLinks.map((l) => l.resolution ?? l.res)
-			});
-
-			if (modalBtn.sectionKind === 'quality' && coordinatorOnline) {
-				const link = findOmniSaveLink(modalBtn.label);
-				const movie = modalBtn.movie || omniSaveMovieTitle;
-				const formats = link ? formatFromOmniSaveLink(link, modalBtn.label, movie) : null;
-				if (formats) {
-					interceptLog('step 2: opening Veloce menu (cached link)', formats[0]);
-					e.preventDefault();
-					e.stopImmediatePropagation();
-					openFormatMenu(location.href.split('#')[0], modalBtn.btn, modalBtn.btn, formats);
-					return;
-				}
-				interceptLog('step 1c: no cached link — open modal again or refresh tab after extension load', {
-					label: modalBtn.label,
-					hint: 'links load when Download Options modal opens (axios API)'
-				});
-				showVeloceToast('Veloce: reopen Download Options modal once, then click quality again', true);
-			}
-
-			if (!coordinatorOnline) {
-				interceptLog('step 1b: coordinator OFFLINE — pnpm dev + click Veloce icon');
-				showVeloceToast('Veloce offline — run: cd backend && pnpm dev', true);
-			}
-		}
+		if (omni?.handleDocumentClick?.(e)) return;
 
 		const a = e.target.closest?.('a[href]');
 		if (!a) return;
@@ -1980,7 +1594,9 @@
 		e.preventDefault();
 		e.stopPropagation();
 		const pageUrl = location.href.split('#')[0];
-		const preloaded = a.hasAttribute('download') ? formatsFromDownloadAnchor(a) : null;
+		const preloaded = a.hasAttribute('download')
+			? (omni?.renameInterceptFormats?.(formatsFromDownloadAnchor(a)) || formatsFromDownloadAnchor(a))
+			: null;
 		const listUrl = resolveInterceptListUrl(pageUrl, resolveDownloadUrl(href, a) || href);
 		interceptLog('step 2: opening format menu from link click', { listUrl, preloaded: !!preloaded });
 		openFormatMenu(listUrl, a, a, preloaded || undefined);
@@ -1992,41 +1608,45 @@
 	function scheduleScan() {
 		if (!captureActive()) return;
 		clearTimeout(scanTimer);
+		let debounceMs = 200;
+		for (const h of siteHandlers) {
+			const ms = h.getScanDebounceMs?.();
+			if (ms != null) debounceMs = ms;
+		}
 		scanTimer = setTimeout(() => {
 			if (!captureActive()) return;
 			scanTimer = null;
 			cullBackgroundBadges();
-			watchBudget = /youtube\.com|youtu\.be/i.test(location.hostname) ? 600 : 80;
+			watchBudget = 80;
+			for (const h of siteHandlers) {
+				const budget = h.getWatchBudget?.();
+				if (budget != null) watchBudget = budget;
+			}
 			const batch = pendingMutations.splice(0);
 			const overlay = findMediaOverlay();
-			const onYoutube = /youtube\.com|youtu\.be/i.test(location.hostname);
-			if (onYoutube) {
-				for (const m of batch) {
-					for (const node of m.addedNodes) {
-						if (node.nodeType !== 1) continue;
-						if (node.matches?.(YT_FEED_CARD)) watchYoutubeFeedCard(node);
-						if (node.querySelectorAll) {
-							for (const card of node.querySelectorAll?.(YT_FEED_CARD) || []) {
-								watchYoutubeFeedCard(card);
-							}
-						}
-					}
+			const addedNodes = [];
+			for (const m of batch) {
+				for (const node of m.addedNodes) {
+					if (node.nodeType === 1) addedNodes.push(node);
 				}
-				scanYoutubeFeedCardsVisible();
-			} else {
-				for (const m of batch) {
-					for (const node of m.addedNodes) {
-						if (node.nodeType !== 1) continue;
-						if (overlay && !overlay.contains(node) && node !== overlay) continue;
-						scanSubtree(node);
-						if (watchBudget <= 0) break;
-					}
+			}
+			let handled = false;
+			for (const h of siteHandlers) {
+				if (h.isHost?.() && h.handleMutationNodes?.(addedNodes, overlay)) {
+					handled = true;
+					break;
+				}
+			}
+			if (!handled) {
+				for (const node of addedNodes) {
+					if (overlay && !overlay.contains(node) && node !== overlay) continue;
+					scanSubtree(node);
 					if (watchBudget <= 0) break;
 				}
 				if (overlay) scanSubtree(overlay);
 			}
 			scheduleBadgeLayout();
-		}, 200);
+		}, debounceMs);
 	}
 
 	// Re-scan when SPA navigates or a modal player opens/closes.
@@ -2035,8 +1655,8 @@
 		if (captureActive()) scan();
 	});
 	window.addEventListener('yt-navigate-finish', () => {
-		if (/youtube\.com|youtu\.be/i.test(location.hostname)) {
-			resetYoutubeCapture();
+		if (isYoutubeHost()) {
+			yt?.resetCapture?.();
 		} else {
 			cullBackgroundBadges();
 		}
@@ -2068,6 +1688,46 @@
 	setTimeout(queryForegroundState, 200);
 	connectTabPort();
 	startTabPing();
+
+	initSiteHandlers({
+		captureActive,
+		placeBadge,
+		removeBadge,
+		badges,
+		badgeKeys,
+		normalizeBadgeKey,
+		SCANNED_ATTR,
+		CARD_WATCH_ATTR,
+		BADGE_MARGIN_PX,
+		isNearViewport,
+		shouldStartPrefetch,
+		closeMenu,
+		showVeloceToast,
+		resetScanStateDeep,
+		cardIo,
+		igCardIo,
+		watchElement,
+		isSocialFeedPage,
+		isDedicatedMediaPage,
+		visibleMediaRect,
+		clipRectToViewport,
+		mediaVisibleRect,
+		findMediaOverlay,
+		cardViewportScore,
+		eagerPrefetch,
+		isHttpUrl,
+		isBrowserOnlyUrl,
+		CDN_IMAGE,
+		setReelsPrefetchFocus,
+		interceptLog,
+		openFormatMenu,
+		formatsFromDownloadAnchor,
+		get coordinatorOnline() { return coordinatorOnline; },
+		invokeScan: () => scan()
+	});
+	omni?.onInit?.();
+	ig?.hookNavigation?.();
+
 	if (!document.hidden) scan();
 	const observer = new MutationObserver((mutations) => {
 		if (!captureActive()) return;
@@ -2080,7 +1740,4 @@
 	setInterval(() => {
 		if (!document.hidden) refreshCoordinatorState();
 	}, 12000);
-	if (/videodownloader\.site/i.test(location.hostname)) {
-		interceptLog('OmniSave site detected — page hook + modal intercept active');
-	}
 })();

@@ -39,33 +39,72 @@
 		return coordinatorOnline;
 	}
 
-	function storeDownloadLinks(links, movie) {
-		if (!Array.isArray(links) || !links.length) return;
-		const payload = { links, movie: movie || '', ts: Date.now() };
+	function storeDownloadPayload(links, captions, movie) {
+		const hasLinks = Array.isArray(links) && links.length;
+		const hasCaptions = Array.isArray(captions) && captions.length;
+		if (!hasLinks && !hasCaptions) return;
+		const payload = {
+			links: hasLinks ? links : [],
+			captions: hasCaptions ? captions : [],
+			movie: movie || '',
+			ts: Date.now()
+		};
 		try {
 			sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 		} catch { /* ignore */ }
 		logImportant('stored download links', {
-			count: links.length,
+			count: payload.links.length,
+			captions: payload.captions.length,
 			movie,
-			qualities: links.map((l) => l.resolution ?? l.res ?? l.quality)
+			qualities: payload.links.map((l) => l.resolution ?? l.res ?? l.quality)
 		});
 		try {
 			window.postMessage({
 				source: 'veloce-page-hook',
 				type: 'VELOCE_DOWNLOAD_LINKS',
-				links,
+				links: payload.links,
+				captions: payload.captions,
 				movie
 			}, '*');
 		} catch { /* ignore */ }
 	}
 
+	function normalizeMediaLinks(raw) {
+		if (!Array.isArray(raw)) return [];
+		return raw.map((item) => ({
+			url: item.url || item.downloadUrl || item.href || item.resourceLink || '',
+			resolution: item.resolution ?? item.res ?? item.quality ?? item.label,
+			format: item.format || item.codecName || 'mp4',
+			label: item.title || item.label || ''
+		})).filter((item) => item.url);
+	}
+
+	function normalizeCaptionLinks(raw) {
+		if (!Array.isArray(raw)) return [];
+		return raw.map((item) => ({
+			url: item.url || item.downloadUrl || item.href || '',
+			lan: item.lan || item.lang || item.language || '',
+			lanName: item.lanName || item.languageName || item.label || item.name || item.lan || 'subtitle'
+		})).filter((item) => item.url);
+	}
+
 	function parseDownloadApiBody(body) {
 		if (!body || typeof body !== 'object') return;
-		const links = body.downloads || body.downloadLinks || body.data?.downloads || [];
-		if (!Array.isArray(links) || !links.length) return;
+		const rawLinks = body.downloads || body.downloadLinks || body.data?.downloads
+			|| body.list || body.data?.list || [];
+		const rawCaptions = body.captions || body.extCaptions || body.data?.captions
+			|| body.data?.extCaptions || [];
+		const embeddedCaptions = [];
+		if (Array.isArray(rawLinks)) {
+			for (const item of rawLinks) {
+				if (Array.isArray(item?.extCaptions)) embeddedCaptions.push(...item.extCaptions);
+			}
+		}
+		const links = normalizeMediaLinks(rawLinks);
+		const captions = normalizeCaptionLinks([].concat(rawCaptions, embeddedCaptions));
+		if (!links.length && !captions.length) return;
 		const movie = body.title || body.subject?.title || body.data?.title || '';
-		storeDownloadLinks(links, movie);
+		storeDownloadPayload(links, captions, movie);
 	}
 
 	function isDownloadApiUrl(url) {
@@ -101,7 +140,14 @@
 		obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-veloce-coordinator'] });
 	} catch { /* ignore */ }
 
-	// OmniSave API uses axios/XHR — not window.fetch.
+	function inspectDownloadApiResponse(url, text) {
+		if (!isDownloadApiUrl(url) || !text) return;
+		try {
+			parseDownloadApiBody(JSON.parse(text));
+		} catch { /* ignore */ }
+	}
+
+	// MovieBox / OmniSave API uses axios/XHR; some mirrors also use fetch.
 	try {
 		const nativeXHROpen = XMLHttpRequest.prototype.open;
 		const nativeXHRSend = XMLHttpRequest.prototype.send;
@@ -111,16 +157,29 @@
 		};
 		XMLHttpRequest.prototype.send = function veloceXHRSend(...args) {
 			this.addEventListener('load', function veloceXHRLoad() {
-				const url = this.__veloceUrl || '';
-				if (!isDownloadApiUrl(url) || !this.responseText) return;
-				try {
-					parseDownloadApiBody(JSON.parse(this.responseText));
-				} catch { /* ignore */ }
+				inspectDownloadApiResponse(this.__veloceUrl || '', this.responseText);
 			});
 			return nativeXHRSend.apply(this, args);
 		};
 	} catch (e) {
 		logImportant('XHR hook failed (SES?)', String(e));
+	}
+
+	try {
+		const nativeFetch = window.fetch;
+		if (typeof nativeFetch === 'function') {
+			window.fetch = function veloceFetch(input, init) {
+				const url = typeof input === 'string' ? input : input?.url || '';
+				return nativeFetch.call(this, input, init).then((res) => {
+					if (isDownloadApiUrl(url)) {
+						res.clone().text().then((text) => inspectDownloadApiResponse(url, text)).catch(() => {});
+					}
+					return res;
+				});
+			};
+		}
+	} catch (e) {
+		logImportant('fetch hook failed (SES?)', String(e));
 	}
 
 	// Only intercept programmatic <a download>.click() — do NOT hook createElement (breaks React/GSI).

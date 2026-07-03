@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Veloce Download Manager",
-  "version": "1.5.2",
+  "version": "1.7.5",
   "description": "Intercepts web resources and sends them to the local Veloce Engine",
   "action": {
     "default_popup": "index.html"
@@ -36,7 +36,13 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": [
+        "sites/registry.js",
+        "sites/youtube.js",
+        "sites/instagram.js",
+        "sites/omnisave.js",
+        "content.js"
+      ],
       "run_at": "document_start",
       "all_frames": false
     },

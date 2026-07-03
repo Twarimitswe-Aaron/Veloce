@@ -101,7 +101,7 @@ function normalizeFormatUrl(url) {
 		}
 		if (/instagram\.com/i.test(u.hostname)) {
 			u.search = '';
-			u.pathname = u.pathname.replace(/\/+$/, '');
+			u.pathname = u.pathname.replace(/\/reels\//i, '/reel/').replace(/\/+$/, '');
 		}
 		return u.href;
 	} catch {
@@ -278,7 +278,8 @@ function handleWsMessage(data) {
 						downloaded: d.downloaded ?? 0,
 						total: d.total ?? 0,
 						speedBps: 0,
-						etaSecs: 0
+						etaSecs: 0,
+						isPlaylist: d.isPlaylist === true
 					});
 				}
 			}
@@ -324,7 +325,42 @@ function handleWsMessage(data) {
 			broadcastToExtension({ type: 'VELOCE_SETTINGS', settings });
 			break;
 		case 'PLAYLIST_QUEUED':
-			notify(`veloce-pl-${Date.now()}`, 'Playlist queued', `${data.count}/${data.total} items added to Veloce.`);
+			notify('veloce-pl-' + Date.now(), 'Playlist started', `"${data.title || 'Playlist'}" — ${data.total} tracks, one job (see Settings for format).`);
+			if (data.playlistId) {
+				upsertDownload(data.playlistId, {
+					fileName: `${data.title || 'Playlist'} (0/${data.total} tracks)`,
+					status: 'queued',
+					isPlaylist: true
+				});
+			}
+			break;
+		case 'PLAYLIST_UPDATE':
+			if (data.playlistId) {
+				upsertDownload(data.playlistId, {
+					fileName: data.fileName || 'Playlist',
+					status: data.status === 'cancelled' ? 'error' : (data.status || 'downloading'),
+					downloaded: data.downloaded ?? 0,
+					total: data.totalBytes ?? 0,
+					speedBps: data.speedBps ?? 0,
+					etaSecs: data.etaSecs ?? 0,
+					isPlaylist: true,
+					error: data.error
+				});
+			}
+			break;
+		case 'PLAYLIST_REMOVED':
+			if (data.playlistId) {
+				delete downloads[data.playlistId];
+				broadcastToExtension({ type: 'VELOCE_DOWNLOAD_REMOVED', downloadId: data.playlistId });
+			}
+			break;
+		case 'PLAYLIST_FINISHED':
+			if (data.playlistId) {
+				const msg = `"${data.title || 'Playlist'}" done — ${data.completed ?? 0} saved, ${data.failed ?? 0} skipped`;
+				notify(`veloce-pl-done-${data.playlistId}`, 'Playlist finished', msg);
+				delete downloads[data.playlistId];
+				broadcastToExtension({ type: 'VELOCE_DOWNLOAD_REMOVED', downloadId: data.playlistId });
+			}
 			break;
 		case 'DIRECTORY_SELECTED':
 			selectedDirectory = data.payload?.path ?? null;
@@ -1041,6 +1077,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 			if (!isForegroundTab(_sender.tab?.id)) return false;
 			prefetchBatch(msg.urls);
 			return false;
+
+		case 'VELOCE_PREFETCH_FOCUS': {
+			if (!isForegroundTab(_sender.tab?.id)) return false;
+			const keep = new Set(
+				(Array.isArray(msg.keep) ? msg.keep : [])
+					.map((u) => normalizeFormatUrl(u))
+					.filter(Boolean)
+			);
+			for (let i = prefetchQueue.length - 1; i >= 0; i--) {
+				const key = prefetchQueue[i];
+				if (!keep.has(key)) {
+					prefetchQueue.splice(i, 1);
+					prefetchQueued.delete(key);
+				}
+			}
+			drainPrefetchQueue();
+			return false;
+		}
 
 		case 'VELOCE_AM_I_FOREGROUND':
 			(async () => {

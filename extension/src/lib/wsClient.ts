@@ -5,12 +5,19 @@ export const selectedDirectory = writable<string | null>(null);
 export const pickerError = writable<string | null>(null);
 export const interceptEnabled = writable(true);
 
+export interface PlaylistFormatSettings {
+	mediaType: 'audio' | 'video';
+	videoQuality: '1080' | '720' | '480' | '360' | 'best';
+	audioMissingFallback: 'video' | 'skip';
+}
+
 export interface VeloceSettings {
 	maxConcurrentDownloads: number;
 	defaultThreads: number;
 	maxRateBytes: number;
 	baseDirectory: string;
 	engineQuiet: boolean;
+	playlistFormats: PlaylistFormatSettings;
 }
 
 export const settings = writable<VeloceSettings | null>(null);
@@ -27,8 +34,8 @@ export interface DownloadItem {
 	etaSecs: number;
 	error?: string;
 	updatedAt: number;
-	/** Stable first-seen sequence — fixes each row's position so the list never reshuffles. */
 	order: number;
+	isPlaylist?: boolean;
 }
 
 export const downloads = writable<Record<string, DownloadItem>>({});

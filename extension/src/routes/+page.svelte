@@ -24,6 +24,9 @@
 	let sDefaultThreads = $state(8);
 	let sMaxRateMB = $state(0);
 	let sEngineQuiet = $state(true);
+	let plMediaType = $state<'audio' | 'video'>('audio');
+	let plVideoQuality = $state<'1080' | '720' | '480' | '360' | 'best'>('720');
+	let plAudioFallback = $state<'video' | 'skip'>('video');
 
 	$effect(() => {
 		const s = $settings as VeloceSettings | null;
@@ -32,6 +35,11 @@
 			sDefaultThreads = s.defaultThreads;
 			sMaxRateMB = Math.round((s.maxRateBytes / (1024 * 1024)) * 10) / 10;
 			sEngineQuiet = s.engineQuiet;
+			if (s.playlistFormats) {
+				plMediaType = s.playlistFormats.mediaType;
+				plVideoQuality = s.playlistFormats.videoQuality;
+				plAudioFallback = s.playlistFormats.audioMissingFallback;
+			}
 		}
 	});
 
@@ -40,7 +48,12 @@
 			maxConcurrentDownloads: sMaxConcurrent,
 			defaultThreads: sDefaultThreads,
 			maxRateBytes: Math.round(sMaxRateMB * 1024 * 1024),
-			engineQuiet: sEngineQuiet
+			engineQuiet: sEngineQuiet,
+			playlistFormats: {
+				mediaType: plMediaType,
+				videoQuality: plVideoQuality,
+				audioMissingFallback: plAudioFallback
+			}
 		});
 	}
 
@@ -179,7 +192,7 @@
 
 		<label class="flex items-center gap-2 text-[11px] opacity-80 cursor-pointer">
 			<input type="checkbox" bind:checked={asPlaylist} class="accent-white" />
-			Treat URL as a playlist (queue every item)
+			Treat URL as a playlist (one job — format from Settings below)
 		</label>
 
 		<button
@@ -219,6 +232,32 @@
 					<input type="checkbox" bind:checked={sEngineQuiet} class="accent-white" />
 					Quiet engine (no terminal progress bars)
 				</label>
+				<div class="border-t border-white/15 pt-3 mt-1">
+					<p class="text-[10px] uppercase tracking-widest opacity-60 mb-2">Playlist downloads</p>
+					<div class="flex flex-col gap-2">
+						<label class="text-[11px] opacity-80">Media type
+							<select bind:value={plMediaType} class="{inputClass} mt-1">
+								<option value="audio">Audio only (preferred)</option>
+								<option value="video">Video with audio</option>
+							</select>
+						</label>
+						<label class="text-[11px] opacity-80">Video quality (when video or fallback)
+							<select bind:value={plVideoQuality} class="{inputClass} mt-1">
+								<option value="1080">1080p (step down if missing)</option>
+								<option value="720">720p (step down if missing)</option>
+								<option value="480">480p (step down if missing)</option>
+								<option value="360">360p</option>
+								<option value="best">Best available</option>
+							</select>
+						</label>
+						<label class="text-[11px] opacity-80">If audio-only and no audio stream
+							<select bind:value={plAudioFallback} class="{inputClass} mt-1">
+								<option value="video">Download video at quality above</option>
+								<option value="skip">Skip track</option>
+							</select>
+						</label>
+					</div>
+				</div>
 				<button
 					type="button"
 					disabled={!$isConnected}
@@ -273,10 +312,15 @@
 							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
 								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Cancel</button>
 						{:else if d.status === 'error'}
-							<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
-								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Retry</button>
-							<button type="button" onclick={() => wsClient.removeDownload(d.id)}
-								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
+							{#if d.isPlaylist}
+								<button type="button" onclick={() => wsClient.removeDownload(d.id)}
+									class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
+							{:else}
+								<button type="button" onclick={() => wsClient.resumeDownload(d.id)}
+									class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Retry</button>
+								<button type="button" onclick={() => wsClient.removeDownload(d.id)}
+									class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>
+							{/if}
 						{:else if d.status === 'completed'}
 							<button type="button" onclick={() => wsClient.openFile(d.id)}
 								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Open</button>
