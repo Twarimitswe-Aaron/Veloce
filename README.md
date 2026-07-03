@@ -15,8 +15,9 @@ Veloce is a high-performance, segmented Internet Download Manager (IDM) designed
 *   **How it works:** A **global scheduler** caps how many engine processes run at once (default **10**, configurable via `.env`). Additional jobs queue FIFO — you can queue **100+ downloads**; they start as slots free up. Each engine is a **child process**; coordinator crash recovery re-queues interrupted jobs on restart.
 
 ### 3. `core_engine/` (Rust Core)
-*   **Tech Stack:** Rust, Tokio, Reqwest, Crossbeam
+*   **Tech Stack:** Rust 0.2.0, Tokio, Reqwest, Crossbeam
 *   **Role:** The heavy lifter. A standalone executable invoked by the coordinator. It performs segmented byte-range downloads with a **lock-free work-stealing** piece queue, adaptive concurrency, idle-stall detection, and crash-safe resume — writing directly to disk at maximum speed.
+*   **Layout:** Modular library (`file_io`, `piece`, `profiles`, `probe`, `adaptive`, `resume`, `discover`, `download`, `engine`) plus a thin `main.rs` CLI. See `core_engine/src/lib.rs`.
 
 ## 📚 Learning Concepts Explained
 
@@ -27,7 +28,7 @@ To let the browser extension talk to your computer's native file system, we use 
 Instead of compiling the complex Rust Engine into a JavaScript module (FFI), the SvelteKit backend runs the compiled Rust executable (`veloce_core.exe`) exactly like you would run a command in the terminal. This is called spawning a **Child Process**. If the Rust engine crashes due to a bad network request, your SvelteKit dashboard stays safely alive and can restart it.
 
 ### Multi-Threading (Tokio)
-The Rust engine first probes whether the server honors HTTP range requests. If it does, the file is divided into fixed **4 MiB pieces** placed on a shared queue. `Tokio` runs one async worker per connection; each worker repeatedly claims the next pending piece and writes it at the correct file offset. Because workers pull work dynamically, a slow connection never holds up the others — there is no fixed per-thread "tail". Every sub-range response is verified to be `206 Partial Content`; a `200` (server silently ignoring `Range`) is rejected so the full body can never be written over a piece offset and corrupt the file.
+The Rust engine first probes whether the server honors HTTP range requests. If it does, the file is divided into **adaptive pieces** (typically 1–16 MiB, tuned per host and file size) placed on a shared queue. `Tokio` runs one async worker per connection; each worker repeatedly claims the next pending piece and writes it at the correct file offset. Because workers pull work dynamically, a slow connection never holds up the others — there is no fixed per-thread "tail". Every sub-range response is verified to be `206 Partial Content`; a `200` (server silently ignoring `Range`) is rejected so the full body can never be written over a piece offset and corrupt the file.
 
 ## 🚀 Performance & Reliability (implemented)
 
@@ -56,7 +57,8 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Release profile** — thin LTO + `codegen-units = 1` for faster binary.
 
 ### Coordinator (`backend/`)
-*   **Global download scheduler** — caps concurrent engine processes (default 3); extra jobs queue FIFO and start as slots free.
+*   **Global download scheduler** — caps concurrent engine processes (default **10**); extra jobs queue FIFO and start as slots free.
+*   **Shared engine CLI builder** — `engineCli.ts` centralizes `core_engine` spawn arguments (`--read-buffer-bytes`, `--no-auto-tune`, referer/origin) for both single downloads and playlist jobs.
 *   **Media resolution with cookie fallback** — resolves direct URLs via yt-dlp, trying Chrome → Firefox → no-cookies, so login-gated, extension-less links (e.g. Instagram reels) resolve to a single progressive `mp4`.
 *   **Completion cleanup** — once a download is recorded `completed` in the DB, the engine's `.veloce_done`/`.veloce_state` markers are permanently removed (unlinked, not sent to trash) to keep the download folder clean.
 *   **Fail-closed safety** — aborts (instead of downloading page HTML) when media-URL extraction fails, and aborts when free disk space can't be verified.
@@ -73,6 +75,10 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Resilient folder picker** — tries `zenity`, then `kdialog`, and reports when neither is available.
 
 ### Extension (`extension/`)
+*   **Site handler registry** — per-site modules under `extension/static/sites/` (`youtube.js`, `instagram.js`, `mediafire.js`, `omnisave.js`) register via `registry.js` and are loaded before `content.js`.
+*   **YouTube watch / SPA** — badges on the main `#movie_player` video; `v=` URL changes (sidebar click, autoplay) reset badges and prefetch focus; radio/mix `list=RD…` stripped to `watch?v=ID`; sidebar prefetch disabled on watch pages.
+*   **Instagram Reels** — prefetch starts when a reel begins playing; scroll switches focus to the new reel while keeping the previous reel cached (2-slot window); `/reels/ID` normalized to `/reel/ID`.
+*   **MediaFire file pages** — badges on `mediafire.com/file/…/file` (polls for the download button after "Preparing Download").
 *   **In-page capture** — content script badges every downloadable `<a>`, `<video>`, `<audio>`, and video/social page; format picker via `LIST_FORMATS` (yt-dlp JSON).
 *   **Download interception** — `chrome.downloads.onCreated` cancels native downloads when coordinator is online (toggle in popup).
 *   **Persistent background WS** — service worker keeps the connection alive when popup is closed.
@@ -111,7 +117,50 @@ Use this section as study material: each row is a real failure mode, why it matt
 | 16 | 100 simultaneous download requests | Socket/RAM exhaustion | FIFO queue + configurable active engine cap | scheduler + `.env` |
 | 17 | Native browser download while Veloce online | Bypasses engine | `chrome.downloads` intercept → Veloce queue | `background.js` |
 | 18 | User wants specific quality | Wrong default format | In-page badge → `LIST_FORMATS` → `directUrl` download | extension + `listFormats` |
+| 19 | YouTube SPA changes `v=` without reload | Stale badge / wrong prefetch | `onWatchVideoChanged` + `hookNavigation`; reset capture, update prefetch focus | `sites/youtube.js` |
+| 20 | Instagram Reels scroll | Format list hangs on wrong reel | Play-triggered prefetch + 2-slot focus window | `sites/instagram.js` + `VELOCE_PREFETCH_FOCUS` |
+| 21 | MediaFire "Preparing Download" delay | No badge on file page | Poll DOM every 600ms until download button appears | `sites/mediafire.js` |
+| 22 | Slow link underutilized | Fixed thread count wastes bandwidth | Auto-tune probe (2–16 connections) + AIMD adaptive concurrency | `probe.rs` + `adaptive.rs` |
 
+## 🆕 Recent updates
+
+Summary of notable changes in the latest development cycle. For agent/contributor details on format handling and site DOM layouts, see **`AGENTS.md`**.
+
+### `core_engine` v0.2.0 — modular engine + throughput tuning
+
+The monolithic `main.rs` was split into focused modules so each concern can be tested and tuned independently:
+
+| Module | Responsibility |
+|---|---|
+| `file_io.rs` | Shared file handle, cross-platform `pwrite`/`seek_write`, free-space via `fs2` |
+| `piece.rs` | Adaptive 1–16 MiB piece sizing |
+| `profiles.rs` | Per-host defaults (MediaFire 8 MiB, googlevideo 4 MiB, …) + optional JSON overrides |
+| `probe.rs` | Short pre-download connection probe (2–16 threads) |
+| `adaptive.rs` | AIMD concurrency — ramp up on success, halve on transient errors |
+| `resume.rs` | Binary `.veloce_state` bitmap (legacy JSON still loads) |
+| `discover.rs` | Size discovery (`HEAD` → ranged `GET` fallback) |
+| `download.rs` / `engine.rs` | Piece workers, reporter loop, orchestration |
+
+**Coordinator integration:** `backend/src/lib/server/engineCli.ts` builds consistent CLI args for `ws.ts` and `playlistRunner.ts`, wiring `VELOCE_ENGINE_AUTO_TUNE`, `VELOCE_ENGINE_READ_BUFFER_BYTES`, referer/origin, and `--quiet`.
+
+**Build:** release profile uses thin LTO (`Cargo.toml`). Rebuild after pulling:
+
+```bash
+cd core_engine && cargo build --release
+```
+
+### Extension v1.7.7 — site-specific capture
+
+*   **Handler split** — YouTube, Instagram, MediaFire, and OmniSave/MovieBox logic moved out of `content.js` into `extension/static/sites/*.js`.
+*   **YouTube** — watch-page badges, SPA navigation hooks, prefetch focus on the playing video only.
+*   **Instagram** — reels prefetch on play + scroll focus; no feed prefetch spam.
+*   **MediaFire** — file-page badges with delayed-button polling.
+*   **XHR intercept fix** — `responseType: 'json'` responses no longer break the OmniSave cache hook.
+
+### Backend fixes
+
+*   Download jobs use `runtime.defaultThreads` (per-device setting) — the `downloads` table does not store a per-row thread count.
+*   Engine spawn errors log the resolved binary path from `coreEngineBinaryPath()`.
 
 ## 🔒 Security
 
@@ -207,10 +256,22 @@ systemctl --user enable --now veloce.service
 
 ## 🧪 Testing
 
-Backend unit tests (URL-safety/SSRF guard, filename sanitization, path confinement, category mapping, direct-URL/extractor detection) run with Vitest:
+**Backend** — URL-safety/SSRF guard, filename sanitization, path confinement, category mapping, direct-URL/extractor detection, and `engineCli` argument building (Vitest):
 
 ```bash
 cd backend && pnpm test
+```
+
+**Rust engine** — unit tests per module plus HTTP integration tests (`tests/integration_download.rs`):
+
+```bash
+cd core_engine && cargo test
+```
+
+Type-check the coordinator (SvelteKit + server TS):
+
+```bash
+cd backend && pnpm exec svelte-check --threshold error
 ```
 
 ## 🖱️ Using in-page capture
