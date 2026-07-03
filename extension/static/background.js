@@ -13,6 +13,16 @@ let wsPingTimer = null;
 const livePorts = new Set();
 /** Tab id of the active tab in the last-focused window — only it gets badges/prefetch. */
 let foregroundTabId = null;
+let previousForegroundTabId = null;
+
+const CONTENT_SCRIPT_FILES = [
+	'sites/registry.js',
+	'sites/youtube.js',
+	'sites/instagram.js',
+	'sites/omnisave.js',
+	'sites/mediafire.js',
+	'content.js'
+];
 const downloads = {};
 let selectedDirectory = null;
 let settings = null;
@@ -153,25 +163,60 @@ function isForegroundTab(tabId) {
 }
 
 async function refreshForegroundTab() {
+	const prev = foregroundTabId;
 	try {
 		const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
 		foregroundTabId = tab?.id ?? null;
 	} catch {
 		foregroundTabId = null;
 	}
-	broadcastForegroundState();
+	broadcastForegroundState(prev);
 }
 
-function broadcastForegroundState() {
-	chrome.tabs.query({}, (tabs) => {
-		for (const t of tabs) {
-			if (t.id == null) continue;
-			chrome.tabs.sendMessage(t.id, {
-				type: 'VELOCE_FOREGROUND_STATE',
-				active: t.id === foregroundTabId
-			}).catch(() => {});
-		}
-	});
+function notifyTabForegroundState(tabId, active) {
+	if (tabId == null) return;
+	const msg = { type: 'VELOCE_FOREGROUND_STATE', active };
+	chrome.tabs.sendMessage(tabId, msg).catch(() => {});
+	for (const port of livePorts) {
+		if (port.name !== 'veloce-tab' || port.sender?.tab?.id !== tabId) continue;
+		try { port.postMessage(msg); } catch { /* ignore */ }
+	}
+}
+
+/** Only the active tab (and the tab that just lost focus) are notified — not every open tab. */
+function broadcastForegroundState(previousId = previousForegroundTabId) {
+	previousForegroundTabId = foregroundTabId;
+	const targets = new Set();
+	if (foregroundTabId != null) targets.add(foregroundTabId);
+	if (previousId != null && previousId !== foregroundTabId) targets.add(previousId);
+	for (const tabId of targets) {
+		notifyTabForegroundState(tabId, tabId === foregroundTabId);
+	}
+}
+
+async function reinjectContentOnActiveTab() {
+	try {
+		const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+		if (!tab?.id || !tab.url || !/^https?:/i.test(tab.url)) return;
+		await chrome.scripting.executeScript({
+			target: { tabId: tab.id },
+			files: CONTENT_SCRIPT_FILES
+		});
+		try {
+			await chrome.scripting.executeScript({
+				target: { tabId: tab.id },
+				files: ['inject-intercept.js'],
+				world: 'MAIN'
+			});
+		} catch { /* MAIN hook may already be installed */ }
+		await refreshForegroundTab();
+	} catch (e) {
+		console.warn('[Veloce] Active-tab re-inject failed, reloading tab', e);
+		try {
+			const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+			if (tab?.id && tab.url && /^https?:/i.test(tab.url)) await chrome.tabs.reload(tab.id);
+		} catch { /* ignore */ }
+	}
 }
 
 function drainPrefetchQueue() {
@@ -1355,11 +1400,14 @@ if (chrome.contextMenus) {
 	});
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
 	chrome.storage.local.set({ veloce_intercept: true });
 	scheduleKeepaliveAlarm();
 	setupContextMenus();
 	void connectCoordinator();
+	if (details.reason === 'update' || details.reason === 'install') {
+		void reinjectContentOnActiveTab();
+	}
 });
 
 chrome.runtime.onStartup.addListener(() => {

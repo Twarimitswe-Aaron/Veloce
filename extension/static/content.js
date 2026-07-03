@@ -3,8 +3,18 @@
 // immediately when the user picks one.
 
 (function () {
-	if (window.__veloceContentLoaded) return;
-	window.__veloceContentLoaded = true;
+	let contentSession;
+	try {
+		contentSession = chrome.runtime.id + '@' + chrome.runtime.getManifest().version;
+	} catch {
+		return;
+	}
+	if (window.__veloceContentSession === contentSession) return;
+	if (window.__veloceContentTeardown) {
+		try { window.__veloceContentTeardown(); } catch { /* ignore */ }
+	}
+	window.__veloceContentSession = contentSession;
+	const teardownFns = [];
 
 	console.log('%c[Veloce] content script active', 'color:#00ff9d;font-weight:bold', location.href);
 
@@ -58,6 +68,162 @@
 			return p === 'blob:' || p === 'data:' || p === 'mediastream:';
 		} catch {
 			return /^blob:|^data:|^mediastream:/i.test(url || '');
+		}
+	}
+
+	let extensionDead = false;
+	let extensionReloadWarned = false;
+	let reloadBannerEl = null;
+
+	function isExtensionInvalidatedError(e) {
+		const s = String(e?.message || e || '');
+		return /invalidated/i.test(s);
+	}
+
+	function stopExtensionTimers() {
+		if (suspendTimer) {
+			clearTimeout(suspendTimer);
+			suspendTimer = null;
+		}
+		tabPort = null;
+	}
+
+	function showReloadBanner() {
+		if (reloadBannerEl?.isConnected) return;
+		try {
+			reloadBannerEl = document.createElement('div');
+			reloadBannerEl.textContent = 'Veloce was updated — refresh this page (F5)';
+			reloadBannerEl.setAttribute(
+				'style',
+				'position:fixed;bottom:16px;right:16px;z-index:2147483647;pointer-events:auto;' +
+				'padding:10px 14px;background:#001833;color:#fff;border:1px solid #fff;' +
+				'font:600 12px system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.45);cursor:default'
+			);
+			(document.body || document.documentElement).appendChild(reloadBannerEl);
+		} catch { /* ignore */ }
+	}
+
+	function markExtensionDead(reason) {
+		if (extensionDead) return;
+		extensionDead = true;
+		stopExtensionTimers();
+		if (!extensionReloadWarned) {
+			extensionReloadWarned = true;
+			console.warn('[Veloce] Extension was reloaded — refresh this page (F5) to continue.', reason || '');
+			showReloadBanner();
+		}
+	}
+
+	window.addEventListener('error', (e) => {
+		if (isExtensionInvalidatedError(e.error)) {
+			markExtensionDead(e.error);
+			e.preventDefault();
+		}
+	}, true);
+	window.addEventListener('unhandledrejection', (e) => {
+		if (isExtensionInvalidatedError(e.reason)) {
+			markExtensionDead(e.reason);
+			e.preventDefault();
+		}
+	});
+
+	function extensionAlive() {
+		if (extensionDead) return false;
+		try {
+			if (typeof chrome === 'undefined') return false;
+			const rt = chrome.runtime;
+			if (!rt) return false;
+			const id = rt.id;
+			return typeof id === 'string' && id.length > 0;
+		} catch (e) {
+			markExtensionDead(e);
+			return false;
+		}
+	}
+
+	function safeSendMessage(msg, callback) {
+		if (!extensionAlive()) {
+			callback?.(undefined);
+			return;
+		}
+		try {
+			rtSendMessage(msg, callback);
+		} catch (e) {
+			if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+			callback?.(undefined);
+		}
+	}
+
+	function rtSendMessage(msg, callback) {
+		chrome.runtime.sendMessage(msg, (r) => {
+			const err = chrome.runtime.lastError;
+			if (err) {
+				if (isExtensionInvalidatedError(err)) markExtensionDead(err);
+				callback?.(undefined);
+				return;
+			}
+			callback?.(r);
+		});
+	}
+
+	function safeConnect(name) {
+		if (!extensionAlive()) return null;
+		try {
+			return chrome.runtime.connect({ name });
+		} catch (e) {
+			if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+			return null;
+		}
+	}
+
+	function githubBlobToRaw(url) {
+		try {
+			const u = new URL(url);
+			const host = u.hostname.toLowerCase();
+			if (!host.endsWith('github.com') || host === 'raw.githubusercontent.com') return null;
+			const m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
+			if (!m) return null;
+			return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}/${m[4]}`;
+		} catch {
+			return null;
+		}
+	}
+
+	function isGithubRawUrl(url) {
+		try {
+			return /raw\.githubusercontent\.com/i.test(new URL(url).hostname);
+		} catch {
+			return false;
+		}
+	}
+
+	function isGithubRepoBrowseUrl(url) {
+		try {
+			const u = new URL(url);
+			const host = u.hostname.toLowerCase();
+			if (!host.endsWith('github.com') || host === 'raw.githubusercontent.com') return false;
+			if (/\/blob\//i.test(u.pathname)) return false;
+			return /^\/[^/]+\/[^/]+\/?$/.test(u.pathname) || /\/tree\//i.test(u.pathname);
+		} catch {
+			return false;
+		}
+	}
+
+	function resolveGithubListUrl(url) {
+		if (!url) return null;
+		return githubBlobToRaw(url) || (isGithubRawUrl(url) ? url : null);
+	}
+
+	function formatsForGithubUrl(url) {
+		const fetchUrl = resolveGithubListUrl(url);
+		if (!fetchUrl) return null;
+		try {
+			const name = decodeURIComponent(new URL(fetchUrl).pathname.split('/').pop() || 'download');
+			const dot = name.lastIndexOf('.');
+			const ext = dot > 0 ? name.slice(dot) : '.bin';
+			return [{ id: 'direct', label: `Direct — ${name}`, url: fetchUrl, ext }];
+		} catch {
+			return null;
 		}
 	}
 
@@ -145,6 +311,8 @@
 		}
 
 		if (!isHttpUrl(raw)) return null;
+		const gh = resolveGithubListUrl(raw);
+		if (gh) return gh;
 		return raw;
 	}
 
@@ -398,11 +566,12 @@
 	const PREFETCH_MARGIN_PX = BADGE_MARGIN_PX;
 	const SCANNED_ATTR = 'data-veloce-scanned';
 	const WATCH_ATTR = 'data-veloce-watch';
-	const TAB_PING_MS = 25000;
 	let openMenu = null;
 	let pendingMenuUrl = null;
+	let pendingLinkIntercept = null;
+	let menuDownloadChosen = false;
+	let linkInterceptBypassUntil = 0;
 	let tabPort = null;
-	let tabPingTimer = null;
 	// Cached coordinator state so the link-click handler can preventDefault()
 	// synchronously — otherwise the native download starts before an async check
 	// returns, and chrome.downloads.onCreated would create a second copy.
@@ -416,22 +585,19 @@
 	}
 
 	function suspendCapture() {
-		closeMenu();
+		closeMenu({ resume: false });
 		for (const key of [...badgeKeys]) removeBadge(key);
 		document.querySelectorAll(`[${WATCH_ATTR}], [${SCANNED_ATTR}]`).forEach((el) => {
 			try { mediaIo.unobserve(el); } catch { /* ignore */ }
 			el.removeAttribute(WATCH_ATTR);
 			el.removeAttribute(SCANNED_ATTR);
 		});
-		// Keep the tab port alive — pings wake the service worker for message routing.
 		if (!tabPort) connectTabPort();
-		if (!tabPingTimer) startTabPing();
 	}
 
 	function resumeCapture() {
 		if (!captureActive()) return;
 		connectTabPort();
-		startTabPing();
 		scan();
 	}
 
@@ -443,65 +609,50 @@
 		}
 		if (active === true) {
 			isForegroundTab = true;
-			if (ensureForegroundPolling.timer) {
-				clearInterval(ensureForegroundPolling.timer);
-				ensureForegroundPolling.timer = null;
-			}
 			if (!was || document.visibilityState === 'visible') {
 				resumeCapture();
 			}
 			return;
 		}
-		// Debounce suspend — SW can report false once before foregroundTabId is ready.
+		if (document.hidden) return;
+		// Debounce suspend — SW may broadcast before tab id is ready.
 		suspendTimer = setTimeout(() => {
 			suspendTimer = null;
 			if (document.hidden) return;
 			isForegroundTab = false;
 			suspendCapture();
-			ensureForegroundPolling();
 		}, 450);
 	}
 
-	function queryForegroundState() {
-		if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
-		chrome.runtime.sendMessage({ type: 'VELOCE_AM_I_FOREGROUND' }, (r) => {
-			if (chrome.runtime.lastError) return;
-			syncForegroundState(!!r?.active);
-		});
-	}
-
-	function ensureForegroundPolling() {
-		if (ensureForegroundPolling.timer) return;
-		ensureForegroundPolling.timer = setInterval(() => {
-			if (document.hidden) return;
-			if (isForegroundTab) {
-				clearInterval(ensureForegroundPolling.timer);
-				ensureForegroundPolling.timer = null;
-				return;
-			}
-			queryForegroundState();
-		}, 1500);
-	}
-	ensureForegroundPolling.timer = null;
-
 	if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-		chrome.storage.local.get('veloce_connected', (r) => {
-			coordinatorOnline = r.veloce_connected === true;
-			coordinatorStateReady = true;
-			syncInjectCoordinatorState();
-		});
-		chrome.storage.onChanged?.addListener((changes, area) => {
-			if (area === 'local' && changes.veloce_connected) {
-				coordinatorOnline = changes.veloce_connected.newValue === true;
+		try {
+			chrome.storage.local.get('veloce_connected', (r) => {
+				if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
+					markExtensionDead(chrome.runtime.lastError);
+					return;
+				}
+				coordinatorOnline = r.veloce_connected === true;
+				coordinatorStateReady = true;
 				syncInjectCoordinatorState();
-			}
-		});
+			});
+			chrome.storage.onChanged?.addListener((changes, area) => {
+				if (extensionDead) return;
+				if (area === 'local' && changes.veloce_connected) {
+					coordinatorOnline = changes.veloce_connected.newValue === true;
+					syncInjectCoordinatorState();
+				}
+			});
+		} catch (e) {
+			if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+		}
 	}
 
 	function connectTabPort() {
+		if (extensionDead) return;
 		try {
 			if (tabPort) return;
-			tabPort = chrome.runtime.connect({ name: 'veloce-tab' });
+			tabPort = safeConnect('veloce-tab');
+			if (!tabPort) return;
 			tabPort.onMessage.addListener((msg) => {
 				if (msg?.type === 'VELOCE_FOREGROUND_STATE') {
 					syncForegroundState(msg.active === true);
@@ -509,45 +660,23 @@
 			});
 			tabPort.onDisconnect.addListener(() => {
 				tabPort = null;
-				setTimeout(connectTabPort, 800);
+				if (extensionAlive()) setTimeout(connectTabPort, 800);
 			});
-		} catch {
-			setTimeout(connectTabPort, 1500);
-		}
-	}
-
-	function startTabPing() {
-		if (tabPingTimer || document.hidden) return;
-		tabPingTimer = setInterval(() => {
-			if (document.hidden) return;
-			try {
-				if (tabPort) tabPort.postMessage({ type: 'ping' });
-				else connectTabPort();
-			} catch {
-				tabPort = null;
-				connectTabPort();
-			}
-		}, TAB_PING_MS);
-	}
-
-	function stopTabPing() {
-		if (tabPingTimer) {
-			clearInterval(tabPingTimer);
-			tabPingTimer = null;
+		} catch (e) {
+			if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+			else if (extensionAlive()) setTimeout(connectTabPort, 1500);
 		}
 	}
 
 	document.addEventListener('visibilitychange', () => {
 		if (document.visibilityState === 'visible') {
-			queryForegroundState();
+			if (!extensionDead) connectTabPort();
 		} else {
+			isForegroundTab = false;
 			suspendCapture();
 		}
 	});
-	window.addEventListener('pageshow', () => queryForegroundState());
-	window.addEventListener('focus', () => queryForegroundState());
-
-	queryForegroundState();
+	window.addEventListener('pageshow', () => { if (!extensionDead) connectTabPort(); });
 
 	function markBadgeReady(badgeKey) {
 		const entry = badges.get(badgeKey);
@@ -845,9 +974,7 @@
 			batch.push({ url, priority: !!priority });
 		}
 		if (!batch.length) return;
-		try {
-			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_BATCH', urls: batch });
-		} catch { /* ignore */ }
+		safeSendMessage({ type: 'VELOCE_PREFETCH_BATCH', urls: batch });
 	}
 
 	/**
@@ -871,9 +998,7 @@
 			prefetchPageUrls([{ url: previousUrl, priority: false }]);
 		}
 
-		try {
-			chrome.runtime.sendMessage({ type: 'VELOCE_PREFETCH_FOCUS', keep: [...keep] });
-		} catch { /* ignore */ }
+		safeSendMessage({ type: 'VELOCE_PREFETCH_FOCUS', keep: [...keep] });
 	}
 
 	function interceptLog(step, detail) {
@@ -947,20 +1072,6 @@
 	}
 
 	setupInjectBridge();
-
-	function refreshCoordinatorState(cb) {
-		if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
-			cb?.();
-			return;
-		}
-		chrome.runtime.sendMessage({ type: 'VELOCE_GET_STATE' }, (r) => {
-			if (!chrome.runtime.lastError && r) {
-				coordinatorOnline = r.connected === true;
-				syncInjectCoordinatorState();
-			}
-			cb?.();
-		});
-	}
 
 	if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
 		chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1041,16 +1152,39 @@
 	}
 
 
-	function closeMenu() {
+	function resumeLinkNavigation(intercept) {
+		if (!intercept?.href) return;
+		linkInterceptBypassUntil = Date.now() + 1000;
+		const href = intercept.href;
+		const target = (intercept.target || '').toLowerCase();
+		try {
+			if (target === '_blank') {
+				window.open(href, '_blank', 'noopener,noreferrer');
+			} else {
+				window.location.assign(href);
+			}
+		} catch {
+			window.location.href = href;
+		}
+	}
+
+	function closeMenu(opts = {}) {
+		const shouldResume = opts.resume === true && pendingLinkIntercept && !menuDownloadChosen;
+		const intercept = shouldResume ? pendingLinkIntercept : null;
+		pendingLinkIntercept = null;
+		menuDownloadChosen = false;
 		if (openMenu) {
 			openMenu.remove();
 			openMenu = null;
 		}
 		pendingMenuUrl = null;
+		if (intercept) resumeLinkNavigation(intercept);
 	}
 
 	document.addEventListener('click', (e) => {
-		if (openMenu && !e.composedPath().includes(host)) closeMenu();
+		if (openMenu && !e.composedPath().includes(host)) {
+			closeMenu({ resume: !!pendingLinkIntercept });
+		}
 	}, true);
 
 	function iconSvg() {
@@ -1300,40 +1434,53 @@
 			btn.textContent = fmt.label;
 			btn.addEventListener('click', (e) => {
 				e.stopPropagation();
-				closeMenu();
+				menuDownloadChosen = true;
+				closeMenu({ resume: false });
 				const stem = fmt.label.split(' — ')[0] || 'download';
 				const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
 				const pageUrl = location.href.split('#')[0];
 				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 				const manifest = isManifestFormat(fmt);
 				const useDirect = fmt.url && fmt.id !== 'best' && !manifest;
-				chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
-					const payload = {
-						url: sourceUrl,
-						directUrl: useDirect ? fmt.url : undefined,
-						pageUrl,
-						referer: pageUrl,
-						fileName,
-						ext: fmt.ext,
-						baseDirectory: cfg.veloce_base_dir || undefined,
-						threads: 8
-					};
-				chrome.runtime.sendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
-					if (chrome.runtime.lastError) {
-						const err = chrome.runtime.lastError.message || 'extension error';
-						interceptLog('step 7: FAILED — sendMessage', { err });
-						showVeloceToast(`Veloce: ${err}`, true);
-						return;
-					}
-					if (!resp?.ok) {
-						interceptLog('step 7: FAILED — coordinator not reached', { resp });
-						showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
-						return;
-					}
-					interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
-					showVeloceToast(`Veloce: downloading ${fileName}`, false);
-				});
-				});
+				if (!extensionAlive()) {
+					showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+					return;
+				}
+				try {
+					chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
+						if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
+							markExtensionDead(chrome.runtime.lastError);
+							showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+							return;
+						}
+						const payload = {
+							url: sourceUrl,
+							directUrl: useDirect ? fmt.url : undefined,
+							pageUrl,
+							referer: pageUrl,
+							fileName,
+							ext: fmt.ext,
+							baseDirectory: cfg.veloce_base_dir || undefined,
+							threads: 8
+						};
+						safeSendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
+							if (!resp?.ok) {
+								if (extensionDead) {
+									showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+									return;
+								}
+								interceptLog('step 7: FAILED — coordinator not reached', { resp });
+								showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
+								return;
+							}
+							interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
+							showVeloceToast(`Veloce: downloading ${fileName}`, false);
+						});
+					});
+				} catch (e) {
+					if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+					showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+				}
 			});
 			menu.insertBefore(btn, closeBtn);
 		}
@@ -1348,7 +1495,7 @@
 
 	/** Playlist pages: settings-driven download only — no per-track format list. */
 	function openPlaylistOnlyMenu(pageUrl, badgeEl) {
-		closeMenu();
+		closeMenu({ resume: false });
 		const menu = document.createElement('div');
 		menu.className = 'menu';
 		const title = document.createElement('div');
@@ -1358,7 +1505,7 @@
 		const closeBtn = document.createElement('button');
 		closeBtn.className = 'menu-close';
 		closeBtn.textContent = 'Close';
-		closeBtn.addEventListener('click', closeMenu);
+		closeBtn.addEventListener('click', () => closeMenu({ resume: false }));
 		menu.appendChild(closeBtn);
 		shadow.appendChild(menu);
 		openMenu = menu;
@@ -1370,10 +1517,12 @@
 		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
 	}
 
-	function openFormatMenu(resolvedUrl, anchor, badgeEl, preloadedFormats) {
+	function openFormatMenu(resolvedUrl, anchor, badgeEl, preloadedFormats, linkIntercept) {
 		const pageUrl = location.href.split('#')[0];
 		const url = resolvedUrl || resolveDownloadUrl(anchor?.currentSrc || anchor?.src || anchor?.href, anchor);
-		closeMenu();
+		menuDownloadChosen = false;
+		pendingLinkIntercept = linkIntercept || null;
+		closeMenu({ resume: false });
 		const menu = document.createElement('div');
 		menu.className = 'menu';
 
@@ -1385,7 +1534,7 @@
 		const closeBtn = document.createElement('button');
 		closeBtn.className = 'menu-close';
 		closeBtn.textContent = 'Close';
-		closeBtn.addEventListener('click', closeMenu);
+		closeBtn.addEventListener('click', () => closeMenu({ resume: !!pendingLinkIntercept }));
 		menu.appendChild(closeBtn);
 
 		shadow.appendChild(menu);
@@ -1403,6 +1552,20 @@
 		if (preloadedFormats?.length) {
 			interceptLog('step 6: showing preloaded format(s)', { count: preloadedFormats.length, labels: preloadedFormats.map((f) => f.label) });
 			showFormatsInMenu(menu, closeBtn, preloadedFormats, url || pageUrl);
+			return;
+		}
+
+		const githubFormats = formatsForGithubUrl(url);
+		if (githubFormats?.length) {
+			showFormatsInMenu(menu, closeBtn, githubFormats, githubFormats[0].url);
+			return;
+		}
+
+		if (isGithubRepoBrowseUrl(url)) {
+			const err = document.createElement('div');
+			err.className = 'menu-status';
+			err.textContent = 'Not a direct file — close to follow the link, or open a file page first.';
+			menu.insertBefore(err, closeBtn);
 			return;
 		}
 
@@ -1445,14 +1608,13 @@
 		};
 
 		let busyPort = null;
-		try {
-			busyPort = chrome.runtime.connect({ name: 'veloce-busy' });
-		} catch { /* ignore */ }
+		if (extensionAlive()) {
+			busyPort = safeConnect('veloce-busy');
+		}
 
 		// Background SW may already have formats from prefetch — show instantly without a new yt-dlp run.
-		chrome.runtime.sendMessage({ type: 'VELOCE_PEEK_FORMATS', url: badgeKey }, (peek) => {
-			if (chrome.runtime.lastError) { /* fall through */ }
-			else if (peek?.formats?.length) {
+		safeSendMessage({ type: 'VELOCE_PEEK_FORMATS', url: badgeKey }, (peek) => {
+			if (peek?.formats?.length) {
 				if (busyPort) {
 					try { busyPort.disconnect(); } catch { /* ignore */ }
 					busyPort = null;
@@ -1461,7 +1623,15 @@
 				return;
 			}
 
-			chrome.runtime.sendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
+			if (!extensionAlive()) {
+				if (busyPort) {
+					try { busyPort.disconnect(); } catch { /* ignore */ }
+				}
+				finishWithError('Veloce was updated — refresh this page (F5).');
+				return;
+			}
+
+			safeSendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
 				if (busyPort) {
 					try { busyPort.disconnect(); } catch { /* ignore */ }
 					busyPort = null;
@@ -1636,6 +1806,8 @@
 	}
 
 	document.addEventListener('click', (e) => {
+		if (Date.now() < linkInterceptBypassUntil) return;
+
 		try {
 			document.documentElement.setAttribute('data-veloce-coordinator', coordinatorOnline ? '1' : '0');
 			window.postMessage({
@@ -1653,10 +1825,6 @@
 		if (!href || !isHttpUrl(href)) return;
 		if (!a.hasAttribute('download') && !FILE_EXT.test(href)) return;
 
-		// Only intercept when the coordinator is online. preventDefault MUST run
-		// synchronously here — deferring it (e.g. inside a sendMessage callback)
-		// lets the browser start a native download, which chrome.downloads.onCreated
-		// would then turn into a duplicate of the one the format menu starts.
 		if (!coordinatorOnline) return;
 		interceptLog('step 1: <a> link click intercepted', { href, download: a.hasAttribute('download'), isTrusted: e.isTrusted });
 		e.preventDefault();
@@ -1667,7 +1835,10 @@
 			: null;
 		const listUrl = resolveInterceptListUrl(pageUrl, resolveDownloadUrl(href, a) || href);
 		interceptLog('step 2: opening format menu from link click', { listUrl, preloaded: !!preloaded });
-		openFormatMenu(listUrl, a, a, preloaded || undefined);
+		openFormatMenu(listUrl, a, a, preloaded || undefined, {
+			href,
+			target: a.target || ''
+		});
 	}, true);
 
 	let scanTimer = null;
@@ -1734,11 +1905,12 @@
 		}
 		if (captureActive()) scan();
 	});
-	setInterval(() => {
+	const badgeLayoutTimer = setInterval(() => {
 		if (!captureActive()) return;
 		cullBackgroundBadges();
 		scheduleBadgeLayout();
 	}, 800);
+	teardownFns.push(() => clearInterval(badgeLayoutTimer));
 
 	document.addEventListener('visibilitychange', () => {
 		if (document.hidden) {
@@ -1750,16 +1922,11 @@
 			suspendCapture();
 		} else {
 			isForegroundTab = true;
-			queryForegroundState();
-			connectTabPort();
-			startTabPing();
+			if (!extensionDead) connectTabPort();
 			scan();
 		}
 	});
-	queryForegroundState();
-	setTimeout(queryForegroundState, 200);
-	connectTabPort();
-	startTabPing();
+	if (!extensionDead) connectTabPort();
 
 	initSiteHandlers({
 		captureActive,
@@ -1810,9 +1977,17 @@
 		scheduleScan();
 	});
 	observer.observe(document.documentElement, { childList: true, subtree: true });
-	setInterval(pruneBadges, 30000);
-	refreshCoordinatorState();
-	setInterval(() => {
-		if (!document.hidden) refreshCoordinatorState();
-	}, 12000);
+	teardownFns.push(() => observer.disconnect());
+	const pruneBadgesTimer = setInterval(pruneBadges, 30000);
+	teardownFns.push(() => clearInterval(pruneBadgesTimer));
+
+	window.__veloceContentTeardown = () => {
+		extensionDead = true;
+		stopExtensionTimers();
+		try { tabPort?.disconnect(); } catch { /* ignore */ }
+		tabPort = null;
+		for (const fn of teardownFns) {
+			try { fn(); } catch { /* ignore */ }
+		}
+	};
 })();

@@ -7,6 +7,7 @@ describe('isDirectFileUrl', () => {
 		expect(isDirectFileUrl('https://x.com/a/b/song.mp3?token=1')).toBe(true);
 		expect(isDirectFileUrl('https://host/file.zip#frag')).toBe(true);
 		expect(isDirectFileUrl('https://host/image.jpeg')).toBe(true);
+		expect(isDirectFileUrl('https://raw.githubusercontent.com/o/r/main/bible.xml')).toBe(true);
 	});
 
 	it('treats MediaFire CDN hosts as direct', () => {
@@ -16,6 +17,7 @@ describe('isDirectFileUrl', () => {
 	it('rejects landing pages and non-http', () => {
 		expect(isDirectFileUrl('https://example.com/watch?v=abc')).toBe(false);
 		expect(isDirectFileUrl('https://www.mediafire.com/file/key/name')).toBe(false);
+		expect(isDirectFileUrl('https://github.com/o/r/blob/main/file.xml')).toBe(false);
 		expect(isDirectFileUrl('ftp://host/file.mp4')).toBe(false);
 		expect(isDirectFileUrl('not a url')).toBe(false);
 	});

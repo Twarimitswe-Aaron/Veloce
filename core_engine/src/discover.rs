@@ -59,7 +59,11 @@ fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 
 fn parse_total_from_content_range(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let v = headers.get(CONTENT_RANGE)?.to_str().ok()?;
-    v.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|s| *s > 0)
+    let total_part = v.rsplit('/').next()?.trim();
+    if total_part == "*" {
+        return None;
+    }
+    total_part.parse::<u64>().ok().filter(|s| *s > 0)
 }
 
 /// Probe whether the server honors HTTP range requests.
@@ -125,6 +129,25 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
             });
         }
     }
+
+    // Some hosts (e.g. GitHub HTML) answer ranges with `bytes 0-0/*` — try a full GET.
+    let full = client.get(url).send().await.context("discovery full GET failed")?;
+    let full_status = full.status();
+    let full_etag = header_string(full.headers(), ETAG).or_else(|| etag.clone());
+    let full_lm = header_string(full.headers(), LAST_MODIFIED).or_else(|| lm.clone());
+
+    if full_status.is_success() {
+        if let Some(len) = parse_content_length(full.headers()) {
+            return Ok(Discovery {
+                total_size: len,
+                etag: full_etag,
+                last_modified: full_lm,
+                ranges_hint: Some(status.as_u16() == 206),
+                warmed_client: client.clone(),
+            });
+        }
+    }
+
     if status.is_success() {
         if let Some(len) = parse_content_length(res.headers()) {
             return Ok(Discovery {
@@ -160,5 +183,15 @@ mod tests {
             reqwest::header::HeaderValue::from_static("bytes 0-0/12345"),
         );
         assert_eq!(parse_total_from_content_range(&headers), Some(12345));
+    }
+
+    #[test]
+    fn parse_content_range_unknown_total() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 0-0/*"),
+        );
+        assert_eq!(parse_total_from_content_range(&headers), None);
     }
 }

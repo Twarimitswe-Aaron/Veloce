@@ -30,6 +30,7 @@ import {
 } from './playlistRunner';
 import { config } from './config';
 import { buildEngineCliArgs, coreEngineBinaryPath } from './engineCli';
+import { resolveGithubDownloadUrl } from './github';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
 import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
 
@@ -403,6 +404,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				return;
 			}
 			finalUrl = fresh;
+		} else if (/github\.com|githubusercontent\.com/i.test(finalUrl)) {
+			const gh = resolveGithubDownloadUrl(finalUrl);
+			if ('error' in gh) {
+				await markError(id, gh.error);
+				return;
+			}
+			finalUrl = gh.url;
 		} else if (!spec.directUrl && !isDirectFileUrl(spec.pageUrl) && spec.category === VIDEO_CATEGORY) {
 			const directUrl = await extractMediaUrl(spec.pageUrl);
 			if (!directUrl) {
@@ -674,10 +682,23 @@ async function saveBlobDownload(opts: {
  * scheduling. Shared by the single-download and playlist-expansion paths.
  */
 async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: string } | { ok: false; error: string }> {
+	const ghPage = resolveGithubDownloadUrl(opts.rawUrl);
+	if ('error' in ghPage) return { ok: false, error: ghPage.error };
+	let rawUrl = ghPage.url;
+
+	let directUrl = opts.directUrl;
+	if (directUrl) {
+		const ghDirect = resolveGithubDownloadUrl(directUrl);
+		if ('error' in ghDirect) return { ok: false, error: ghDirect.error };
+		directUrl = ghDirect.url;
+	} else if (isDirectFileUrl(rawUrl)) {
+		directUrl = rawUrl;
+	}
+
 	let rawName = sanitizeFileName(opts.fileName || 'download_file');
-	if (opts.directUrl) {
+	if (directUrl) {
 		try {
-			const du = new URL(opts.directUrl);
+			const du = new URL(directUrl);
 			const fromPath = path.basename(du.pathname);
 			if (fromPath && fromPath.includes('.')) {
 				rawName = sanitizeFileName(fromPath);
@@ -688,7 +709,7 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 		} catch { /* keep rawName */ }
 	}
 
-	const cat = categoryFor(opts.rawUrl, rawName);
+	const cat = categoryFor(rawUrl, rawName);
 	const category = cat.category;
 	rawName = cat.rawName;
 
@@ -699,7 +720,7 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	// qualities but still collapses an *active* identical source+target.
 	let duplicate: (typeof downloads.$inferSelect) | undefined;
 	const sameSource = await db.select().from(downloads).where(eq(downloads.url, opts.rawUrl));
-	if (!opts.directUrl) {
+	if (!directUrl) {
 		const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
 		const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
 		duplicate = activeDownload ?? completedOnDisk;
@@ -717,12 +738,12 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	const finalName = path.basename(savePath);
 	const downloadId = crypto.randomUUID();
 	const storedReferer = opts.referer ||
-		refererForDownload(opts.rawUrl, opts.directUrl || opts.rawUrl);
+		refererForDownload(opts.rawUrl, directUrl || opts.rawUrl);
 	await db.insert(downloads).values({
 		id: downloadId,
 		deviceId: opts.macAddress,
 		url: opts.rawUrl,
-		directUrl: opts.directUrl ?? null,
+		directUrl: directUrl ?? null,
 		referer: storedReferer ?? null,
 		fileName: finalName,
 		savePath,
@@ -737,8 +758,8 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 		savePath,
 		category,
 		threads: opts.threads,
-		allowRename: !opts.directUrl && !isDirectFileUrl(opts.rawUrl),
-		directUrl: opts.directUrl || (isDirectFileUrl(opts.rawUrl) ? opts.rawUrl : undefined),
+		allowRename: !directUrl && !isDirectFileUrl(rawUrl),
+		directUrl,
 		referer: storedReferer
 	}));
 	return { ok: true, downloadId };

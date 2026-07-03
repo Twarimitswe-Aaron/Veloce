@@ -11,6 +11,7 @@ import {
 	type FormatKind,
 	type MediaSource
 } from './formatSources';
+import { githubBlobToRaw, isGithubRawUrl, resolveGithubDownloadUrl } from './github';
 
 export type { FormatKind, MediaSource };
 
@@ -222,6 +223,27 @@ async function listFormatsUncached(
 		}
 		const name = path.basename(new URL(direct).pathname) || 'download';
 		const formats = [{ id: 'direct', label: `Direct — ${name}`, url: direct, ext: path.extname(name) || '.bin', source: 'mediafire' as MediaSource, kind: 'direct' as FormatKind }];
+		setCached(cacheKey, formats);
+		return formats;
+	}
+
+	if (/github\.com|githubusercontent\.com/i.test(url)) {
+		const gh = resolveGithubDownloadUrl(url);
+		if ('error' in gh) {
+			failCache.set(cacheKey, { reason: gh.error, ts: Date.now() });
+			return [];
+		}
+		const fetchUrl = gh.url;
+		const name = path.basename(new URL(fetchUrl).pathname) || 'download';
+		const ext = path.extname(name) || '.bin';
+		const formats = [{
+			id: 'direct',
+			label: `Direct — ${name}`,
+			url: fetchUrl,
+			ext,
+			source: 'direct' as MediaSource,
+			kind: 'direct' as FormatKind
+		}];
 		setCached(cacheKey, formats);
 		return formats;
 	}
@@ -647,7 +669,8 @@ export function isDirectFileUrl(url: string): boolean {
 		const u = new URL(url);
 		if (!/^https?:$/i.test(u.protocol)) return false;
 		if (isMediafireCdnHost(u.hostname)) return true;
-		return /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|iso)(\?|#|$)/i.test(u.pathname);
+		if (u.hostname.toLowerCase().endsWith('github.com') && /\/blob\//i.test(u.pathname)) return false;
+		return /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|iso|xml|txt|csv|json|md|yaml|yml|html|css|js|ts)(\?|#|$)/i.test(u.pathname);
 	} catch {
 		return false;
 	}
