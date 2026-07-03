@@ -29,7 +29,7 @@ import {
 	type PlaylistRuntime
 } from './playlistRunner';
 import { config } from './config';
-import { buildEngineCliArgs, coreEngineBinaryPath, coreEngineHasQuietFlag } from './engineCli';
+import { buildEngineCliArgs, coreEngineBinaryPath } from './engineCli';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
 import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
 
@@ -460,7 +460,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			threads: spec.threads,
 			maxRateBytes: runtime.maxRateBytes,
 			engineQuiet: runtime.engineQuiet,
-			hasQuietFlag: coreEngineHasQuietFlag(),
 			referer: referer || undefined
 		});
 		const rustProcess = spawn(bin, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });

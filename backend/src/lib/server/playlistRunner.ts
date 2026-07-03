@@ -46,7 +46,7 @@ function playlistDir(baseDir: string, folderName: string): string | null {
 	return target;
 }
 
-import { buildEngineCliArgs, coreEngineBinaryPath, coreEngineHasQuietFlag } from './engineCli';
+import { buildEngineCliArgs, coreEngineBinaryPath } from './engineCli';
 
 function broadcastPlaylist(
 	broadcast: BroadcastFn,
@@ -126,7 +126,6 @@ function runEngine(
 			threads: runtime.defaultThreads,
 			maxRateBytes: runtime.maxRateBytes,
 			engineQuiet: runtime.engineQuiet,
-			hasQuietFlag: coreEngineHasQuietFlag(),
 			referer
 		}), { stdio: ['ignore', 'pipe', 'inherit'] });
 

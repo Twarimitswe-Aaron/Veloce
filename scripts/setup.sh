@@ -39,7 +39,20 @@ done
 
 # ── Build the Rust core engine ────────────────────────────────────────────────
 info "Building the Rust core engine (release)..."
-( cd core_engine && cargo build --release )
+(
+	cd core_engine
+	cargo build --release
+	# exFAT/VFAT mounts sometimes leave a stale cargo fingerprint without linking the binary.
+	if [ ! -x target/release/core_engine ]; then
+		warn "Release binary missing after cargo build — retrying with a temp target dir..."
+		TMP_TARGET="/tmp/veloce-core-engine-target-$$"
+		CARGO_TARGET_DIR="$TMP_TARGET" cargo build --release
+		mkdir -p target/release
+		cp "$TMP_TARGET/release/core_engine" target/release/core_engine
+		chmod +x target/release/core_engine
+		rm -rf "$TMP_TARGET"
+	fi
+)
 info "Engine built: core_engine/target/release/core_engine"
 
 # ── Install deps + build the extension ────────────────────────────────────────
