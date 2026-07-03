@@ -1,0 +1,7 @@
+{
+  "hosts": {
+    "mediafire.com": { "threads": 4, "piece_mb": 8 },
+    "googlevideo.com": { "threads": 6, "piece_mb": 4 }
+  },
+  "default": { "threads": 8, "piece_mb": 4 }
+}

@@ -122,6 +122,7 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 | YouTube handler | `extension/static/sites/youtube.js` — feed cards, watch/Shorts, playlists |
 | Instagram handler | `extension/static/sites/instagram.js` — feed, post/reel, Stories |
 | OmniSave / MovieBox | `extension/static/sites/omnisave.js` — download-modal intercept |
+| MediaFire | `extension/static/sites/mediafire.js` — file page badge + CDN → page URL |
 | Orchestrator | `extension/static/content.js` — badges, menu, scan loop; delegates to site handlers |
 | XHR/fetch cache | `inject-intercept.js` hooks axios/fetch → `sessionStorage` key `veloce_omni_links` |
 | Open menu | `openFormatMenu(..., preloadedFormats)` — skips `LIST_FORMATS` |
@@ -196,6 +197,15 @@ Agents working on a site should **inspect the live DOM** (DevTools → Elements,
 | Stories | `/stories/user/ID` | Largest story `video` | `/stories/user/ID` |
 
 **Prefetch:** Reels/post viewer only when reel **starts playing**; keep previous reel in prefetch window (2 slots).
+
+### MediaFire (`extension/static/sites/mediafire.js`)
+
+| Page | DOM anchor | Badge target | Resolved URL |
+|------|------------|--------------|--------------|
+| File page | `www.mediafire.com/file/{key}/{name}/file` | `#downloadButton`, `#click_download`, `.download_link`, or `.dl-info` | Same file page URL (backend scrapes CDN) |
+| CDN link | `download{N}.mediafire.com/...` | N/A (intercept only) | Map back to file page URL |
+
+**Note:** Download button appears after "Preparing Download" — poll every 600ms until visible. Do not treat CDN URLs as the badge key.
 
 ---
 

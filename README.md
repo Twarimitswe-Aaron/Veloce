@@ -45,7 +45,15 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Backpressure-aware backoff** — `429`/`503` responses honor the `Retry-After` header (capped at 10 s) before retrying, instead of hammering a rate-limited origin.
 *   **Bandwidth cap** — an optional global **token-bucket rate limiter** (`--max-rate`, bytes/sec) throttles *aggregate* throughput across all connections, so Veloce can share a link politely (a classic IDM feature).
 *   **Atomic resume state** — `.veloce_state` is written to a temp file and `rename`d into place, so a crash mid-write can never leave a truncated state that defeats resume.
-*   **Tuned transport** — HTTP/1.1-only, no gzip, TCP nodelay, keep-alive, per-host pool sized to the connection count, 2 MiB write buffering.
+*   **Tuned transport** — HTTP/1.1-only, no gzip, TCP nodelay, keep-alive, per-host pool sized to the connection count, configurable read buffer (default 256 KiB).
+*   **Shared file + positioned writes** — one preallocated file; cross-platform `pwrite` / `seek_write` (Unix/Windows) instead of open+seek per piece.
+*   **Adaptive piece size** — 1–16 MiB based on file size and host profile (MediaFire 8 MiB, googlevideo 4 MiB, etc.).
+*   **Auto-tune connections** — short probe picks 2–16 threads before the main download (`--no-auto-tune` to disable).
+*   **Per-host profiles** — built-in + optional JSON (`--profiles-path`); see `core_engine/host_profiles.example.json`.
+*   **AIMD adaptive concurrency** — additive increase on success, multiplicative decrease on transient errors; permanent errors drop to 1 connection.
+*   **Staggered worker start** — 75 ms between connections to avoid burst throttling (`--no-stagger`).
+*   **Binary resume state** — compact bitmap in `.veloce_state` (legacy JSON still loads); persisted every 2 s or on piece completion.
+*   **Release profile** — thin LTO + `codegen-units = 1` for faster binary.
 
 ### Coordinator (`backend/`)
 *   **Global download scheduler** — caps concurrent engine processes (default 3); extra jobs queue FIFO and start as slots free.
@@ -124,6 +132,8 @@ The coordinator reads `backend/.env` at startup (real environment variables over
 | `VELOCE_MAX_RATE_BYTES` | `0` | Global speed cap per download in bytes/sec (`0` = unlimited). |
 | `VELOCE_MIN_FREE_DISK_MB` | `500` | Refuse to start if less free space than this. |
 | `VELOCE_ENGINE_QUIET` | `true` | Suppress the engine's terminal progress bars (keeps the log clean). Tunable live. |
+| `VELOCE_ENGINE_AUTO_TUNE` | `true` | Short probe to pick optimal connection count per download. |
+| `VELOCE_ENGINE_READ_BUFFER_BYTES` | `262144` | HTTP read/coalesce buffer per connection. |
 | `VELOCE_BASE_DIR` | *(empty)* | Override the default `~/Downloads/Veloce` base dir. |
 | `VELOCE_ALLOWED_EXTENSION_IDS` | *(empty)* | Comma-separated extension IDs allowed to connect (empty = any extension). |
 | `VELOCE_BLOCK_PRIVATE_HOSTS` | `true` | Block local/private/metadata hosts (SSRF guard). |

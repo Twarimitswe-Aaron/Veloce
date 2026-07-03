@@ -1,0 +1,164 @@
+//! Size discovery, range probing, and connection warmup.
+
+use anyhow::Context;
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE, RETRY_AFTER,
+};
+use reqwest::Client;
+use std::time::Instant;
+use tokio::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    pub total_size: u64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub ranges_hint: Option<bool>,
+    /// Warmed TCP+TLS connection reused for first worker when available.
+    pub warmed_client: Client,
+}
+
+pub fn build_http_client(threads: usize, referer: Option<&str>, origin: Option<&str>) -> anyhow::Result<Client> {
+    let mut client_builder = Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .no_gzip()
+        .http1_only()
+        .pool_max_idle_per_host(threads.max(1))
+        .connect_timeout(Duration::from_secs(30));
+
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Some(r) = referer {
+        if let Ok(val) = r.parse() {
+            default_headers.insert(reqwest::header::REFERER, val);
+        }
+    }
+    if let Some(o) = origin {
+        if let Ok(val) = o.parse() {
+            default_headers.insert(reqwest::header::ORIGIN, val);
+        }
+    }
+    if !default_headers.is_empty() {
+        client_builder = client_builder.default_headers(default_headers);
+    }
+    Ok(client_builder.build()?)
+}
+
+fn header_string(headers: &reqwest::header::HeaderMap, key: reqwest::header::HeaderName) -> Option<String> {
+    headers.get(key).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+}
+
+fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+}
+
+fn parse_total_from_content_range(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let v = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    v.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|s| *s > 0)
+}
+
+/// Probe whether the server honors HTTP range requests.
+pub async fn supports_ranges(client: &Client, url: &str) -> bool {
+    match client.get(url).header(RANGE, "bytes=0-0").send().await {
+        Ok(res) => {
+            if res.status().as_u16() == 206 {
+                return true;
+            }
+            res.headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("bytes"))
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Discover size + validators. Performs a ranged GET warmup on the shared client pool.
+pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
+    let _warmup_start = Instant::now();
+
+    if let Ok(head) = client.head(url).send().await {
+        if head.status().is_success() {
+            if let Some(len) = parse_content_length(head.headers()) {
+                let etag = header_string(head.headers(), ETAG);
+                let lm = header_string(head.headers(), LAST_MODIFIED);
+                let ar = head
+                    .headers()
+                    .get(ACCEPT_RANGES)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("bytes"));
+                return Ok(Discovery {
+                    total_size: len,
+                    etag,
+                    last_modified: lm,
+                    ranges_hint: ar,
+                    warmed_client: client.clone(),
+                });
+            }
+        }
+    }
+
+    let res = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await
+        .context("discovery GET failed")?;
+    let status = res.status();
+    let etag = header_string(res.headers(), ETAG);
+    let lm = header_string(res.headers(), LAST_MODIFIED);
+
+    if status.as_u16() == 206 {
+        if let Some(total) = parse_total_from_content_range(res.headers()) {
+            return Ok(Discovery {
+                total_size: total,
+                etag,
+                last_modified: lm,
+                ranges_hint: Some(true),
+                warmed_client: client.clone(),
+            });
+        }
+    }
+    if status.is_success() {
+        if let Some(len) = parse_content_length(res.headers()) {
+            return Ok(Discovery {
+                total_size: len,
+                etag,
+                last_modified: lm,
+                ranges_hint: Some(false),
+                warmed_client: client.clone(),
+            });
+        }
+    }
+    anyhow::bail!("could not determine file size (status {status})");
+}
+
+pub fn retry_after_secs(res: &reqwest::Response) -> u64 {
+    res.headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2)
+        .min(10)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_range_total() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 0-0/12345"),
+        );
+        assert_eq!(parse_total_from_content_range(&headers), Some(12345));
+    }
+}

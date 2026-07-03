@@ -68,6 +68,10 @@ export const config = {
 	minFreeDiskMb: num('VELOCE_MIN_FREE_DISK_MB', 500),
 	/** Suppress the engine's terminal progress bars (keeps the coordinator log clean). */
 	engineQuiet: bool('VELOCE_ENGINE_QUIET', true),
+	/** Enable engine auto-tune connection probe (pass --no-auto-tune when false). */
+	engineAutoTune: bool('VELOCE_ENGINE_AUTO_TUNE', true),
+	/** HTTP read buffer per connection passed to the engine. */
+	engineReadBufferBytes: num('VELOCE_ENGINE_READ_BUFFER_BYTES', 262_144),
 	/** Optional override for the default base download directory. */
 	baseDir: env['VELOCE_BASE_DIR'] || '',
 	/**

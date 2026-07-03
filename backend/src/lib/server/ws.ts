@@ -29,6 +29,7 @@ import {
 	type PlaylistRuntime
 } from './playlistRunner';
 import { config } from './config';
+import { buildEngineCliArgs, coreEngineBinaryPath, coreEngineHasQuietFlag } from './engineCli';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
 import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
 
@@ -366,7 +367,7 @@ function specFromRow(row: typeof downloads.$inferSelect): JobSpec {
 		fileName: row.fileName,
 		savePath: row.savePath,
 		category,
-		threads: 8,
+		threads: runtime.defaultThreads,
 		allowRename: false,
 		directUrl: row.directUrl ?? undefined,
 		referer: row.referer ?? undefined
@@ -451,22 +452,18 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			);
 			return;
 		}
-		const binaryPath = coreEngineBinaryPath();
-		const engineArgs = [
-			'--id', id,
-			'--url', finalUrl,
-			'--save-path', savePath,
-			'--threads', spec.threads.toString(),
-			'--max-rate', runtime.maxRateBytes.toString()
-		];
-		if (runtime.engineQuiet && coreEngineHasQuietFlag()) engineArgs.push('--quiet');
-		if (referer) {
-			engineArgs.push('--referer', referer);
-			try {
-				engineArgs.push('--origin', new URL(referer).origin);
-			} catch { /* ignore */ }
-		}
-		const rustProcess = spawn(binaryPath, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
+		const bin = coreEngineBinaryPath();
+		const engineArgs = buildEngineCliArgs({
+			id,
+			url: finalUrl,
+			savePath,
+			threads: spec.threads,
+			maxRateBytes: runtime.maxRateBytes,
+			engineQuiet: runtime.engineQuiet,
+			hasQuietFlag: coreEngineHasQuietFlag(),
+			referer: referer || undefined
+		});
+		const rustProcess = spawn(bin, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
 		running.set(id, { proc: rustProcess, intent: 'normal' });
 
 		let resolveProc!: () => void;
@@ -566,27 +563,6 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 const EXTRACTOR_DOMAINS = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'];
 
-/** Cached after first check — avoids passing --quiet to an outdated engine binary. */
-let engineSupportsQuiet: boolean | null = null;
-
-function coreEngineBinaryPath(): string {
-	const coreDir = path.resolve(process.cwd(), '../core_engine');
-	return path.join(coreDir, 'target', 'release', 'core_engine');
-}
-
-function coreEngineHasQuietFlag(): boolean {
-	if (engineSupportsQuiet !== null) return engineSupportsQuiet;
-	try {
-		const help = execSync(`"${coreEngineBinaryPath()}" --help`, { encoding: 'utf8', timeout: 5000 });
-		engineSupportsQuiet = help.includes('--quiet');
-	} catch {
-		engineSupportsQuiet = false;
-	}
-	if (!engineSupportsQuiet && config.engineQuiet) {
-		console.warn('[Veloce] core_engine lacks --quiet — rebuild with: cd core_engine && cargo build --release');
-	}
-	return engineSupportsQuiet;
-}
 
 function categoryFor(sourceUrl: string, rawName: string): { category: string; rawName: string } {
 	let ext = path.extname(rawName).toLowerCase();

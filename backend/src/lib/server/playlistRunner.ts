@@ -46,9 +46,7 @@ function playlistDir(baseDir: string, folderName: string): string | null {
 	return target;
 }
 
-function coreEngineBinaryPath(): string {
-	return path.resolve(process.cwd(), '../core_engine/target/release/core_engine');
-}
+import { buildEngineCliArgs, coreEngineBinaryPath, coreEngineHasQuietFlag } from './engineCli';
 
 function broadcastPlaylist(
 	broadcast: BroadcastFn,
@@ -121,15 +119,16 @@ function runEngine(
 	onProgress: (downloaded: number, total: number, speedBps: number, etaSecs: number) => void
 ): Promise<'completed' | 'paused' | 'cancelled' | 'error'> {
 	return new Promise((resolve) => {
-		const proc = spawn(coreEngineBinaryPath(), [
-			'--id', trackKey,
-			'--url', url,
-			'--save-path', savePath,
-			'--threads', String(runtime.defaultThreads),
-			'--max-rate', String(runtime.maxRateBytes),
-			...(runtime.engineQuiet ? ['--quiet'] : []),
-			...(referer ? ['--referer', referer, '--origin', safeOrigin(referer)] : []),
-		], { stdio: ['ignore', 'pipe', 'inherit'] });
+		const proc = spawn(coreEngineBinaryPath(), buildEngineCliArgs({
+			id: trackKey,
+			url,
+			savePath,
+			threads: runtime.defaultThreads,
+			maxRateBytes: runtime.maxRateBytes,
+			engineQuiet: runtime.engineQuiet,
+			hasQuietFlag: coreEngineHasQuietFlag(),
+			referer
+		}), { stdio: ['ignore', 'pipe', 'inherit'] });
 
 		const run = runningPlaylists.get(playlistId);
 		if (run) run.engineProc = proc;

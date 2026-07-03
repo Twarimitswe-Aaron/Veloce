@@ -11,7 +11,7 @@
 	// Page hook is injected via manifest MAIN-world content_script — no backup <script> tag.
 
 	const FILE_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|bz2|pdf|png|jpe?g|gif|webp|svg|docx?|xlsx?|pptx?|csv|json|xml|iso)(\?|#|$)/i;
-	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
+	const VIDEO_SITES = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv/i;
 	const CDN_IMAGE = /fbcdn\.net|cdninstagram\.com/i;
 	const CARD_WATCH_ATTR = 'data-veloce-card-watch';
 
@@ -20,12 +20,14 @@
 	let yt = null;
 	let ig = null;
 	let omni = null;
+	let mf = null;
 
 	function initSiteHandlers(ctx) {
 		siteHandlers = window.__veloceCreateSiteHandlers?.(ctx) || [];
 		yt = siteHandlers.find((h) => h.id === 'youtube') || null;
 		ig = siteHandlers.find((h) => h.id === 'instagram') || null;
 		omni = siteHandlers.find((h) => h.id === 'omnisave') || null;
+		mf = siteHandlers.find((h) => h.id === 'mediafire') || null;
 	}
 
 	function isYoutubeHost() { return !!yt?.isHost?.(); }
@@ -518,7 +520,10 @@
 	}
 
 	function isDedicatedMediaPage() {
-		if (!VIDEO_SITES.test(location.hostname)) return false;
+		if (!VIDEO_SITES.test(location.hostname) && !/mediafire\.com/i.test(location.hostname)) return false;
+		if (/mediafire\.com/i.test(location.hostname) && /\/file\/[^/]+\/[^/]+/i.test(location.pathname)) {
+			return true;
+		}
 		if (isYoutubeWatchPage()) return true;
 		if (/youtu\.be/i.test(location.hostname) && location.pathname.length > 1) return true;
 		if (isInstagramHost() && isInstagramStoriesPage()) return true;
@@ -665,6 +670,13 @@
 	/** True when the element is the media the user is actually looking at (not feed behind a modal). */
 	function isElementForeground(el) {
 		if (!el?.isConnected) return false;
+
+		for (const h of siteHandlers) {
+			if (!h.isHost?.() || !h.isElementForeground) continue;
+			const siteFg = h.isElementForeground(el);
+			if (siteFg !== null && siteFg !== undefined) return siteFg;
+		}
+
 		const tag = el.tagName?.toLowerCase();
 		if (tag !== 'video' && tag !== 'audio' && tag !== 'a') return false;
 
@@ -677,12 +689,6 @@
 
 		const vis = mediaVisibleRect(el);
 		if (!vis || vis.width < 48 || vis.height < 48) return false;
-
-		for (const h of siteHandlers) {
-			if (!h.isHost?.() || !h.isElementForeground) continue;
-			const siteFg = h.isElementForeground(el);
-			if (siteFg !== null && siteFg !== undefined) return siteFg;
-		}
 
 		if (isDedicatedMediaPage() && !overlay) return true;
 
@@ -1734,6 +1740,7 @@
 	omni?.onInit?.();
 	ig?.hookNavigation?.();
 	yt?.hookNavigation?.();
+	mf?.hookNavigation?.();
 
 	if (!document.hidden) scan();
 	const observer = new MutationObserver((mutations) => {
