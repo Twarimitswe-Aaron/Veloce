@@ -38,6 +38,7 @@
 	function canonicalInstagramStoryUrl(href) { return ig?.canonicalStoryUrl?.(href) ?? null; }
 	function findYoutubeFeedCard(el) { return yt?.findFeedCard?.(el) ?? null; }
 	function findYoutubeWatchUrl(el) { return yt?.findWatchUrl?.(el) ?? null; }
+	function findYoutubeLayoutElInCard(card) { return yt?.findLayoutElInCard?.(card) ?? null; }
 	function findPostUrl(el) { return ig?.findPostUrl?.(el) ?? null; }
 
 	function isHttpUrl(url) {
@@ -787,10 +788,10 @@
 	}
 
 	/**
-	 * Instagram Reels: prefetch the reel being watched (priority) and keep the
-	 * previous reel in the queue so scrolling back is instant. Drops other queued reels.
+	 * Focus prefetch on active (+ optional previous) URLs; drop other queued prefetches.
+	 * Used by Instagram Reels and YouTube watch SPA navigation.
 	 */
-	function setReelsPrefetchFocus(activeUrl, previousUrl) {
+	function setPrefetchFocus(activeUrl, previousUrl) {
 		if (!captureActive() || document.hidden) return;
 		const activeKey = activeUrl ? normalizeBadgeKey(activeUrl) : '';
 		const previousKey = previousUrl ? normalizeBadgeKey(previousUrl) : '';
@@ -1656,6 +1657,10 @@
 	});
 	window.addEventListener('yt-navigate-finish', () => {
 		if (isYoutubeHost()) {
+			if (isYoutubeWatchPage()) {
+				yt?.onWatchVideoChanged?.();
+				return;
+			}
 			yt?.resetCapture?.();
 		} else {
 			cullBackgroundBadges();
@@ -1718,7 +1723,8 @@
 		isHttpUrl,
 		isBrowserOnlyUrl,
 		CDN_IMAGE,
-		setReelsPrefetchFocus,
+		setPrefetchFocus,
+		setReelsPrefetchFocus: setPrefetchFocus,
 		interceptLog,
 		openFormatMenu,
 		formatsFromDownloadAnchor,
@@ -1727,6 +1733,7 @@
 	});
 	omni?.onInit?.();
 	ig?.hookNavigation?.();
+	yt?.hookNavigation?.();
 
 	if (!document.hidden) scan();
 	const observer = new MutationObserver((mutations) => {

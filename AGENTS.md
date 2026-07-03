@@ -155,7 +155,7 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 
 | Site / family | Signature | Behavior class | Format source | Notes |
 |---------------|-----------|----------------|---------------|-------|
-| YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; **2025+ homepage** uses flat `#content` inside `ytd-rich-item-renderer` (no `#video-title`); deep shadow-DOM link scan; lazy-load retry when `#content` empty |
+| YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; **watch page** badge on `#movie_player video`; SPA `v=` changes reset badges + prefetch focus; **no sidebar prefetch** on watch (main player only); radio `list=RD…` stripped to `watch?v=ID` |
 | Instagram | `instagram` | A | yt-dlp + cookies | **Feed:** `main article`. **Post/reel page** (`/p/ID`, `/reel/ID`): badge on main viewer `video` (URL from address bar). **Stories:** `/stories/user/ID`. Photo-only = no badge. **No prefetch** on feed. |
 | TikTok | `tiktok` | A | yt-dlp | |
 | X/Twitter | `twitter` | A | yt-dlp | |
@@ -165,6 +165,37 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 | Generic CDN `.mp4` | `direct` | B | Direct | |
 
 When you implement a new row, **save the link behavior class and handler here** before merging.
+
+---
+
+## Site DOM layouts (fetch before changing handlers)
+
+Agents working on a site should **inspect the live DOM** (DevTools → Elements, including shadow roots) and note anchors here. URLs in the table are canonical Veloce keys (`normalizeBadgeKey` / `normalizeFormatUrl`).
+
+### YouTube (`extension/static/sites/youtube.js`)
+
+| Page | DOM anchor | Badge target | Resolved URL |
+|------|------------|--------------|--------------|
+| Homepage / feed | `ytd-rich-item-renderer`, `ytd-video-renderer`, `yt-lockup-view-model`, … | Thumbnail `<a id="thumbnail">` inside card (shadow DOM) | `https://www.youtube.com/watch?v=ID` or `/shorts/ID` |
+| Watch | `#movie_player` → `video.html5-main-video` | Main player `<video>` | `watch?v=ID` — **strip** `list`, `start_radio`, `index` |
+| Watch sidebar | `ytd-watch-next-secondary-results-renderer` cards | Same feed-card rules as homepage | Per-card `watch?v=OTHER` (not playlist URL) |
+| Shorts | `ytd-shorts` → `#shorts-container` video | Main shorts player | `/shorts/ID` |
+| Radio / mix | `watch?v=X&list=RDX&start_radio=1` | Main player only for prefetch | Always `watch?v=X` for yt-dlp |
+
+**SPA navigation:** YouTube updates `history` and fires `yt-navigate-finish` when the `v` param changes (sidebar click, autoplay next). Veloce must reset badges and prefetch the new `v` — see `onWatchVideoChanged()` + `hookNavigation()`.
+
+**Do not badge:** `ytd-video-preview` hover previews, miniplayer, sandboxed ad iframes.
+
+### Instagram (`extension/static/sites/instagram.js`)
+
+| Page | DOM anchor | Badge target | Resolved URL |
+|------|------------|--------------|--------------|
+| Feed | `main article` | Primary `video` or post link | `/p/ID`, `/reel/ID` |
+| Post/reel | `video` in viewer | Main `video` | From address bar |
+| Reels tab | `/reels/` or `/reels/ID` | Playing reel `video` | `/reel/ID` (normalize `reels` → `reel`) |
+| Stories | `/stories/user/ID` | Largest story `video` | `/stories/user/ID` |
+
+**Prefetch:** Reels/post viewer only when reel **starts playing**; keep previous reel in prefetch window (2 slots).
 
 ---
 

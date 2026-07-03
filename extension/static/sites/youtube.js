@@ -30,10 +30,17 @@
 			isDedicatedMediaPage: coreIsDedicatedMediaPage,
 			findMediaOverlay,
 			cardViewportScore,
-			eagerPrefetch
+			eagerPrefetch,
+			setPrefetchFocus,
+			setReelsPrefetchFocus
 		} = ctx;
 
+		const focusPrefetch = setPrefetchFocus || setReelsPrefetchFocus;
+
 		let scrollScanTimer = null;
+		let watchPoll = null;
+		let lastWatchVideoId = null;
+		let lastWatchUrl = '';
 
 		function isHost() {
 			return /youtube\.com|youtu\.be/i.test(location.hostname);
@@ -85,6 +92,31 @@
 			return el?.closest?.(FEED_CARD) || null;
 		}
 
+		function currentWatchVideoId(href = location.href) {
+			try {
+				const u = new URL(href, location.origin);
+				if (u.pathname.startsWith('/shorts/')) {
+					return u.pathname.split('/').filter(Boolean)[1] || null;
+				}
+				if (u.pathname === '/watch') return u.searchParams.get('v');
+			} catch { /* ignore */ }
+			return null;
+		}
+
+		function findMainPlayerVideo() {
+			for (const sel of [
+				'#movie_player video.html5-main-video',
+				'#movie_player video',
+				'ytd-watch-flexy #player video',
+				'#player video.html5-main-video',
+				'ytd-shorts video',
+				'video.html5-main-video'
+			]) {
+				const v = document.querySelector(sel);
+				if (v && isMainPlayerEl(v)) return v;
+			}
+			return null;
+		}
 		function isMainPlayerEl(el) {
 			return !!el?.closest?.(
 				'#movie_player, #player-container, #player, ytd-watch-flexy #player, ' +
@@ -238,6 +270,10 @@
 
 		function shouldStartPrefetch(resolvedUrl, anchor) {
 			if (!isHost()) return null;
+			// Watch page: only prefetch the main player — sidebar cards flood yt-dlp.
+			if (isWatchPage() && anchor && findFeedCard(anchor) && !isMainPlayerEl(anchor)) {
+				return false;
+			}
 			return true;
 		}
 
@@ -302,6 +338,75 @@
 				queuePlaylistDownload(playlistUrl, pageUrl);
 			});
 			menu.insertBefore(btn, closeBtn);
+		}
+
+		function processWatchPage() {
+			if (!captureActive() || !isWatchPage()) return null;
+
+			const url = canonicalUrl();
+			const video = findMainPlayerVideo();
+			if (!url || !video) return null;
+			if (!shouldBadgeElement(video)) return null;
+
+			const urlKey = normalizeBadgeKey(url);
+			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
+
+			const placed = placeBadge(url, video, url, true);
+			if (!placed) return null;
+			video.setAttribute(SCANNED_ATTR, '1');
+			return url;
+		}
+
+		function onWatchVideoChanged() {
+			const vid = currentWatchVideoId();
+			if (!vid) return;
+			if (vid === lastWatchVideoId) return;
+
+			const prevUrl = lastWatchUrl || '';
+			const url = canonicalUrl();
+			const isRealChange = lastWatchVideoId != null;
+
+			lastWatchVideoId = vid;
+			lastWatchUrl = url || '';
+
+			if (isRealChange) {
+				closeMenu();
+				for (const key of [...badgeKeys]) removeBadge(key);
+				resetScanStateDeep(document.documentElement);
+			}
+
+			if (url) {
+				if (isRealChange) focusPrefetch?.(url, prevUrl || null);
+				processWatchPage();
+				if (!watchPoll) startWatchPoll();
+			}
+			ctx.invokeScan?.();
+		}
+
+		function startWatchPoll() {
+			if (watchPoll) return;
+			if (!isWatchPage()) return;
+			lastWatchVideoId = currentWatchVideoId();
+			lastWatchUrl = canonicalUrl() || '';
+			watchPoll = setInterval(() => {
+				if (!captureActive() || !isHost()) {
+					stopWatchPoll();
+					return;
+				}
+				if (!isWatchPage()) {
+					stopWatchPoll();
+					return;
+				}
+				const vid = currentWatchVideoId();
+				if (vid && vid !== lastWatchVideoId) onWatchVideoChanged();
+			}, 400);
+		}
+
+		function stopWatchPoll() {
+			if (watchPoll) {
+				clearInterval(watchPoll);
+				watchPoll = null;
+			}
 		}
 
 		function processFeedCard(card) {
@@ -382,8 +487,39 @@
 
 		function resetCapture() {
 			closeMenu();
+			stopWatchPoll();
+			lastWatchVideoId = null;
+			lastWatchUrl = '';
 			for (const key of [...badgeKeys]) removeBadge(key);
 			resetScanStateDeep(document.documentElement);
+		}
+
+		function navigationKey() {
+			return canonicalUrl() || `${location.pathname}${location.search}`;
+		}
+
+		function hookNavigation() {
+			if (!isHost() || hookNavigation.done) return;
+			hookNavigation.done = true;
+			let lastKey = navigationKey();
+
+			const onRoute = () => {
+				const key = navigationKey();
+				if (key === lastKey) return;
+				lastKey = key;
+				if (isWatchPage()) {
+					onWatchVideoChanged();
+				} else {
+					resetCapture();
+					if (captureActive()) ctx.invokeScan?.();
+				}
+			};
+
+			window.addEventListener('popstate', onRoute);
+			const push = history.pushState.bind(history);
+			const replace = history.replaceState.bind(history);
+			history.pushState = (...args) => { push(...args); onRoute(); };
+			history.replaceState = (...args) => { replace(...args); onRoute(); };
 		}
 
 		function scan(watchBudgetRef) {
@@ -399,8 +535,13 @@
 				document.querySelectorAll(sel).forEach((player) => watchElement(player));
 			}
 			if (isWatchPage()) {
+				processWatchPage();
+				startWatchPoll();
 				const watchUrl = canonicalUrl();
-				if (watchUrl) eagerPrefetch(watchUrl);
+				if (watchUrl) {
+					focusPrefetch?.(watchUrl, null);
+					eagerPrefetch(watchUrl);
+				}
 			}
 			scanFeedCards(watchBudgetRef);
 			scanFeedCardsVisible();
@@ -437,7 +578,8 @@
 		}
 
 		function onSpaNavigation() {
-			resetCapture();
+			if (isWatchPage()) onWatchVideoChanged();
+			else resetCapture();
 		}
 
 		return {
@@ -448,6 +590,7 @@
 			canonicalUrl,
 			normalizeKey,
 			findFeedCard,
+			findLayoutElInCard,
 			findWatchUrl,
 			resolveDownloadUrl,
 			findBadgeRoot,
@@ -466,7 +609,10 @@
 			getScanDebounceMs,
 			scheduleScrollScan,
 			resetCapture,
-			onSpaNavigation
+			hookNavigation,
+			onSpaNavigation,
+			onWatchVideoChanged,
+			processWatchPage
 		};
 	}
 

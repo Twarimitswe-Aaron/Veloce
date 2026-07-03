@@ -157,7 +157,11 @@
 		};
 		XMLHttpRequest.prototype.send = function veloceXHRSend(...args) {
 			this.addEventListener('load', function veloceXHRLoad() {
-				inspectDownloadApiResponse(this.__veloceUrl || '', this.responseText);
+				try {
+					const rt = this.responseType;
+					if (rt && rt !== '' && rt !== 'text') return;
+					inspectDownloadApiResponse(this.__veloceUrl || '', this.responseText);
+				} catch { /* ignore non-text XHR (e.g. lottie json) */ }
 			});
 			return nativeXHRSend.apply(this, args);
 		};
