@@ -1,42 +1,24 @@
-# sv
+# Veloce browser extension
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Chrome Manifest V3 extension: in-page badges, format picker, download intercept, and popup UI.
 
-## Creating a project
+**Project docs:** [../README.md](../README.md) · [../CONTRIBUTING.md](../CONTRIBUTING.md) · [../AGENTS.md](../AGENTS.md)
 
-If you're seeing this, you've probably already done this step. Congrats!
+## Develop
 
-```sh
-# create a new project
-npx sv create my-app
+```bash
+npm install
+npm run build    # output → extension/build/ (load this folder in chrome://extensions)
 ```
 
-To recreate this project with the same configuration:
+After code changes: rebuild, reload the extension, refresh open tabs (active tab re-injects automatically on update in v1.8.1+).
 
-```sh
-# recreate this project
-npx sv@0.16.1 create --template minimal --types ts --no-install extension
-```
+## Key paths
 
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+| Path | Role |
+|------|------|
+| `static/content.js` | Badge scan, format menu, link intercept |
+| `static/background.js` | WebSocket to coordinator, format cache, foreground tab |
+| `static/sites/*.js` | Per-site handlers (YouTube, Instagram, MediaFire, OmniSave) |
+| `static/inject-intercept.js` | MAIN-world XHR hook for API-driven sites |
+| `src/` | Svelte popup UI |

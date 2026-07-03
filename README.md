@@ -1,6 +1,82 @@
 # ⚡ Veloce: Advanced Multi-Threaded Download Manager
 
-Veloce is a high-performance, segmented Internet Download Manager (IDM) designed to aggressively capture, segment, and assemble web resources. It bypasses browser restrictions by splitting operations into three distinct, decoupled layers.
+Veloce is a **local-first download manager** for people who want IDM-style speed with modern web capture. A Chrome extension finds downloadable media on the page you are viewing, a Node coordinator on your machine resolves formats (via yt-dlp and site-specific logic), and a Rust engine downloads files with multi-connection segmentation, resume, and corruption guards.
+
+Everything runs on **your PC** — no cloud queue, no account, no subscription.
+
+---
+
+## Overview
+
+| Piece | What it does |
+|-------|----------------|
+| **Browser extension** | Badges links and videos on the **active tab**, opens a format picker, intercepts browser downloads when the coordinator is online |
+| **Local coordinator** (`backend/`) | WebSocket server on `localhost:14921`, SQLite queue, yt-dlp extraction, spawns download jobs |
+| **Rust engine** (`core_engine/`) | Segmented HTTP download with work-stealing pieces, adaptive threads, crash-safe resume |
+
+**Typical flow:** browse → click Veloce badge → pick quality → file lands in `~/Downloads/Veloce` (or your chosen folder) with live speed/ETA in the popup or dashboard.
+
+---
+
+## Why Veloce vs other download managers
+
+| Advantage | What it means for you |
+|-----------|----------------------|
+| **Work-stealing segmentation** | Fast connections keep working while slow ones catch up — no fixed “slow last chunk” like classic IDM splits |
+| **Adaptive concurrency** | Thread count goes **down** on errors and **back up** when the server recovers |
+| **Corruption-aware engine** | Rejects servers that ignore HTTP Range (`200` instead of `206`), validates ETag on resume |
+| **Modern web capture** | Per-site handlers for YouTube SPA, Instagram Reels, MediaFire delays, API-driven sites (MovieBox/OmniSave) |
+| **yt-dlp integration** | One-click quality pick for social video without manual copy-paste |
+| **Local + open stack** | Rust engine + SvelteKit coordinator you can inspect, patch, and extend |
+| **Security defaults** | WebSocket origin allowlist, SSRF blocking for private IPs, safe filename paths |
+| **No vendor lock-in** | Not tied to a proprietary protocol or paid capture layer |
+
+See the full feature comparison table in [How Veloce compares](#-how-veloce-compares-to-other-download-managers) below.
+
+---
+
+## Limitations & honest drawbacks
+
+Veloce is young software. Know these trade-offs before you rely on it for everything.
+
+| Limitation | Detail |
+|------------|--------|
+| **Local setup required** | You must run the coordinator (`npm run dev` or systemd). It is not a “install extension only” product like some SaaS grabbers. |
+| **Chrome-first** | The extension targets Chromium Manifest V3. Firefox support is not a primary focus today. |
+| **yt-dlp dependency** | YouTube, Instagram, TikTok, and many social sites need `yt-dlp` installed and occasionally updated when sites change. |
+| **Login-gated content** | Private or age-gated media only works if yt-dlp can use your browser cookies (Chrome profile). |
+| **Site breakage is normal** | SPAs change DOM constantly. A site update can hide badges or break format listing until a handler patch lands. |
+| **Active tab only** | Badges and prefetch intentionally run on the **focused tab** — not every background tab (by design, for performance). |
+| **No BitTorrent / Metalink** | HTTP(S) focus only; torrents are out of scope for now. |
+| **No proxy / auth downloads yet** | HTTP proxy and authenticated origins are on the roadmap. |
+| **No checksum verification yet** | SHA-256 / Metalink verification is planned but not shipped. |
+| **Extension reload friction** | After updating the extension, open tabs may need a refresh (active tab auto re-injects on update in v1.8.1+). |
+
+If you hit a site-specific problem, that is expected — **contributions fixing one site help everyone**. See [Contributing](#-contributing).
+
+---
+
+## Contributing
+
+We need help when:
+
+- A **page behaves differently** (new layout, SPA navigation, modal download UI)
+- **Format listing fails** for a host yt-dlp used to support
+- **Downloads are slow, corrupt, or 403** for a specific CDN
+- **Documentation** or setup scripts could be clearer
+
+**Quick start for contributors:**
+
+1. Fork / clone, run `./scripts/setup.sh`
+2. Read **[CONTRIBUTING.md](./CONTRIBUTING.md)** — reporting bugs, which file to edit, site handler patterns
+3. For format/extraction deep dives, see **[AGENTS.md](./AGENTS.md)** — platform signatures, cache rules, DOM tables
+4. Open a PR with a test URL, before/after notes, and tests if you touch `backend/` or `core_engine/`
+
+**Most common fix:** add or update a file under `extension/static/sites/` when badges or navigation break on one website.
+
+---
+
+Veloce bypasses browser restrictions by splitting operations into three distinct, decoupled layers.
 
 ## 🏗️ System Architecture
 
@@ -148,6 +224,13 @@ The monolithic `main.rs` was split into focused modules so each concern can be t
 ```bash
 cd core_engine && cargo build --release
 ```
+
+### Extension v1.8.1 — active-tab capture & extension reload
+
+*   **Foreground-only messaging** — only the active tab (and the tab that just lost focus) receive foreground state; no broadcast to every open tab.
+*   **Auto re-inject on update** — reloading the extension re-injects the content script on the **current tab** automatically.
+*   **Stale tab handling** — invalidated extension context stops timers and shows a refresh banner instead of console spam.
+*   **Link intercept middleware** — closing the format menu without choosing a format resumes normal navigation.
 
 ### Extension v1.7.7 — site-specific capture
 
