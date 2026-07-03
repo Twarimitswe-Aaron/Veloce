@@ -594,6 +594,13 @@ async function enrichDownloadPayload(payload, tabId) {
 		out.referer = out.referer || pageUrl;
 	}
 
+	if (out.directUrl && BROWSER_ONLY_URL.test(out.directUrl)) {
+		delete out.directUrl;
+	}
+	if (out.url && BROWSER_ONLY_URL.test(out.url) && out.pageUrl) {
+		out.url = out.pageUrl;
+	}
+
 	const mediaUrl = out.directUrl || out.url;
 	if (!out.playlist && mediaUrl && out.url === mediaUrl && out.pageUrl) {
 		out.url = out.pageUrl;
@@ -1147,29 +1154,186 @@ function setupContextMenus() {
 	});
 }
 
-async function downloadFromContext(url, tabId) {
-	if (!url) return;
+const VIDEO_HOST = /youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com|facebook\.com|twitch\.tv|mediafire\.com/i;
+
+function needsFormatPicker(url) {
+	if (!url || !/^https?:/i.test(url)) return false;
+	try {
+		const u = new URL(url);
+		if (/mediafire\.com/i.test(u.hostname) && /\/file\//i.test(u.pathname)) return true;
+		if (!VIDEO_HOST.test(u.hostname)) return false;
+		if (INTERCEPT_MEDIA_EXT.test(u.pathname)) return false;
+		if (/googlevideo\.com/i.test(u.hostname)) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function shouldUseDirectUrl(url) {
+	if (!url || !/^https?:/i.test(url)) return false;
+	if (needsFormatPicker(url)) return false;
+	try {
+		const u = new URL(url);
+		return INTERCEPT_MEDIA_EXT.test(u.pathname) || isInterceptableMediaUrl(url);
+	} catch {
+		return false;
+	}
+}
+
+/** Fallback when the content script is not reachable (e.g. tab just opened). */
+async function resolveContextMediaInTab(tabId, srcUrl, mediaType) {
+	try {
+		const resp = await chrome.tabs.sendMessage(tabId, {
+			type: 'VELOCE_RESOLVE_CONTEXT_MEDIA',
+			srcUrl,
+			mediaType
+		});
+		if (resp?.ok) return resp;
+	} catch { /* content script unavailable */ }
+
+	try {
+		const results = await chrome.scripting.executeScript({
+			target: { tabId },
+			func: (src, type) => {
+				const pageUrl = location.href.split('#')[0];
+				const host = location.hostname.toLowerCase();
+				if (/^(blob:|data:|mediastream:)/i.test(src || '')) {
+					if (host.includes('youtube.com') || host === 'youtu.be') {
+						try {
+							const u = new URL(location.href);
+							if (u.pathname === '/watch' && u.searchParams.get('v')) {
+								const url = `https://www.youtube.com/watch?v=${u.searchParams.get('v')}`;
+								return { ok: true, url, pageUrl, needsFormatMenu: true };
+							}
+							const shorts = u.pathname.match(/^\/shorts\/([^/?#]+)/);
+							if (shorts) {
+								const url = `https://www.youtube.com/shorts/${shorts[1]}`;
+								return { ok: true, url, pageUrl, needsFormatMenu: true };
+							}
+						} catch { /* ignore */ }
+					}
+					if (host.includes('instagram.com') && /\/(p|reel|tv)\//i.test(location.pathname)) {
+						const url = pageUrl.split('?')[0].replace(/\/reels\//i, '/reel/');
+						return { ok: true, url, pageUrl, needsFormatMenu: true };
+					}
+					return { ok: false };
+				}
+				if (/^https?:/i.test(src || '')) {
+					return { ok: true, url: src, pageUrl, needsFormatMenu: false, directUrl: src };
+				}
+				if (type === 'video' && host.includes('youtube.com')) {
+					try {
+						const u = new URL(location.href);
+						if (u.pathname === '/watch' && u.searchParams.get('v')) {
+							const url = `https://www.youtube.com/watch?v=${u.searchParams.get('v')}`;
+							return { ok: true, url, pageUrl, needsFormatMenu: true };
+						}
+					} catch { /* ignore */ }
+				}
+				return { ok: false };
+			},
+			args: [srcUrl, mediaType]
+		});
+		return results?.[0]?.result || null;
+	} catch {
+		return null;
+	}
+}
+
+async function downloadFromContext(url, tabId, opts = {}) {
+	if (!url && !opts.mediaType) return;
+
+	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
+	const baseDirectory = veloce_base_dir || selectedDirectory || undefined;
+	let resolvedUrl = url;
+	let directUrl;
+	let pageUrl = opts.pageUrl;
+
+	if (BROWSER_ONLY_URL.test(url || '') && tabId != null) {
+		const resolved = await resolveContextMediaInTab(tabId, url, opts.mediaType);
+		if (resolved?.needsFormatMenu && resolved.url) {
+			await openInterceptFormatMenu(tabId, {
+				listUrl: resolved.url,
+				pageUrl: resolved.pageUrl || opts.pageUrl,
+				fileName: 'download'
+			});
+			return;
+		}
+		if (resolved?.url) {
+			resolvedUrl = resolved.url;
+			directUrl = resolved.directUrl;
+			pageUrl = resolved.pageUrl || pageUrl;
+		} else {
+			const blob = await materializeBlobUrl(tabId, url);
+			if (blob) {
+				await startBlobDownload({
+					...blob,
+					fileName: 'download',
+					baseDirectory,
+					sourceUrl: url,
+					pageUrl: pageUrl || opts.pageUrl
+				});
+				return;
+			}
+			notify(
+				`veloce-context-blob-${Date.now()}`,
+				'Veloce',
+				'Could not resolve this media — use the Veloce badge on the page instead.'
+			);
+			return;
+		}
+	}
+
+	if (resolvedUrl && needsFormatPicker(resolvedUrl)) {
+		await openInterceptFormatMenu(tabId, {
+			listUrl: resolvedUrl,
+			pageUrl: pageUrl || resolvedUrl,
+			fileName: 'download'
+		});
+		return;
+	}
+
+	if (BROWSER_ONLY_URL.test(resolvedUrl || '')) {
+		notify(
+			`veloce-context-proto-${Date.now()}`,
+			'Veloce',
+			'Browser-only media URL — use the Veloce badge on the page instead.'
+		);
+		return;
+	}
+
 	let fileName = 'download';
 	try {
-		const parts = new URL(url).pathname.split('/').filter(Boolean);
-		fileName = parts.pop() || 'download';
+		const parts = new URL(directUrl || resolvedUrl).pathname.split('/').filter(Boolean);
+		fileName = decodeURIComponent(parts.pop() || 'download');
 	} catch { /* keep default */ }
-	const { veloce_base_dir } = await chrome.storage.local.get('veloce_base_dir');
-	await startDownload({
-		url,
-		directUrl: url,
+
+	const payload = {
+		url: resolvedUrl,
 		fileName,
-		baseDirectory: veloce_base_dir || selectedDirectory || undefined,
-		threads: 8
-	}, tabId);
+		baseDirectory,
+		threads: 8,
+		pageUrl
+	};
+	if (directUrl && shouldUseDirectUrl(directUrl)) {
+		payload.directUrl = directUrl;
+	} else if (shouldUseDirectUrl(resolvedUrl)) {
+		payload.directUrl = resolvedUrl;
+	}
+
+	await startDownload(payload, tabId);
 }
 
 if (chrome.contextMenus) {
 	chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 		if (info.menuItemId === 'veloce-download-link') {
-			await downloadFromContext(info.linkUrl, tab?.id);
+			await downloadFromContext(info.linkUrl, tab?.id, { pageUrl: info.pageUrl });
 		} else if (info.menuItemId === 'veloce-download-media') {
-			await downloadFromContext(info.srcUrl || info.linkUrl, tab?.id);
+			await downloadFromContext(info.srcUrl || info.linkUrl, tab?.id, {
+				mediaType: info.mediaType,
+				pageUrl: info.pageUrl
+			});
 		} else if (info.menuItemId === 'veloce-download-page-links' && tab?.id != null) {
 			try {
 				const results = await chrome.scripting.executeScript({

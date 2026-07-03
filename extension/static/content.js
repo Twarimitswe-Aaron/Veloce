@@ -148,6 +148,63 @@
 		return raw;
 	}
 
+	/** Social / scrape pages need the format picker; direct file URLs do not. */
+	function needsFormatPicker(url) {
+		try {
+			const u = new URL(url);
+			if (/mediafire\.com/i.test(u.hostname) && /\/file\//i.test(u.pathname)) return true;
+			if (!VIDEO_SITES.test(u.hostname)) return false;
+			if (FILE_EXT.test(u.pathname)) return false;
+			if (/googlevideo\.com/i.test(u.hostname)) return false;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Resolve right-click context menu media (blob/src) to a listable download URL. */
+	function resolveContextMedia(srcUrl, mediaType) {
+		let anchor = null;
+		if (srcUrl) {
+			for (const el of document.querySelectorAll('video, audio, img')) {
+				const s = el.currentSrc || el.src || '';
+				if (s === srcUrl) {
+					anchor = el;
+					break;
+				}
+			}
+		}
+		if (!anchor) {
+			if (mediaType === 'video') {
+				anchor = document.querySelector(
+					'#movie_player video.html5-main-video, ytd-shorts #shorts-container video, video.html5-main-video, video'
+				);
+			} else if (mediaType === 'audio') {
+				anchor = document.querySelector('audio');
+			}
+		}
+
+		const rawUrl = srcUrl || anchor?.currentSrc || anchor?.src || '';
+		let url = rawUrl ? resolveDownloadUrl(rawUrl, anchor) : null;
+
+		if (!url && anchor && (anchor.tagName === 'VIDEO' || anchor.tagName === 'AUDIO')) {
+			if (isYoutubeHost()) url = findYoutubeWatchUrl(anchor);
+			else if (ig?.resolveVideoPageUrl) url = ig.resolveVideoPageUrl(anchor);
+			else if (isDedicatedMediaPage()) url = location.href.split('#')[0];
+		}
+
+		const pageUrl = location.href.split('#')[0];
+		const listUrl = url || (isHttpUrl(rawUrl) ? rawUrl : null);
+
+		return {
+			ok: !!listUrl,
+			url: listUrl,
+			pageUrl,
+			needsFormatMenu: listUrl ? needsFormatPicker(listUrl) : false,
+			directUrl: listUrl && !needsFormatPicker(listUrl) && isHttpUrl(listUrl) ? listUrl : undefined
+		};
+	}
+
 	/** Canonical cache key — must match backend/background normalizeFormatUrl. */
 	function normalizeBadgeKey(url) {
 		for (const h of siteHandlers) {
@@ -930,6 +987,10 @@
 						: null);
 				openFormatMenu(listUrl, anchor, badge, preloaded || undefined);
 				interceptLog('format menu shown — pick a format to download');
+			}
+			if (msg.type === 'VELOCE_RESOLVE_CONTEXT_MEDIA') {
+				sendResponse(resolveContextMedia(msg.srcUrl, msg.mediaType));
+				return false;
 			}
 			if (msg.type === 'VELOCE_FETCH_BLOB' && msg.url) {
 				(async () => {
