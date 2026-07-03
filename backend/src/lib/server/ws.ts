@@ -535,7 +535,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		});
 
 		rustProcess.on('error', async (err) => {
-			console.error(`❌ Failed to launch core engine at ${binaryPath}:`, err);
+			console.error(`❌ Failed to launch core engine at ${bin}:`, err);
 			await settle('error', `Could not start the download engine (${err.message}). Is core_engine built?`);
 		});
 
