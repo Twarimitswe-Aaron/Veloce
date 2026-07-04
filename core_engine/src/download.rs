@@ -115,6 +115,13 @@ pub async fn download_piece(
         output.write_at(file_offset, &buf).context("disk write")?;
     }
 
+    // Flush any remaining batched writes to ensure all data is visible
+    // to the kernel page cache before we report the piece as complete.
+    #[cfg(target_os = "linux")]
+    if let Some(engine) = uring.as_mut() {
+        engine.flush()?;
+    }
+
     Ok(())
 }
 
