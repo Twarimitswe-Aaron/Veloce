@@ -74,6 +74,27 @@ function ytdlpSharedArgs(): string[] {
 }
 
 const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Cache for direct URLs extracted by extractMediaUrl().
+ * When listFormats() runs yt-dlp with -J, a follow-up call to extractMediaUrl()
+ * from runDownloadJob() re-runs yt-dlp with -f b -g to get the best URL.
+ * This cache skips that second yt-dlp invocation.
+ */
+const BEST_URL_CACHE_TTL_MS = 10 * 60 * 1000; // same as format cache
+const IG_DIRECT_URL_CACHE_TTL_MS = 5 * 60 * 1000; // Instagram URLs expire faster
+const bestUrlCache = new Map<string, { url: string; ts: number }>();
+
+/** Export for tests — clear cached direct URLs. */
+export function clearBestUrlCache(): void {
+	bestUrlCache.clear();
+}
+
+/** Export for tests — remove one entry. */
+export function removeBestUrlCache(url: string): void {
+	bestUrlCache.delete(normalizePageUrl(url));
+}
+
 const ytDlpErrorLogged = new Set<string>();
 
 /** Canonical cache key — same video/post must map to one key across content, SW, and backend. */
@@ -941,17 +962,35 @@ function runYtDlpPlaylistJson(url: string, cookieArgs: string[]): Promise<Resolv
 
 /**
  * Extracts the direct media URL from a social media link (Instagram, YouTube, etc) using yt-dlp.
+ * Results are cached to avoid duplicate yt-dlp invocations when listFormats() already
+ * extracted the formats and then runDownloadJob() needs the best direct URL.
+ *
  * @param url The raw social media URL
  * @returns The absolute direct media URL, or null if it fails
  */
 export async function extractMediaUrl(url: string): Promise<string | null> {
+	// MediaFire — never cache, tokens expire mid-download.
 	if (url.includes('mediafire.com')) {
 		return resolveMediafireDownload(url);
 	}
 
+	// Direct file URLs — return as-is, no extraction needed.
 	if (isDirectFileUrl(url)) {
 		return url;
 	}
+
+	// Check cache from a previous extractMediaUrl() call — avoids re-running yt-dlp
+	// on pause/resume cycles and consecutive playlist tracks from the same host.
+	const normalized = normalizePageUrl(url);
+	const cached = bestUrlCache.get(normalized);
+	if (cached) {
+		const ttl = /instagram\.com/i.test(normalized) ? IG_DIRECT_URL_CACHE_TTL_MS : BEST_URL_CACHE_TTL_MS;
+		if (Date.now() - cached.ts < ttl) {
+			return cached.url;
+		}
+		// Expired — fall through to re-extract.
+	}
+
     const cookieStrategies: string[][] = [
         ['--cookies-from-browser', 'chrome'],
         ['--cookies-from-browser', 'chromium'],
@@ -963,6 +1002,8 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         const label = cookieArgs.length ? cookieArgs[1] : 'no-cookies';
         const directUrl = await runYtDlp(url, cookieArgs, YTDLP_BEST_FORMAT);
         if (directUrl) {
+            // Cache and return.
+            bestUrlCache.set(normalized, { url: directUrl, ts: Date.now() });
             return directUrl;
         }
         console.error(`[Extractor] yt-dlp attempt failed (${label}) for ${url}`);
