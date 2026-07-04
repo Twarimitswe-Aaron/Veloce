@@ -1,4 +1,8 @@
 //! Auto-tune optimal connection count from a short probe.
+//!
+//! All probe levels run concurrently so total wall time ≈ max(one probe),
+//! not sum of all probes. The probe budget per level is conservative (1.5s)
+//! because relative comparison is robust even with short samples.
 
 use crate::discover::supports_ranges;
 use reqwest::header::RANGE;
@@ -6,9 +10,13 @@ use reqwest::Client;
 use std::time::{Duration, Instant};
 use futures::StreamExt;
 
-const PROBE_SECONDS: f64 = 2.5;
+const PROBE_SECONDS: f64 = 1.5;
 
 /// Run a short ranged download probe and suggest thread count.
+///
+/// All candidate thread counts are tested concurrently so the total
+/// wall-clock latency is bounded by the longest single probe (1.5 s)
+/// rather than the sequential sum (up to 12.5 s previously).
 pub async fn probe_optimal_threads(
     client: &Client,
     url: &str,
@@ -23,19 +31,46 @@ pub async fn probe_optimal_threads(
         return 1;
     }
 
+    let candidates: Vec<usize> = [2usize, 4, 8, 12, 16]
+        .into_iter()
+        .filter(|&t| t <= ceiling)
+        .collect();
+
+    if candidates.is_empty() || (candidates.len() == 1 && candidates[0] == 2) {
+        return candidates.first().copied().unwrap_or(2).max(1).min(ceiling);
+    }
+
+    // Spawn all probe levels concurrently so total wall time ≈ PROBE_SECONDS.
+    let mut tasks = Vec::with_capacity(candidates.len());
+    for &try_threads in &candidates {
+        let client = client.clone();
+        let url = url.to_string();
+        tasks.push(tokio::spawn(async move {
+            let bps =
+                measure_parallel_throughput(&client, &url, try_threads, piece_size).await;
+            (try_threads, bps)
+        }));
+    }
+
+    let mut results: Vec<(usize, u64)> = Vec::with_capacity(candidates.len());
+    for task in tasks {
+        if let Ok(pair) = task.await {
+            results.push(pair);
+        }
+    }
+
+    // Same selection logic as before — pick first level that shows ≤ 10 %
+    // improvement, or the best if all are better.
     let mut best_threads = 2usize.min(ceiling);
     let mut best_bps = 0u64;
-
-    for try_threads in [2usize, 4, 8, 12, 16] {
-        if try_threads > ceiling {
-            break;
-        }
-        let bps = measure_parallel_throughput(client, url, try_threads, piece_size).await;
+    // candidates are already sorted ascending; results preserve insertion order.
+    for &(try_threads, bps) in &results {
         if bps > best_bps {
             if best_bps == 0 || bps > best_bps * 11 / 10 {
                 best_bps = bps;
                 best_threads = try_threads;
             } else {
+                // Improvement ≤ 10 % — diminishing returns, stop.
                 break;
             }
         } else if try_threads >= 4 {
@@ -54,7 +89,7 @@ async fn measure_parallel_throughput(
 ) -> u64 {
     let chunk = std::cmp::min(piece_size, 512 * 1024).max(64 * 1024);
     let start = Instant::now();
-    let mut handles = Vec::new();
+    let mut handles = Vec::with_capacity(threads);
 
     for i in 0..threads {
         let client = client.clone();

@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Notify;
 use tokio::time::{sleep, Duration};
 
 const SAFETY_MARGIN: u64 = 32 * 1024 * 1024;
@@ -143,6 +144,8 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
     let adaptive = Arc::new(AdaptiveController::new(effective_ceiling));
     let queue: Arc<SegQueue<usize>> = Arc::new(SegQueue::new());
+    let notify = Arc::new(Notify::new());
+    let slot_notify = Arc::new(Notify::new());
     let completed: Arc<Vec<AtomicBool>> = Arc::new(
         completed_init
             .iter()
@@ -165,6 +168,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
     let completed_bytes = Arc::new(AtomicU64::new(baseline_bytes));
     let remaining = Arc::new(AtomicUsize::new(remaining_count));
+    let completed_count = Arc::new(AtomicU64::new((pieces.len() - remaining_count) as u64));
     let had_failure = Arc::new(AtomicBool::new(false));
     let worker_partial: Arc<Vec<AtomicU64>> =
         Arc::new((0..effective_ceiling).map(|_| AtomicU64::new(0)).collect());
@@ -227,11 +231,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let attempts = Arc::clone(&attempts);
         let remaining = Arc::clone(&remaining);
         let completed_bytes = Arc::clone(&completed_bytes);
+        let completed_count = Arc::clone(&completed_count);
         let adaptive = Arc::clone(&adaptive);
         let had_failure = Arc::clone(&had_failure);
         let worker_partial = Arc::clone(&worker_partial);
         let conn_bars = Arc::clone(&conn_bars);
         let limiter = Arc::clone(&limiter);
+        let notify = Arc::clone(&notify);
+        let slot_notify = Arc::clone(&slot_notify);
         let stagger = !args.no_stagger;
 
         handles.push(tokio::spawn(async move {
@@ -246,13 +253,22 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                         if remaining.load(Ordering::Acquire) == 0 {
                             break;
                         }
-                        sleep(Duration::from_millis(30)).await;
+                        // Zero-wait blocking: notify_one() from re-pushed pieces
+                        // wakes us immediately. 1s safety timeout prevents deadlock
+                        // if remaining hits 0 between our check and the .notified() call.
+                        tokio::select! {
+                            _ = notify.notified() => {},
+                            _ = sleep(Duration::from_millis(1000)) => {},
+                        }
                         continue;
                     }
                 };
 
                 while !adaptive.try_acquire_slot() {
-                    sleep(Duration::from_millis(20)).await;
+                    tokio::select! {
+                        _ = slot_notify.notified() => {},
+                        _ = sleep(Duration::from_millis(1000)) => {},
+                    }
                 }
 
                 let (start, end) = pieces[idx];
@@ -276,6 +292,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 .await;
 
                 adaptive.release_slot();
+                slot_notify.notify_one();
 
                 let full = res.is_ok() && worker_partial[w].load(Ordering::Relaxed) == piece_len;
                 worker_partial[w].store(0, Ordering::Relaxed);
@@ -283,7 +300,10 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 if full {
                     completed[idx].store(true, Ordering::Relaxed);
                     completed_bytes.fetch_add(piece_len, Ordering::Relaxed);
-                    remaining.fetch_sub(1, Ordering::Release);
+                    if remaining.fetch_sub(1, Ordering::Release) == 1 {
+                        notify.notify_waiters();
+                    }
+                    completed_count.fetch_add(1, Ordering::Relaxed);
                     adaptive.on_success();
                 } else {
                     let n = attempts[idx].fetch_add(1, Ordering::Relaxed) as usize + 1;
@@ -309,12 +329,15 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     if n >= MAX_PIECE_RETRIES {
                         eprintln!("[C{w}] piece {idx} permanently failed");
                         had_failure.store(true, Ordering::Relaxed);
-                        remaining.fetch_sub(1, Ordering::Release);
+                        if remaining.fetch_sub(1, Ordering::Release) == 1 {
+                            notify.notify_waiters();
+                        }
                         adaptive.on_failure(FailureKind::Permanent);
                     } else {
                         adaptive.on_failure(kind);
                         sleep(Duration::from_millis(300 * n as u64)).await;
                         queue.push(idx);
+                        notify.notify_one();
                     }
                 }
             }
@@ -326,12 +349,13 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let worker_partial = Arc::clone(&worker_partial);
         let remaining = Arc::clone(&remaining);
         let completed = Arc::clone(&completed);
+        let completed_count = Arc::clone(&completed_count);
         let adaptive = Arc::clone(&adaptive);
         let header_bar = header_bar.clone();
         let state_path = state_path.to_path_buf();
         let etag = discovery.etag.clone();
         let last_modified = discovery.last_modified.clone();
-        let mut last_persisted_done = completed_init.iter().filter(|c| **c).count();
+        let mut last_persisted_done = completed_count.load(Ordering::Relaxed) as usize;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(500));
             let mut last_bytes = baseline_bytes;
@@ -359,22 +383,21 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 last_tick = Instant::now();
                 header_bar.set_position(current);
 
-                let done_count = completed.iter().filter(|b| b.load(Ordering::Relaxed)).count();
+                let done_count = completed_count.load(Ordering::Relaxed) as usize;
                 let should_save = last_save.elapsed() >= Duration::from_millis(RESUME_INTERVAL_MS)
                     || done_count != last_persisted_done;
 
                 if should_save {
                     last_persisted_done = done_count;
                     last_save = Instant::now();
-                    let snapshot: Vec<bool> = completed.iter().map(|b| b.load(Ordering::Relaxed)).collect();
-                    let resume = ResumeState {
+                    let _ = crate::resume::save_bitmap_atomic(
+                        &state_path,
                         piece_size,
                         total_size,
-                        etag: etag.clone(),
-                        last_modified: last_modified.clone(),
-                        completed: snapshot,
-                    };
-                    let _ = ResumeState::save_atomic(&state_path, &resume);
+                        &etag,
+                        &last_modified,
+                        &completed,
+                    );
                 }
 
                 println!(

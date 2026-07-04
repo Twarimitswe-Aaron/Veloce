@@ -112,6 +112,47 @@ impl ResumeState {
     }
 }
 
+/// Write binary resume state directly from an `AtomicBool` slice,
+/// avoiding the intermediate `Vec<bool>` allocation and one full pass.
+pub fn save_bitmap_atomic(
+    path: &Path,
+    piece_size: u64,
+    total_size: u64,
+    etag: &Option<String>,
+    last_modified: &Option<String>,
+    completed: &[std::sync::atomic::AtomicBool],
+) -> std::io::Result<()> {
+    let tmp = format!("{}.tmp", path.display());
+
+    let etag_bytes = etag.as_deref().unwrap_or("").as_bytes();
+    let lm_bytes = last_modified.as_deref().unwrap_or("").as_bytes();
+    let n = completed.len();
+    let bitmap_len = n.div_ceil(8);
+
+    let mut out = Vec::with_capacity(32 + etag_bytes.len() + lm_bytes.len() + bitmap_len);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.extend_from_slice(&piece_size.to_le_bytes());
+    out.extend_from_slice(&total_size.to_le_bytes());
+    out.extend_from_slice(&(etag_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(lm_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(etag_bytes);
+    out.extend_from_slice(lm_bytes);
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+
+    // Build bitmap directly from AtomicBool — no intermediate Vec<bool>
+    let mut bitmap = vec![0u8; bitmap_len];
+    for (i, slot) in completed.iter().enumerate() {
+        if slot.load(std::sync::atomic::Ordering::Relaxed) {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out.extend_from_slice(&bitmap);
+
+    fs::write(&tmp, out)?;
+    fs::rename(tmp, path)
+}
+
 pub fn validators_match(
     state: &ResumeState,
     etag: &Option<String>,
@@ -172,6 +213,41 @@ mod tests {
         assert!(path.exists());
         let raw = fs::read(&path).unwrap();
         assert_eq!(&raw[0..4], MAGIC);
+    }
+
+    #[test]
+    fn save_bitmap_atomic_roundtrip() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+
+        let completed: Vec<AtomicBool> = vec![true, false, true, false, true]
+            .into_iter()
+            .map(AtomicBool::new)
+            .collect();
+
+        save_bitmap_atomic(
+            &path,
+            4 * 1024 * 1024,
+            100,
+            &Some("\"abc\"".into()),
+            &Some("Mon".into()),
+            &completed,
+        )
+        .unwrap();
+
+        let loaded = ResumeState::load(&path).unwrap();
+        assert_eq!(loaded.piece_size, 4 * 1024 * 1024);
+        assert_eq!(loaded.total_size, 100);
+        assert_eq!(loaded.completed, vec![true, false, true, false, true]);
+        assert_eq!(loaded.etag, Some("\"abc\"".into()));
+        assert_eq!(loaded.last_modified, Some("Mon".into()));
+
+        // Verify binary format matches to_binary()
+        let s = sample();
+        let bin_from_state = s.to_binary();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw, bin_from_state, "save_bitmap_atomic must produce identical binary to to_binary()");
     }
 
     #[test]
