@@ -1,20 +1,20 @@
 //! Linux io_uring backend for batched positioned writes.
 //!
-//! Instead of submitting one SQE and waiting for one CQE per call (1:1
-//! syscall → `pwrite`), this engine **batches** writes: each `write_at`
-//! copies data into a pending buffer and returns immediately. When the
-//! batch reaches `BATCH_SIZE` (8), or when `flush()` is called explicitly,
-//! all pending SQEs are submitted at once and a single `submit_and_wait`
-//! waits for all completions.  N writes → 1 syscall instead of N.
+//! **Primary path** — pipe + `IORING_OP_SPLICE`:
+//! 1. Pending data is written to the pipe write end (userspace → pipe buffer).
+//! 2. `IORING_OP_SPLICE` moves data from the pipe read end to the output
+//!    file (pipe → page cache via page-table manipulation — zero-copy).
 //!
-//! Uses `IORING_SETUP_SQPOLL` so the kernel polls the submission queue,
-//! eliminating the `io_uring_enter` syscall for submission.
+//! **Fallback** — `IORING_OP_WRITE` — used when the kernel doesn't support
+//! `IORING_OP_SPLICE`.  Detection happens once: the first splice failure
+//! sets `use_splice = false` and all subsequent flushes use the write path.
 //!
-//! Each worker gets its **own** `IoUringEngine` (no Mutex, no sharing) so
-//! writes to disjoint file offsets are never serialised.
+//! Both paths batch N writes into a single `submit_and_wait` call (8× syscall
+//! reduction).  Uses `IORING_SETUP_SQPOLL` to eliminate submission syscalls.
 //!
-//! Falls back gracefully to `None` if the kernel or permissions don't
-//! support io_uring.
+//! Each worker gets its **own** `IoUringEngine` (no sharing).
+//!
+//! Returns `None` from `try_new()` if io_uring isn't available at all.
 
 #![cfg(target_os = "linux")]
 
@@ -24,91 +24,255 @@ use std::os::fd::AsRawFd;
 
 use io_uring::{opcode, types, IoUring};
 
-/// Number of pending writes to accumulate before auto-flushing.
+/// Number of pending writes before auto-flush.
 const BATCH_SIZE: usize = 8;
 
-/// A pending write submission — kept alive in the engine's buffer until
-/// `flush()` submits and completes all SQEs.
+/// A pending write — kept alive until `flush()` completes it.
 struct PendingWrite {
     offset: u64,
     data: Vec<u8>,
 }
 
-/// Per-worker io_uring writer with batched submission.
+/// Per-worker io_uring writer.
 ///
-/// Not `Sync` — must not be shared across threads. Each worker creates its
-/// own instance. `IoUring` is `Send`, so this is `Send` by default.
+/// Not `Sync` — each worker owns its instance. `IoUring` is `Send`, so
+/// this is `Send` by default.
 pub struct IoUringEngine {
     ring: IoUring,
     fd: i32,
-    /// Accumulated writes not yet submitted to the kernel.
+    pipe_rd: i32,
+    pipe_wr: i32,
+    pipe_capacity: usize,
+    /// Whether `IORING_OP_SPLICE` is known to work on this kernel.
+    /// Set to `false` on the first splice failure.
+    use_splice: bool,
     pending: Vec<PendingWrite>,
 }
 
-// On drop, flush any remaining pending writes to avoid data loss.
-// The error is silently ignored — the engine is being dropped anyway.
 impl Drop for IoUringEngine {
     fn drop(&mut self) {
         let _ = self.flush();
+        unsafe {
+            let _ = libc::close(self.pipe_rd);
+            let _ = libc::close(self.pipe_wr);
+        }
     }
 }
 
 impl IoUringEngine {
     /// Try to create an io_uring engine backed by `file`.
     ///
-    /// Returns `None` if the kernel does not support io_uring or SQPOLL,
-    /// or if the user lacks `CAP_SYS_ADMIN` / sufficient `memlock` rlimit.
+    /// Returns `None` if io_uring or pipe creation fails.
     pub fn try_new(file: &File, entries: u32) -> io::Result<Option<Self>> {
-        // Try with SQPOLL first (zero-syscall submission).
-        let ring = match IoUring::builder().setup_sqpoll(2000).build(entries) {
-            Ok(ring) => ring,
-            Err(_) => {
-                match IoUring::new(entries) {
-                    Ok(ring) => ring,
-                    Err(_) => return Ok(None),
-                }
-            }
+        // --- per-worker pipe ---
+        let mut pipe_fds = [-1i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (pipe_rd, pipe_wr) = (pipe_fds[0], pipe_fds[1]);
+
+        // Bump pipe capacity so a full batch fits (deadlock prevention).
+        let target_cap = (entries as usize) * 256 * 1024;
+        unsafe { libc::fcntl(pipe_wr, libc::F_SETPIPE_SZ, target_cap as libc::c_int); }
+        let pipe_capacity = match unsafe { libc::fcntl(pipe_wr, libc::F_GETPIPE_SZ) } {
+            cap if cap > 0 => cap as usize,
+            _ => 65536,
         };
 
-        let fd = file.as_raw_fd();
+        // --- io_uring ---
+        let ring = match IoUring::builder().setup_sqpoll(2000).build(entries) {
+            Ok(r) => r,
+            Err(_) => match IoUring::new(entries) {
+                Ok(r) => r,
+                Err(_) => {
+                    unsafe { libc::close(pipe_rd); libc::close(pipe_wr); }
+                    return Ok(None);
+                }
+            },
+        };
+
         Ok(Some(Self {
             ring,
-            fd,
+            fd: file.as_raw_fd(),
+            pipe_rd,
+            pipe_wr,
+            pipe_capacity,
+            use_splice: true,
             pending: Vec::with_capacity(BATCH_SIZE * 2),
         }))
     }
 
-    /// Queue a positioned write at `offset`. Does **not** block unless the
-    /// pending batch is full — in that case the batch is flushed first.
-    ///
-    /// The caller must call `flush()` at the end to guarantee all queued
-    /// data has been written to the kernel page cache.
-    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.pending.push(PendingWrite {
-            offset,
-            data: data.to_vec(),
-        });
+    // ── public API ──────────────────────────────────────────────────────
 
+    /// Queue a positioned write.  Does **not** block unless the pending
+    /// batch is full (auto-flush).  Call `flush()` at the end.
+    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.pending.push(PendingWrite { offset, data: data.to_vec() });
         if self.pending.len() >= BATCH_SIZE {
             self.flush()?;
         }
-
         Ok(())
     }
 
-    /// Submit all pending SQEs and block until every one completes.
-    ///
-    /// After this call the pending buffer is empty and all queued writes
-    /// are visible to the kernel page cache.
+    /// Flush all pending writes — either via pipe+splice or IORING_OP_WRITE.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
 
-        let batch = self.pending.len();
+        if self.use_splice {
+            let total: usize = self.pending.iter().map(|p| p.data.len()).sum();
+            let result = if total <= self.pipe_capacity {
+                self.flush_batch_splice()
+            } else {
+                self.flush_seq_splice()
+            };
 
-        // Prepare one SQE per pending write.
-        for (i, pw) in self.pending.iter().enumerate() {
+            match result {
+                Ok(()) => {
+                    self.pending.clear();
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Splice failed — permanently fall back to WRITE.
+                    self.use_splice = false;
+                    let _ = self.drain_pipe();
+                }
+            }
+        }
+
+        // Fallback: IORING_OP_WRITE.
+        self.flush_write()?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Number of pending writes.
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    // ── splice helpers ──────────────────────────────────────────────────
+
+    fn flush_batch_splice(&mut self) -> io::Result<()> {
+        self.write_all_to_pipe()?;
+        self.push_all_splices()?;
+        self.ring.submit_and_wait(self.pending.len())?;
+        self.consume_all_cqes()?;
+        Ok(())
+    }
+
+    fn flush_seq_splice(&mut self) -> io::Result<()> {
+        while !self.pending.is_empty() {
+            let pw = self.pending.swap_remove(0);
+            self.write_one_to_pipe(&pw)?;
+            let sqe = make_splice_sqe(self.pipe_rd, self.fd, &pw, 0);
+            unsafe {
+                self.ring.submission()
+                    .push(&sqe)
+                    .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "submission queue full"))?;
+            }
+            self.ring.submit_and_wait(1)?;
+            match self.ring.completion().next() {
+                Some(cqe) => {
+                    let r = cqe.result();
+                    if r < 0 {
+                        return Err(io::Error::from_raw_os_error(-r));
+                    }
+                    if r as usize != pw.data.len() {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero,
+                            format!("short splice: {r} of {} bytes", pw.data.len())));
+                    }
+                }
+                None => return Err(io::Error::new(io::ErrorKind::Other, "completion queue empty")),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_all_to_pipe(&self) -> io::Result<()> {
+        for pw in &self.pending {
+            self.write_one_to_pipe(pw)?;
+        }
+        Ok(())
+    }
+
+    fn write_one_to_pipe(&self, pw: &PendingWrite) -> io::Result<()> {
+        let mut off = 0usize;
+        while off < pw.data.len() {
+            let n = unsafe {
+                libc::write(self.pipe_wr,
+                    pw.data[off..].as_ptr() as *const libc::c_void,
+                    (pw.data.len() - off) as libc::size_t)
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            off += n as usize;
+        }
+        Ok(())
+    }
+
+    /// Push splice SQEs by index to avoid borrow conflicts.
+    fn push_all_splices(&mut self) -> io::Result<()> {
+        for i in 0..self.pending.len() {
+            let sqe = make_splice_sqe(self.pipe_rd, self.fd, &self.pending[i], i as u64);
+            unsafe {
+                self.ring.submission()
+                    .push(&sqe)
+                    .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "submission queue full"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume CQEs by index to avoid borrow conflicts.
+    fn consume_all_cqes(&mut self) -> io::Result<()> {
+        let mut err = None;
+        for i in 0..self.pending.len() {
+            let pw = &self.pending[i];
+            match self.ring.completion().next() {
+                Some(cqe) => {
+                    let r = cqe.result();
+                    if r < 0 {
+                        err = Some(io::Error::from_raw_os_error(-r));
+                    } else if r as usize != pw.data.len() {
+                        err = Some(io::Error::new(io::ErrorKind::WriteZero,
+                            format!("short splice: {r} of {} bytes", pw.data.len())));
+                    }
+                }
+                None => return Err(io::Error::new(io::ErrorKind::Other, "completion queue empty")),
+            }
+        }
+        match err { Some(e) => Err(e), None => Ok(()) }
+    }
+
+    // ── pipe drain (clean up after failed splice) ────────────────────────
+
+    fn drain_pipe(&self) -> io::Result<()> {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = unsafe {
+                libc::read(self.pipe_rd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n <= 0 {
+                return if n == 0 { Ok(()) } else {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted { continue; }
+                    Err(e)
+                };
+            }
+        }
+    }
+
+    // ── IORING_OP_WRITE fallback ────────────────────────────────────────
+
+    fn flush_write(&mut self) -> io::Result<()> {
+        for i in 0..self.pending.len() {
+            let pw = &self.pending[i];
             let sqe = opcode::Write::new(
                 types::Fd(self.fd),
                 pw.data.as_ptr(),
@@ -119,49 +283,45 @@ impl IoUringEngine {
             .user_data(i as u64);
 
             unsafe {
-                self.ring
-                    .submission()
+                self.ring.submission()
                     .push(&sqe)
                     .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "submission queue full"))?;
             }
         }
 
-        // Single syscall: submit SQEs (if not yet picked up by SQPOLL
-        // thread) and wait for `batch` completions.
-        self.ring.submit_and_wait(batch)?;
+        self.ring.submit_and_wait(self.pending.len())?;
 
-        // Drain the CQ — one entry per submitted SQE.
-        let mut last_err = None::<io::Error>;
-        for pw in &self.pending {
-            let cqe = self
-                .ring
-                .completion()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "completion queue empty"))?;
-
-            let result = cqe.result();
-            if result < 0 {
-                last_err = Some(io::Error::from_raw_os_error(-result));
-            } else if (result as usize) != pw.data.len() {
-                last_err = Some(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("short write: {} of {} bytes", result, pw.data.len()),
-                ));
+        let mut err = None;
+        for i in 0..self.pending.len() {
+            let pw = &self.pending[i];
+            match self.ring.completion().next() {
+                Some(cqe) => {
+                    let r = cqe.result();
+                    if r < 0 {
+                        err = Some(io::Error::from_raw_os_error(-r));
+                    } else if r as usize != pw.data.len() {
+                        err = Some(io::Error::new(io::ErrorKind::WriteZero,
+                            format!("short write: {r} of {} bytes", pw.data.len())));
+                    }
+                }
+                None => return Err(io::Error::new(io::ErrorKind::Other, "completion queue empty")),
             }
         }
-
-        self.pending.clear();
-
-        // Return the first error if any (all-or-nothing semantics).
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        match err { Some(e) => Err(e), None => Ok(()) }
     }
+}
 
-    /// Number of pending writes not yet flushed.
-    #[allow(dead_code)]
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
+// ── standalone SQE builders (avoid borrow conflicts with &self) ──────────
+
+fn make_splice_sqe(pipe_rd: i32, fd: i32, pw: &PendingWrite, id: u64) -> io_uring::squeue::Entry {
+    opcode::Splice::new(
+        types::Fd(pipe_rd),  // fd_in
+        -1i64,                // off_in = NULL (pipe position)
+        types::Fd(fd),        // fd_out
+        pw.offset as i64,     // off_out
+        pw.data.len() as u32, // len
+    )
+    .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE) as u32)
+    .build()
+    .user_data(id)
 }
