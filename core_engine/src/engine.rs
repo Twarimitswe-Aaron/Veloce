@@ -1,5 +1,8 @@
 //! Download orchestration — workers, progress, resume persistence.
 
+#[cfg(target_os = "linux")]
+use crate::io_uring_writer::IoUringEngine;
+
 use crate::adaptive::{AdaptiveController, FailureKind};
 use crate::args::EngineArgs;
 use crate::discover::{build_http_client, discover, supports_ranges};
@@ -246,6 +249,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 sleep(Duration::from_millis(STAGGER_MS * w as u64)).await;
             }
 
+            // Each worker gets its own io_uring engine so writes
+            // to disjoint file offsets are never serialised.
+            // Created once per worker, reused for every piece.
+            #[cfg(target_os = "linux")]
+            let mut uring = IoUringEngine::try_new(&output.inner, 64)
+                .ok()
+                .flatten();
+
             loop {
                 let idx = match queue.pop() {
                     Some(i) => i,
@@ -288,6 +299,8 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     IDLE_TIMEOUT,
                     &limiter,
                     read_buf,
+                    #[cfg(target_os = "linux")]
+                    uring.as_mut(),
                 )
                 .await;
 

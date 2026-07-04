@@ -36,7 +36,7 @@ pub async fn probe_optimal_threads(
         .filter(|&t| t <= ceiling)
         .collect();
 
-    if candidates.is_empty() || (candidates.len() == 1 && candidates[0] == 2) {
+    if candidates.len() <= 1 {
         return candidates.first().copied().unwrap_or(2).max(1).min(ceiling);
     }
 

@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time;
 
+#[cfg(target_os = "linux")]
+use crate::io_uring_writer::IoUringEngine;
+
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PIECE_RETRIES: usize = 10;
 
@@ -36,6 +39,7 @@ pub async fn download_piece(
     idle_timeout: Duration,
     limiter: &RateLimiter,
     read_buffer_bytes: usize,
+    #[cfg(target_os = "linux")] mut uring: Option<&mut IoUringEngine>,
 ) -> anyhow::Result<()> {
     worker_partial.store(0, Ordering::Relaxed);
     let piece_len = end - start + 1;
@@ -83,9 +87,14 @@ pub async fn download_piece(
                 limiter.acquire(n as u64).await;
                 buf.extend_from_slice(&bytes);
                 if buf.len() >= read_buffer_bytes {
-                    output
-                        .write_at(file_offset, &buf)
-                        .context("disk write")?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(engine) = uring.as_mut() {
+                        engine.write_at(file_offset, &buf).context("disk write")?;
+                    } else {
+                        output.write_at(file_offset, &buf).context("disk write")?;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    output.write_at(file_offset, &buf).context("disk write")?;
                     file_offset += buf.len() as u64;
                     buf.clear();
                 }
@@ -96,9 +105,14 @@ pub async fn download_piece(
     }
 
     if !buf.is_empty() {
-        output
-            .write_at(file_offset, &buf)
-            .context("disk write")?;
+        #[cfg(target_os = "linux")]
+        if let Some(engine) = uring.as_mut() {
+            engine.write_at(file_offset, &buf).context("disk write")?;
+        } else {
+            output.write_at(file_offset, &buf).context("disk write")?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        output.write_at(file_offset, &buf).context("disk write")?;
     }
 
     Ok(())

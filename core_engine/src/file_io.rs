@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// Shared output file for all workers — positioned writes avoid per-piece open/seek.
 #[derive(Clone)]
 pub struct SharedOutput {
-    inner: Arc<File>,
+    pub(crate) inner: Arc<File>,
 }
 
 impl SharedOutput {
