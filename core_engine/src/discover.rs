@@ -24,7 +24,6 @@ pub fn build_http_client(threads: usize, referer: Option<&str>, origin: Option<&
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true)
         .no_gzip()
-        .http1_only()
         .pool_max_idle_per_host(threads.max(1))
         .connect_timeout(Duration::from_secs(30));
 
