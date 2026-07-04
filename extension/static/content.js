@@ -478,6 +478,29 @@
 			margin-left: 2px;
 		}
 		.badge svg { width: 12px; height: 12px; flex-shrink: 0; }
+		.badge-close {
+			position: absolute;
+			top: -6px;
+			right: -6px;
+			width: 16px;
+			height: 16px;
+			border-radius: 50%;
+			background: #c0392b;
+			color: #fff;
+			border: 1px solid #fff;
+			font-size: 10px;
+			font-weight: 700;
+			line-height: 1;
+			padding: 0;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			cursor: pointer;
+			pointer-events: auto;
+			box-shadow: 0 1px 4px rgba(0,0,0,.4);
+			z-index: 1;
+		}
+		.badge-close:hover { background: #e74c3c; }
 		.menu {
 			position: fixed;
 			z-index: 2147483647;
@@ -576,12 +599,14 @@
 	// synchronously — otherwise the native download starts before an async check
 	// returns, and chrome.downloads.onCreated would create a second copy.
 	let coordinatorOnline = false;
+	/** Whether the popup intercept toggle is enabled. */
+	let interceptEnabled = true;
 	/** Only the active tab in the focused window may show badges or prefetch. */
 	let isForegroundTab = !document.hidden;
 	let suspendTimer = null;
 
 	function captureActive() {
-		return isForegroundTab && !document.hidden;
+		return interceptEnabled && isForegroundTab && !document.hidden;
 	}
 
 	function suspendCapture() {
@@ -626,20 +651,40 @@
 
 	if (typeof chrome !== 'undefined' && chrome.storage?.local) {
 		try {
-			chrome.storage.local.get('veloce_connected', (r) => {
+			chrome.storage.local.get(['veloce_connected', 'veloce_intercept'], (r) => {
 				if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
 					markExtensionDead(chrome.runtime.lastError);
 					return;
 				}
 				coordinatorOnline = r.veloce_connected === true;
+				interceptEnabled = r.veloce_intercept !== false;
 				coordinatorStateReady = true;
 				syncInjectCoordinatorState();
 			});
 			chrome.storage.onChanged?.addListener((changes, area) => {
 				if (extensionDead) return;
-				if (area === 'local' && changes.veloce_connected) {
-					coordinatorOnline = changes.veloce_connected.newValue === true;
-					syncInjectCoordinatorState();
+				if (area === 'local') {
+					if (changes.veloce_connected) {
+						coordinatorOnline = changes.veloce_connected.newValue === true;
+						syncInjectCoordinatorState();
+					}
+					if (changes.veloce_intercept) {
+						const enabled = changes.veloce_intercept.newValue !== false;
+						interceptEnabled = enabled;
+						if (enabled) {
+							// Re-enable: rescan and show all badges.
+							isForegroundTab = !document.hidden;
+							scan();
+						} else {
+							// Disable: hide all badges immediately.
+							for (const key of [...badgeKeys]) removeBadge(key);
+							document.querySelectorAll(`[${WATCH_ATTR}], [${SCANNED_ATTR}]`).forEach((el) => {
+								try { mediaIo.unobserve(el); } catch { /* ignore */ }
+								el.removeAttribute(WATCH_ATTR);
+								el.removeAttribute(SCANNED_ATTR);
+							});
+						}
+					}
 				}
 			});
 		} catch (e) {
@@ -1299,12 +1344,25 @@
 		// Don't create badges for feed tiles that aren't the foreground media.
 		if (!isElementForeground(anchor)) return false;
 
-		const el = document.createElement('div');
-		el.className = 'badge badge-ready';
-		el.appendChild(iconSvg());
-		const label = document.createElement('span');
-		label.textContent = 'Veloce';
-		el.appendChild(label);
+	const el = document.createElement('div');
+	el.className = 'badge';
+
+	// Close button — removes this specific badge when clicked.
+	const closeBtn = document.createElement('button');
+	closeBtn.className = 'badge-close';
+	closeBtn.textContent = '×';
+	closeBtn.title = 'Dismiss this badge';
+	closeBtn.addEventListener('click', (e) => {
+		e.preventDefault();
+		e.stopPropagation();
+		removeBadge(badgeKey);
+	});
+	el.appendChild(closeBtn);
+
+	el.appendChild(iconSvg());
+	const label = document.createElement('span');
+	label.textContent = 'Veloce';
+	el.appendChild(label);
 
 		el.addEventListener('click', (e) => {
 			e.preventDefault();

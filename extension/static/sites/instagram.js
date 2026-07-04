@@ -322,6 +322,9 @@
 			if (isReelsViewerPage() || isPostPage()) {
 				return !!canonicalPostUrl(url);
 			}
+			if (isStoriesPage()) {
+				return !!canonicalStoryUrl();
+			}
 			return false;
 		}
 
@@ -393,10 +396,11 @@
 
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
-			const placed = placeBadge(url, video, url, false);
+			const placed = placeBadge(url, video, url, true);
 			if (!placed) return null;
 			video.setAttribute(SCANNED_ATTR, '1');
 			bindReelVideoPrefetch(video, () => canonicalPostUrl(location.href) || getReelsViewerUrl());
+			ctx.eagerPrefetch(url);
 			return url;
 		}
 
@@ -437,10 +441,11 @@
 				return url;
 			}
 
-			const placed = placeBadge(url, video, url, false);
+			const placed = placeBadge(url, video, url, true);
 			if (!placed) return null;
 			video.setAttribute(SCANNED_ATTR, '1');
 			bindReelVideoPrefetch(video, () => getReelsViewerUrl());
+			ctx.eagerPrefetch(url);
 			return url;
 		}
 
@@ -475,9 +480,10 @@
 
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
-			const placed = placeBadge(url, video, url, false);
+			const placed = placeBadge(url, video, url, true);
 			if (!placed) return null;
 			video.setAttribute(SCANNED_ATTR, '1');
+			ctx.eagerPrefetch(url);
 			return url;
 		}
 
