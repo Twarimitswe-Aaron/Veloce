@@ -1239,16 +1239,39 @@
 	function dismissBadge(key, anchor) {
 		const badgeKey = normalizeBadgeKey(key);
 		dismissedBadges.add(badgeKey);
+		const entry = badges.get(badgeKey);
 		removeBadge(badgeKey);
 		const nodes = new Set();
 		if (anchor) nodes.add(anchor);
+		if (entry?.anchor) nodes.add(entry.anchor);
+		if (entry?.root) nodes.add(entry.root);
+		const article = (entry?.anchor || anchor)?.closest?.('article');
+		if (article) nodes.add(article);
 		for (const node of nodes) {
 			if (!node?.isConnected) continue;
 			node.removeAttribute(WATCH_ATTR);
 			node.removeAttribute(SCANNED_ATTR);
+			node.removeAttribute?.(CARD_WATCH_ATTR);
 			try { mediaIo.unobserve(node); } catch { /* ignore */ }
+			try { igCardIo.unobserve(node); } catch { /* ignore */ }
+			node.querySelectorAll?.('video, audio, a[href]').forEach((child) => {
+				child.removeAttribute(SCANNED_ATTR);
+				child.removeAttribute(WATCH_ATTR);
+				try { mediaIo.unobserve(child); } catch { /* ignore */ }
+			});
 		}
 		interceptLog('badge dismissed (session)', { badgeKey });
+	}
+
+	/** Shared guard for site handlers — returns false when user dismissed or badge already exists. */
+	function shouldAttemptBadge(urlKey, el) {
+		const key = normalizeBadgeKey(urlKey);
+		if (isDismissedBadge(key)) return false;
+		if (el?.getAttribute?.(SCANNED_ATTR)) {
+			if (badges.has(key)) return false;
+			el.removeAttribute(SCANNED_ATTR);
+		}
+		return true;
 	}
 
 	function closeMenu(opts = {}) {
@@ -1854,7 +1877,7 @@
 	);
 
 	function processMediaElement(el) {
-		if (!captureActive() || !el || el.getAttribute(SCANNED_ATTR)) return null;
+		if (!captureActive() || !el) return null;
 		if (!shouldBadgeMediaElement(el)) return null;
 
 		for (const h of siteHandlers) {
@@ -1883,7 +1906,10 @@
 			rawUrl = rawUrl || url || '';
 		}
 		if (!url) return null;
-		if (isDismissedBadge(normalizeBadgeKey(url))) return null;
+		const urlKey = normalizeBadgeKey(url);
+		if (!shouldAttemptBadge(urlKey, anchor)) return null;
+		if (el !== anchor && !shouldAttemptBadge(urlKey, el)) return null;
+		if (anchor.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 		const overlay = findMediaOverlay();
 		if (overlay && !overlay.contains(el) && !overlay.contains(anchor)) return null;
@@ -2080,6 +2106,7 @@
 		removeBadge,
 		dismissBadge,
 		isDismissedBadge,
+		shouldAttemptBadge,
 		dismissedBadges,
 		badges,
 		badgeKeys,

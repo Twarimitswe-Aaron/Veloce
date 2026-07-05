@@ -11,6 +11,7 @@
 			placeBadge,
 			removeBadge,
 			isDismissedBadge,
+			shouldAttemptBadge,
 			dismissedBadges,
 			badges,
 			badgeKeys,
@@ -351,11 +352,8 @@
 			if (!shouldBadgeElement(video)) return null;
 
 			const urlKey = normalizeBadgeKey(url);
-			if (isDismissedBadge?.(urlKey)) return null;
+			if (!shouldAttemptBadge?.(urlKey, video)) return null;
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
-			if (video.getAttribute(SCANNED_ATTR) && !badges.has(urlKey)) {
-				video.removeAttribute(SCANNED_ATTR);
-			}
 
 			const placed = placeBadge(url, video, url, true);
 			if (!placed) return null;
@@ -425,7 +423,7 @@
 
 			const { anchor, url } = hit;
 			const urlKey = normalizeBadgeKey(url);
-			if (isDismissedBadge?.(urlKey)) return null;
+			if (!shouldAttemptBadge?.(urlKey, anchor)) return null;
 			if (anchor.getAttribute(SCANNED_ATTR)) {
 				if (!badges.has(urlKey)) anchor.removeAttribute(SCANNED_ATTR);
 				else return url;

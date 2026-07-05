@@ -5,6 +5,9 @@
 			captureActive,
 			placeBadge,
 			removeBadge,
+			isDismissedBadge,
+			shouldAttemptBadge,
+			dismissedBadges,
 			badges,
 			badgeKeys,
 			normalizeBadgeKey,
@@ -394,6 +397,7 @@
 			}
 			lastPostBadgeKey = urlKey;
 
+			if (!shouldAttemptBadge?.(urlKey, video)) return null;
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 			const placed = placeBadge(url, video, url, true);
@@ -436,6 +440,7 @@
 			}
 			lastReelsBadgeKey = urlKey;
 
+			if (!shouldAttemptBadge?.(urlKey, video)) return null;
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) {
 				bindReelVideoPrefetch(video, () => getReelsViewerUrl());
 				return url;
@@ -478,6 +483,7 @@
 			}
 			lastStoryBadgeKey = urlKey;
 
+			if (!shouldAttemptBadge?.(urlKey, video)) return null;
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 			const placed = placeBadge(url, video, url, true);
@@ -538,6 +544,7 @@
 			if (!isArticleReady(article) && !isDedicatedMediaPage()) return null;
 
 			const urlKey = normalizeBadgeKey(url);
+			if (!shouldAttemptBadge?.(urlKey, article)) return null;
 			if (article.getAttribute(SCANNED_ATTR)) {
 				if (!badges.has(urlKey)) article.removeAttribute(SCANNED_ATTR);
 				else return url;
@@ -561,6 +568,7 @@
 			} catch { return null; }
 
 			const urlKey = normalizeBadgeKey(url);
+			if (!shouldAttemptBadge?.(urlKey, anchor)) return null;
 			if (anchor.getAttribute(SCANNED_ATTR)) {
 				if (!badges.has(urlKey)) anchor.removeAttribute(SCANNED_ATTR);
 				else return url;
@@ -639,6 +647,7 @@
 			lastReelsWatchKey = '';
 			lastReelsWatchUrl = '';
 			previousReelsWatchUrl = '';
+			dismissedBadges?.clear?.();
 			for (const key of [...badgeKeys]) removeBadge(key);
 			resetScanStateDeep(document.documentElement);
 		}

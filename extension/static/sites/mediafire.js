@@ -5,6 +5,9 @@
 			captureActive,
 			placeBadge,
 			removeBadge,
+			isDismissedBadge,
+			shouldAttemptBadge,
+			dismissedBadges,
 			badges,
 			badgeKeys,
 			normalizeBadgeKey,
@@ -147,6 +150,7 @@
 			}
 			lastBadgeKey = urlKey;
 
+			if (!shouldAttemptBadge?.(urlKey, anchor)) return null;
 			if (anchor.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 			const placed = placeBadge(url, anchor, url, true);
@@ -190,6 +194,7 @@
 			closeMenu();
 			stopFilePagePoll();
 			lastBadgeKey = null;
+			dismissedBadges?.clear?.();
 			for (const key of [...badgeKeys]) removeBadge(key);
 			resetScanStateDeep(document.documentElement);
 		}

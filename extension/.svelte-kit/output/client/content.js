@@ -591,6 +591,10 @@
 	const WATCH_ATTR = 'data-veloce-watch';
 	let openMenu = null;
 	let pendingMenuUrl = null;
+	let pendingMenuEpoch = 0;
+	let menuEpoch = 0;
+	/** User dismissed badge for this URL — do not recreate until navigation/video change. */
+	const dismissedBadges = new Set();
 	let pendingLinkIntercept = null;
 	let menuDownloadChosen = false;
 	let linkInterceptBypassUntil = 0;
@@ -1048,11 +1052,12 @@
 
 	function interceptLog(step, detail) {
 		const ts = new Date().toISOString();
-		if (detail !== undefined) {
-			console.log(`[Veloce intercept] ${ts} ${step}`, detail);
-		} else {
-			console.log(`[Veloce intercept] ${ts} ${step}`);
-		}
+		const prefix = `[Veloce intercept][page] ${ts}`;
+		if (detail !== undefined) console.log(prefix, step, detail);
+		else console.log(prefix, step);
+		try {
+			safeSendMessage({ type: 'VELOCE_INTERCEPT_LOG', step: `[page] ${step}`, detail }, () => {});
+		} catch { /* ignore */ }
 	}
 
 	let coordinatorStateReady = false;
@@ -1181,8 +1186,10 @@
 				syncInjectCoordinatorState();
 			}
 			if (msg.type === 'VELOCE_FORMATS_READY' && msg.url && msg.formats?.length) {
+				interceptLog('prefetch ready (background)', { url: msg.url, count: msg.formats.length });
 				storeFormats(msg.url, msg.formats);
-				if (openMenu && pendingMenuUrl === normalizeBadgeKey(msg.url)) {
+				const key = normalizeBadgeKey(msg.url);
+				if (openMenu && pendingMenuUrl === key && pendingMenuEpoch === menuEpoch) {
 					const closeBtn = openMenu.querySelector('.menu-close');
 					const loading = openMenu.querySelector('.menu-loading');
 					if (loading) loading.remove();
@@ -1191,6 +1198,7 @@
 				}
 			}
 			if (msg.type === 'VELOCE_FORMATS_FAILED' && msg.url) {
+				interceptLog('prefetch failed (background)', { url: msg.url, prefetch: msg.prefetch });
 				prefetchStarted.delete(normalizeBadgeKey(msg.url));
 			}
 		});
@@ -1213,9 +1221,63 @@
 		}
 	}
 
+	function isDismissedBadge(key) {
+		return dismissedBadges.has(normalizeBadgeKey(key));
+	}
+
+	function clickTargetsVeloceUi(e) {
+		return e.composedPath().some((n) => {
+			if (!n?.classList) return false;
+			return n.classList.contains('menu')
+				|| n.classList.contains('menu-close')
+				|| n.classList.contains('menu-item')
+				|| n.classList.contains('badge')
+				|| n.classList.contains('badge-close');
+		});
+	}
+
+	function dismissBadge(key, anchor) {
+		const badgeKey = normalizeBadgeKey(key);
+		dismissedBadges.add(badgeKey);
+		const entry = badges.get(badgeKey);
+		removeBadge(badgeKey);
+		const nodes = new Set();
+		if (anchor) nodes.add(anchor);
+		if (entry?.anchor) nodes.add(entry.anchor);
+		if (entry?.root) nodes.add(entry.root);
+		const article = (entry?.anchor || anchor)?.closest?.('article');
+		if (article) nodes.add(article);
+		for (const node of nodes) {
+			if (!node?.isConnected) continue;
+			node.removeAttribute(WATCH_ATTR);
+			node.removeAttribute(SCANNED_ATTR);
+			node.removeAttribute?.(CARD_WATCH_ATTR);
+			try { mediaIo.unobserve(node); } catch { /* ignore */ }
+			try { igCardIo.unobserve(node); } catch { /* ignore */ }
+			node.querySelectorAll?.('video, audio, a[href]').forEach((child) => {
+				child.removeAttribute(SCANNED_ATTR);
+				child.removeAttribute(WATCH_ATTR);
+				try { mediaIo.unobserve(child); } catch { /* ignore */ }
+			});
+		}
+		interceptLog('badge dismissed (session)', { badgeKey });
+	}
+
+	/** Shared guard for site handlers — returns false when user dismissed or badge already exists. */
+	function shouldAttemptBadge(urlKey, el) {
+		const key = normalizeBadgeKey(urlKey);
+		if (isDismissedBadge(key)) return false;
+		if (el?.getAttribute?.(SCANNED_ATTR)) {
+			if (badges.has(key)) return false;
+			el.removeAttribute(SCANNED_ATTR);
+		}
+		return true;
+	}
+
 	function closeMenu(opts = {}) {
 		const shouldResume = opts.resume === true && pendingLinkIntercept && !menuDownloadChosen;
 		const intercept = shouldResume ? pendingLinkIntercept : null;
+		menuEpoch++;
 		pendingLinkIntercept = null;
 		menuDownloadChosen = false;
 		if (openMenu) {
@@ -1223,13 +1285,16 @@
 			openMenu = null;
 		}
 		pendingMenuUrl = null;
+		pendingMenuEpoch = 0;
 		if (intercept) resumeLinkNavigation(intercept);
 	}
 
 	document.addEventListener('click', (e) => {
-		if (openMenu && !e.composedPath().includes(host)) {
-			closeMenu({ resume: !!pendingLinkIntercept });
-		}
+		if (!openMenu) return;
+		if (clickTargetsVeloceUi(e)) return;
+		closeMenu({ resume: !!pendingLinkIntercept });
+		e.preventDefault();
+		e.stopImmediatePropagation();
 	}, true);
 
 	function iconSvg() {
@@ -1329,6 +1394,7 @@
 
 	function placeBadge(resolvedUrl, anchor, rawUrl, startPrefetch = false) {
 		const badgeKey = normalizeBadgeKey(resolvedUrl);
+		if (isDismissedBadge(badgeKey)) return false;
 		const root = findBadgeRoot(anchor);
 
 		const existing = badges.get(badgeKey);
@@ -1355,7 +1421,7 @@
 	closeBtn.addEventListener('click', (e) => {
 		e.preventDefault();
 		e.stopPropagation();
-		removeBadge(badgeKey);
+		dismissBadge(badgeKey, anchor);
 	});
 	el.appendChild(closeBtn);
 
@@ -1368,6 +1434,7 @@
 			e.preventDefault();
 			e.stopPropagation();
 			const pageUrl = location.href.split('#')[0];
+			interceptLog('step 0: badge click', { resolvedUrl, pageUrl, coordinatorOnline });
 			try {
 				const u = new URL(pageUrl);
 				if (/youtube\.com/i.test(location.hostname) && u.pathname === '/playlist' && u.searchParams.get('list')) {
@@ -1504,6 +1571,13 @@
 					showVeloceToast('Veloce was updated — refresh this page (F5)', true);
 					return;
 				}
+				interceptLog('step I: format picked → NEW_DOWNLOAD', {
+					fileName,
+					sourceUrl,
+					directUrl: useDirect ? fmt.url : undefined,
+					formatId: fmt.id,
+					manifest
+				});
 				try {
 					chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
 						if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
@@ -1563,7 +1637,11 @@
 		const closeBtn = document.createElement('button');
 		closeBtn.className = 'menu-close';
 		closeBtn.textContent = 'Close';
-		closeBtn.addEventListener('click', () => closeMenu({ resume: false }));
+		closeBtn.addEventListener('click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			closeMenu({ resume: false });
+		});
 		menu.appendChild(closeBtn);
 		shadow.appendChild(menu);
 		openMenu = menu;
@@ -1578,9 +1656,18 @@
 	function openFormatMenu(resolvedUrl, anchor, badgeEl, preloadedFormats, linkIntercept) {
 		const pageUrl = location.href.split('#')[0];
 		const url = resolvedUrl || resolveDownloadUrl(anchor?.currentSrc || anchor?.src || anchor?.href, anchor);
+		closeMenu({ resume: false });
+		const epoch = menuEpoch;
+		interceptLog('step E: openFormatMenu', {
+			resolvedUrl,
+			url,
+			pageUrl,
+			preloaded: preloadedFormats?.length ?? 0,
+			coordinatorOnline,
+			fromLinkIntercept: !!linkIntercept
+		});
 		menuDownloadChosen = false;
 		pendingLinkIntercept = linkIntercept || null;
-		closeMenu({ resume: false });
 		const menu = document.createElement('div');
 		menu.className = 'menu';
 
@@ -1592,7 +1679,11 @@
 		const closeBtn = document.createElement('button');
 		closeBtn.className = 'menu-close';
 		closeBtn.textContent = 'Close';
-		closeBtn.addEventListener('click', () => closeMenu({ resume: !!pendingLinkIntercept }));
+		closeBtn.addEventListener('click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			closeMenu({ resume: !!pendingLinkIntercept });
+		});
 		menu.appendChild(closeBtn);
 
 		shadow.appendChild(menu);
@@ -1600,6 +1691,7 @@
 		positionMenu(menu, badgeEl);
 
 		if (!url && !preloadedFormats?.length) {
+			interceptLog('step E1: ABORT — no URL', { pageUrl });
 			const err = document.createElement('div');
 			err.className = 'menu-status';
 			err.textContent = 'No downloadable URL found for this item.';
@@ -1608,18 +1700,20 @@
 		}
 
 		if (preloadedFormats?.length) {
-			interceptLog('step 6: showing preloaded format(s)', { count: preloadedFormats.length, labels: preloadedFormats.map((f) => f.label) });
+			interceptLog('step E2: preloaded formats (no yt-dlp)', { count: preloadedFormats.length, labels: preloadedFormats.map((f) => f.label) });
 			showFormatsInMenu(menu, closeBtn, preloadedFormats, url || pageUrl);
 			return;
 		}
 
 		const githubFormats = formatsForGithubUrl(url);
 		if (githubFormats?.length) {
+			interceptLog('step E2: github direct formats', { url: githubFormats[0].url });
 			showFormatsInMenu(menu, closeBtn, githubFormats, githubFormats[0].url);
 			return;
 		}
 
 		if (isGithubRepoBrowseUrl(url)) {
+			interceptLog('step E1: ABORT — github repo browse (not a file)', { url });
 			const err = document.createElement('div');
 			err.className = 'menu-status';
 			err.textContent = 'Not a direct file — close to follow the link, or open a file page first.';
@@ -1630,20 +1724,25 @@
 		const badgeKey = normalizeBadgeKey(url);
 		const cached = localFormatCache.get(badgeKey);
 		if (cached?.length) {
+			interceptLog('step E2: local cache HIT', { badgeKey, count: cached.length });
 			showFormatsInMenu(menu, closeBtn, cached, url, null);
 			return;
 		}
 
+		interceptLog('step F: loading formats (peek → LIST_FORMATS)', { badgeKey, url });
 		const loading = showLoadingStatus(menu, closeBtn);
 		pendingMenuUrl = badgeKey;
+		pendingMenuEpoch = epoch;
 		eagerPrefetch(url);
 
 		const finishWithFormats = (formats, fromCache = false) => {
-			if (!openMenu || pendingMenuUrl !== badgeKey) return;
+			if (epoch !== menuEpoch || !openMenu || pendingMenuUrl !== badgeKey) return;
+			interceptLog('step H: formats ready', { badgeKey, count: formats?.length ?? 0, fromCache });
 			if (formats?.length) storeFormats(url, formats);
 			if (fromCache) loading.setInstant();
 			loading.stop();
 			if (!formats?.length) {
+				interceptLog('step H1: ERROR — empty formats', { badgeKey });
 				const err = document.createElement('div');
 				err.className = 'menu-status';
 				err.textContent = 'No formats found. Is the backend running?';
@@ -1656,7 +1755,8 @@
 		};
 
 		const finishWithError = (error) => {
-			if (!openMenu || pendingMenuUrl !== badgeKey) return;
+			if (epoch !== menuEpoch || !openMenu || pendingMenuUrl !== badgeKey) return;
+			interceptLog('step H1: ERROR', { badgeKey, error: error || 'unknown' });
 			loading.stop();
 			const err = document.createElement('div');
 			err.className = 'menu-status';
@@ -1672,6 +1772,7 @@
 
 		// Background SW may already have formats from prefetch — show instantly without a new yt-dlp run.
 		safeSendMessage({ type: 'VELOCE_PEEK_FORMATS', url: badgeKey }, (peek) => {
+			interceptLog('step F1: peek response', { badgeKey, hit: !!peek?.formats?.length, count: peek?.formats?.length ?? 0 });
 			if (peek?.formats?.length) {
 				if (busyPort) {
 					try { busyPort.disconnect(); } catch { /* ignore */ }
@@ -1682,6 +1783,7 @@
 			}
 
 			if (!extensionAlive()) {
+				interceptLog('step F1: ABORT — extension invalidated (refresh page)', { badgeKey });
 				if (busyPort) {
 					try { busyPort.disconnect(); } catch { /* ignore */ }
 				}
@@ -1689,12 +1791,20 @@
 				return;
 			}
 
+			interceptLog('step F2: LIST_FORMATS force=true', { badgeKey });
 			safeSendMessage({ type: 'VELOCE_LIST_FORMATS', url: badgeKey, force: true }, (resp) => {
+				interceptLog('step G: LIST_FORMATS response', {
+					badgeKey,
+					type: resp?.type,
+					count: resp?.formats?.length ?? 0,
+					cached: !!resp?.cached,
+					error: resp?.error
+				});
 				if (busyPort) {
 					try { busyPort.disconnect(); } catch { /* ignore */ }
 					busyPort = null;
 				}
-				if (!openMenu || pendingMenuUrl !== badgeKey) return;
+				if (epoch !== menuEpoch || !openMenu || pendingMenuUrl !== badgeKey) return;
 
 				if (resp?.type === 'FORMATS_ERROR' || !resp?.formats?.length) {
 					finishWithError(resp?.error);
@@ -1767,7 +1877,7 @@
 	);
 
 	function processMediaElement(el) {
-		if (!captureActive() || !el || el.getAttribute(SCANNED_ATTR)) return null;
+		if (!captureActive() || !el) return null;
 		if (!shouldBadgeMediaElement(el)) return null;
 
 		for (const h of siteHandlers) {
@@ -1796,6 +1906,10 @@
 			rawUrl = rawUrl || url || '';
 		}
 		if (!url) return null;
+		const urlKey = normalizeBadgeKey(url);
+		if (!shouldAttemptBadge(urlKey, anchor)) return null;
+		if (el !== anchor && !shouldAttemptBadge(urlKey, el)) return null;
+		if (anchor.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 		const overlay = findMediaOverlay();
 		if (overlay && !overlay.contains(el) && !overlay.contains(anchor)) return null;
@@ -1990,6 +2104,10 @@
 		captureActive,
 		placeBadge,
 		removeBadge,
+		dismissBadge,
+		isDismissedBadge,
+		shouldAttemptBadge,
+		dismissedBadges,
 		badges,
 		badgeKeys,
 		normalizeBadgeKey,

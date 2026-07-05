@@ -10,6 +10,9 @@
 			captureActive,
 			placeBadge,
 			removeBadge,
+			isDismissedBadge,
+			shouldAttemptBadge,
+			dismissedBadges,
 			badges,
 			badgeKeys,
 			normalizeBadgeKey,
@@ -349,6 +352,7 @@
 			if (!shouldBadgeElement(video)) return null;
 
 			const urlKey = normalizeBadgeKey(url);
+			if (!shouldAttemptBadge?.(urlKey, video)) return null;
 			if (video.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
 
 			const placed = placeBadge(url, video, url, true);
@@ -372,6 +376,7 @@
 			if (isRealChange) {
 				closeMenu();
 				for (const key of [...badgeKeys]) removeBadge(key);
+				dismissedBadges?.clear?.();
 				resetScanStateDeep(document.documentElement);
 			}
 
@@ -418,6 +423,7 @@
 
 			const { anchor, url } = hit;
 			const urlKey = normalizeBadgeKey(url);
+			if (!shouldAttemptBadge?.(urlKey, anchor)) return null;
 			if (anchor.getAttribute(SCANNED_ATTR)) {
 				if (!badges.has(urlKey)) anchor.removeAttribute(SCANNED_ATTR);
 				else return url;
