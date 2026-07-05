@@ -190,11 +190,15 @@
 	try {
 		const nativeProtoClick = HTMLAnchorElement.prototype.click;
 		HTMLAnchorElement.prototype.click = function veloceProtoAnchorClick() {
-			if (readCoordinatorOnline() && this.hasAttribute?.('download')) {
+			if (this.hasAttribute?.('download')) {
 				const href = this.href;
 				const download = this.getAttribute('download') || '';
 				if (href && /^https?:/i.test(href)) {
-					notifyIntercept(href, download);
+					if (readCoordinatorOnline()) {
+						notifyIntercept(href, download);
+					} else {
+						logImportant('SKIP anchor.click — coordinator offline', { href, download });
+					}
 				}
 			}
 			return nativeProtoClick.call(this);

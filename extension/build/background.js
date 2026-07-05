@@ -228,8 +228,14 @@ function drainPrefetchQueue() {
 		prefetchQueued.delete(url);
 		if (!url || getFormatCache(url) || inflightFormatUrls.has(url)) continue;
 		prefetchRunning++;
+		traceFormats('prefetch start', { url, running: prefetchRunning, queueLeft: prefetchQueue.length });
 		void requestFormatsFromCoordinator(url, (data) => {
 			prefetchRunning--;
+			traceFormats(data.formats?.length ? 'prefetch OK' : 'prefetch FAIL', {
+				url,
+				count: data.formats?.length ?? 0,
+				error: data.error
+			});
 			if (data.formats?.length) setFormatCache(url, data.formats);
 			else notifyFormatFailed(url, true);
 			drainPrefetchQueue();
@@ -418,6 +424,14 @@ function handleWsMessage(data) {
 		case 'FORMATS_LIST':
 		case 'FORMATS_ERROR': {
 			const pending = pendingFormatRequests.get(data.requestId);
+			traceFormats(data.type === 'FORMATS_LIST' ? 'WS response OK' : 'WS response ERROR', {
+				requestId: data.requestId,
+				url: pending?.url,
+				prefetch: pending?.prefetch === true,
+				count: data.formats?.length ?? 0,
+				error: data.error,
+				hasPending: !!pending
+			});
 			if (pending) {
 				pendingFormatRequests.delete(data.requestId);
 				if (pending.url) inflightFormatUrls.delete(pending.url);
@@ -689,8 +703,10 @@ async function startDownload(payload, tabId) {
 
 async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false, force = false) {
 	const key = normalizeFormatUrl(url);
+	traceFormats('coordinator request start', { url: key, prefetch, force });
 	const ok = await ensureConnected(2500);
 	if (!ok) {
+		traceFormats('coordinator OFFLINE', { url: key });
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
 		return;
 	}
@@ -698,12 +714,14 @@ async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false
 	const requestId = crypto.randomUUID();
 	inflightFormatUrls.add(key);
 	pendingFormatRequests.set(requestId, { sendResponse, url: key, prefetch });
+	traceFormats('WS LIST_FORMATS send', { requestId, url: key, force, prefetch });
 	const sent = await wsSendAsync({
 		type: 'LIST_FORMATS',
 		requestId,
 		payload: { url: key, force: force === true }
 	});
 	if (!sent) {
+		traceFormats('WS send FAILED', { requestId, url: key });
 		inflightFormatUrls.delete(key);
 		pendingFormatRequests.delete(requestId);
 		sendResponse({ type: 'FORMATS_ERROR', error: 'Local Coordinator offline' });
@@ -711,6 +729,7 @@ async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false
 	}
 	setTimeout(() => {
 		if (pendingFormatRequests.has(requestId)) {
+			traceFormats('WS TIMEOUT (50s)', { requestId, url: key, prefetch });
 			inflightFormatUrls.delete(key);
 			pendingFormatRequests.delete(requestId);
 			sendResponse({ type: 'FORMATS_ERROR', error: 'Format list timed out' });
@@ -720,28 +739,39 @@ async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false
 
 async function listFormats(url, sendResponse, sender, force = false) {
 	const key = normalizeFormatUrl(url);
+	traceFormats('listFormats start', {
+		url: key,
+		force,
+		tabId: sender?.tab?.id,
+		failCached: isFormatFailed(key)
+	});
 	if (force) clearFormatFail(key);
 
 	let cached = getFormatCache(key);
 	if (!cached?.length) {
+		traceFormats('waiting inflight prefetch', { url: key });
 		cached = await waitForInflightFormats(key);
 	}
 	if (cached?.length) {
+		traceFormats('cache HIT', { url: key, count: cached.length });
 		sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
 		return;
 	}
 
 	// User click — jump the queue; never block on a prefetch-only fail.
 	if (!force) {
+		traceFormats('enqueue prefetch (non-force path)', { url: key });
 		enqueuePrefetch(key, true);
 		await waitForInflightFormats(key);
 		cached = getFormatCache(key);
 		if (cached?.length) {
+			traceFormats('prefetch cache HIT after wait', { url: key, count: cached.length });
 			sendResponse({ type: 'FORMATS_LIST', formats: cached, cached: true });
 			return;
 		}
 	}
 
+	traceFormats('delegating to coordinator', { url: key, force });
 	await requestFormatsFromCoordinator(key, sendResponse, false, force);
 }
 
@@ -751,11 +781,13 @@ function scheduleKeepaliveAlarm() {
 
 function interceptLog(step, detail) {
 	const ts = new Date().toISOString();
-	if (detail !== undefined) {
-		console.log(`[Veloce intercept] ${ts} ${step}`, detail);
-	} else {
-		console.log(`[Veloce intercept] ${ts} ${step}`);
-	}
+	const prefix = `[Veloce intercept][bg] ${ts}`;
+	if (detail !== undefined) console.log(prefix, step, detail);
+	else console.log(prefix, step);
+}
+
+function traceFormats(step, detail) {
+	interceptLog(`formats: ${step}`, detail);
 }
 
 const BROWSER_ONLY_URL = /^(blob:|data:|mediastream:)/i;
@@ -1116,6 +1148,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		case 'VELOCE_PEEK_FORMATS': {
 			const key = normalizeFormatUrl(msg.url);
 			const cached = getFormatCache(key);
+			traceFormats('peek', { url: key, hit: !!cached?.length, count: cached?.length ?? 0 });
 			sendResponse(cached?.length ? { formats: cached, cached: true } : { formats: [] });
 			return false;
 		}
