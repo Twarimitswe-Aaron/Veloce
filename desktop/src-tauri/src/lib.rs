@@ -118,14 +118,21 @@ pub fn run() {
 
     let config = config::Config::from_env();
 
-    let data_dir = dirs::data_dir()
-        .unwrap_or(std::path::PathBuf::from("."))
-        .join("Veloce");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-    let db_path = data_dir.join("veloce.db");
+    let db_path = config.database_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).expect("Failed to create database directory");
+    }
 
     let db = Database::open(&db_path).expect("Failed to open database");
     log::info!("Database opened at {:?}", db_path);
+
+    match util::ytdlp_binary() {
+        Some(path) => log::info!("yt-dlp found at {:?}", path),
+        None => log::warn!(
+            "yt-dlp not found — YouTube/Instagram/TikTok extraction disabled. \
+             Place binary at backend/bin/yt-dlp or install via package manager."
+        ),
+    }
 
     let ws_rt = tokio::runtime::Runtime::new().expect("Failed to create WS tokio runtime");
     let runtime_handle = ws_rt.handle().clone();
@@ -162,9 +169,8 @@ pub fn run() {
             get_config,
         ])
         .setup(|app| {
-            if let Some(state) = app.try_state::<Arc<AppState>>() {
-                state.set_app_handle(app.handle().clone());
-            }
+            let state = app.state::<Arc<AppState>>();
+            state.set_app_handle(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

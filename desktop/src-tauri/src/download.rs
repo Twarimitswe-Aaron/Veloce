@@ -81,7 +81,7 @@ pub async fn list_formats_for_url(
                 kind: Some("direct".to_string()),
             }]
         }
-        _ => ytdlp::list_formats(url, force)?,
+        _ => ytdlp::list_formats(&normalized, force)?,
     };
 
     if let Ok(json) = serde_json::to_string(&formats) {
@@ -152,6 +152,17 @@ pub async fn start_download_job(
     };
     let save_path_str = save_path.to_string_lossy().to_string();
 
+    let min_free_bytes = config.min_free_disk_mb * 1024 * 1024;
+    if let Some(free) = util::free_space(&save_dir) {
+        if free < min_free_bytes {
+            return Err(format!(
+                "Insufficient disk space: {} free, need at least {} MB reserved",
+                util::format_bytes(free),
+                config.min_free_disk_mb,
+            ));
+        }
+    }
+
     let download_url = resolve_download_url(&state, &req.url, req.direct_url.as_deref())?;
 
     if state.db.get_download(&download_id).ok().flatten().is_some() {
@@ -191,6 +202,9 @@ pub async fn start_download_job(
         source: Some(format!("{:?}", source).to_lowercase()),
     };
     state.track_download(status).await;
+    state
+        .ws_clients
+        .broadcast_ack(&download_id, &safe_name, "downloading");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -221,6 +235,8 @@ pub async fn start_download_job(
         config.default_threads,
         config.max_rate_bytes,
         config.engine_quiet,
+        config.engine_read_buffer_bytes,
+        config.engine_auto_tune,
         referer.as_deref(),
         on_progress,
     ) {

@@ -82,5 +82,15 @@ export const config = {
 	 */
 	allowedExtensionIds: list('VELOCE_ALLOWED_EXTENSION_IDS'),
 	/** Block downloads whose host is localhost/loopback/private/link-local (SSRF guard). */
-	blockPrivateHosts: bool('VELOCE_BLOCK_PRIVATE_HOSTS', true)
+	blockPrivateHosts: bool('VELOCE_BLOCK_PRIVATE_HOSTS', true),
+	/** SQLite database file (shared with desktop coordinator). */
+	dbPath: env['VELOCE_DB_PATH']?.trim()
+		? path.resolve(env['VELOCE_DB_PATH'].trim())
+		: path.join(
+				(process.env.HOME || process.env.USERPROFILE || '.'),
+				'.local',
+				'share',
+				'Veloce',
+				'veloce.db'
+			)
 };

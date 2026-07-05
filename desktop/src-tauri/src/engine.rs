@@ -1,13 +1,12 @@
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::io::Read;
 use std::path::PathBuf;
 use serde_json;
 
 /// Represents a running core_engine process.
 pub struct EngineProcess {
-    pub download_id: String,
+    download_id: String,
     child: Option<Child>,
     cancelled: Arc<AtomicBool>,
 }
@@ -38,6 +37,8 @@ impl EngineProcess {
         threads: u32,
         max_rate: u64,
         quiet: bool,
+        read_buffer_bytes: u32,
+        auto_tune: bool,
         referer: Option<&str>,
         on_progress: F,
     ) -> Result<(Self, std::thread::JoinHandle<()>), String>
@@ -56,9 +57,14 @@ impl EngineProcess {
             threads.to_string(),
             "--max-rate".to_string(),
             max_rate.to_string(),
+            "--read-buffer-bytes".to_string(),
+            read_buffer_bytes.to_string(),
         ];
         if quiet {
             args.push("--quiet".to_string());
+        }
+        if !auto_tune {
+            args.push("--no-auto-tune".to_string());
         }
         if let Some(ref_) = referer {
             args.push("--referer".to_string());
@@ -109,6 +115,7 @@ impl EngineProcess {
 
     /// Cancel the engine (state file will be cleaned up by coordinator).
     pub fn cancel(&mut self) {
+        log::debug!("Cancelling engine for download {}", self.download_id);
         self.cancelled.store(true, Ordering::SeqCst);
         if let Some(ref mut child) = self.child {
             let _ = child.kill();

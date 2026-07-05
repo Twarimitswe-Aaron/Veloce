@@ -11,7 +11,7 @@ Everything runs on **your PC** — no cloud queue, no account, no subscription.
 | Piece | What it does |
 |-------|----------------|
 | **Browser extension** | Badges links and videos on the **active tab**, opens a format picker, intercepts browser downloads when the coordinator is online |
-| **Local coordinator** (`backend/`) | WebSocket server on `localhost:14921`, SQLite queue, yt-dlp extraction, spawns download jobs |
+| **Local coordinator** (`backend/` or **`desktop/`**) | WebSocket on `localhost:14921`, SQLite queue, yt-dlp, engine spawn. Use **one** at a time — not both. |
 | **Rust engine** (`core_engine/`) | Segmented HTTP download with work-stealing pieces, adaptive threads, crash-safe resume |
 
 **Typical flow:** browse → click Veloce badge → pick quality → file lands in `~/Downloads/Veloce` (or your chosen folder) with live speed/ETA in the popup or dashboard.
@@ -41,7 +41,7 @@ Veloce is young software. Know these trade-offs before you rely on it for everyt
 
 | Limitation | Detail |
 |------------|--------|
-| **Local setup required** | You must run the coordinator (`npm run dev` or systemd). It is not a “install extension only” product like some SaaS grabbers. |
+| **Local setup required** | Run **`desktop/`** (native app) *or* **`backend npm run dev`**. Do not run both — same port 14921. |
 | **Chrome-first** | The extension targets Chromium Manifest V3. Firefox support is not a primary focus today. |
 | **yt-dlp dependency** | YouTube, Instagram, TikTok, and many social sites need `yt-dlp` installed and occasionally updated when sites change. |
 | **Login-gated content** | Private or age-gated media only works if yt-dlp can use your browser cookies (Chrome profile). |

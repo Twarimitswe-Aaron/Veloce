@@ -77,11 +77,13 @@ impl FormatCache {
         });
     }
 
+    #[allow(dead_code)]
     pub fn invalidate(&self, key: &str) {
         let mut cache = self.cache.lock().unwrap();
         cache.remove(key);
     }
 
+    #[allow(dead_code)]
     pub fn clear(&self) {
         let mut cache = self.cache.lock().unwrap();
         cache.clear();

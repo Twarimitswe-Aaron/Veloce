@@ -22,6 +22,7 @@ pub struct DownloadRow {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct DeviceRow {
     pub id: String,
     pub created_at: i64,
@@ -30,6 +31,7 @@ pub struct DeviceRow {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct PlaylistJobRow {
     pub id: String,
     pub device_id: String,
@@ -122,8 +124,9 @@ impl Database {
         Ok(())
     }
 
-    // ── Devices ──────────────────────────────────────────────────────────
+    // ── Devices (wired in P2: settings / device tracking) ────────────────
 
+    #[allow(dead_code)]
     pub fn upsert_device(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -238,6 +241,7 @@ impl Database {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn list_interrupted_downloads(&self) -> Result<Vec<DownloadRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -265,12 +269,14 @@ impl Database {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn delete_download(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM downloads WHERE id = ?1", params![id])?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn has_download_with_url(&self, url: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM downloads WHERE url = ?1 AND status IN ('queued', 'downloading', 'completed')")?;

@@ -27,6 +27,7 @@ pub fn sanitize_filename(name: &str) -> String {
 
 /// Securely join a base directory with a relative path, ensuring the result
 /// stays inside the base directory (path traversal protection).
+#[allow(dead_code)]
 pub fn safe_join(base: &Path, component: &str) -> Option<PathBuf> {
     let cleaned = component.trim_start_matches('/').trim_start_matches('\\');
     let joined = base.join(cleaned);
@@ -50,6 +51,7 @@ pub fn safe_join(base: &Path, component: &str) -> Option<PathBuf> {
 }
 
 /// Category based on file extension.
+#[allow(dead_code)]
 pub fn category_for_ext(ext: &str) -> &'static str {
     match ext.to_lowercase().as_str() {
         e if matches!(e, ".mp4" | ".mkv" | ".webm" | ".avi" | ".mov" | ".m4v") => "videos",
@@ -164,22 +166,45 @@ pub fn find_core_engine(manifest_dir: &str) -> PathBuf {
 }
 
 /// Resolve the path to the yt-dlp binary, checking relative to executable first,
-/// then bundled path, then PATH.
+/// then bundled paths, then PATH.
 pub fn find_ytdlp(manifest_dir: &str) -> PathBuf {
-    // 1. Relative to the running executable
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap().join("bin").join("yt-dlp");
-        if sibling.exists() { return sibling; }
+    let manifest = PathBuf::from(manifest_dir);
+    let desktop_root = manifest.parent().unwrap(); // desktop/
+    let project_root = desktop_root.parent().unwrap(); // repo root
+
+    let candidates = [
+        // 1. Relative to the running executable (packaged sidecar)
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                let p = exe.parent()?.join("bin").join("yt-dlp");
+                p.exists().then_some(p)
+            }),
+        // 2. desktop/bin/yt-dlp (Tauri bundle dev path)
+        Some(desktop_root.join("bin").join("yt-dlp")),
+        // 3. backend/bin/yt-dlp (shared with Node coordinator during dev)
+        Some(project_root.join("backend").join("bin").join("yt-dlp")),
+        // 4. repo/bin/yt-dlp (legacy layout)
+        Some(project_root.join("bin").join("yt-dlp")),
+    ];
+
+    for path in candidates.into_iter().flatten() {
+        if path.exists() {
+            return path;
+        }
     }
-    // 2. Bundled with Tauri sidecar (dev path during cargo build)
-    let bundled = PathBuf::from(manifest_dir)
-        .parent().unwrap()
-        .parent().unwrap()
-        .join("bin")
-        .join("yt-dlp");
-    if bundled.exists() { return bundled; }
-    // 3. PATH
+
     PathBuf::from("yt-dlp")
+}
+
+/// Returns the resolved yt-dlp path if the binary exists on disk.
+pub fn ytdlp_binary() -> Option<PathBuf> {
+    let path = find_ytdlp(env!("CARGO_MANIFEST_DIR"));
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

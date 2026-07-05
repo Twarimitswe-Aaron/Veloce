@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -134,15 +134,32 @@ pub async fn start_ws_server(app: Arc<AppState>, clients: Arc<WsClients>, port: 
         .route("/ws", get(ws_handler))
         .with_state(ws_state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    log::info!("WebSocket server listening on ws://{}", addr);
+    let listener = bind_ws_listener(port).await;
+    log::info!(
+        "WebSocket server listening on ws://127.0.0.1:{}/ws (also ws://localhost:{}/ws)",
+        port,
+        port
+    );
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("Failed to bind WebSocket server — is port 14921 already in use?");
     axum::serve(listener, router)
         .await
         .expect("WebSocket server exited with error");
+}
+
+/// Bind dual-stack `[::]:port` so `localhost` works when it resolves to `::1`.
+/// Falls back to `0.0.0.0` when IPv6 is unavailable.
+async fn bind_ws_listener(port: u16) -> tokio::net::TcpListener {
+    let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    match tokio::net::TcpListener::bind(v6).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::warn!("IPv6 bind on port {} failed ({}), using 0.0.0.0", port, e);
+            let v4 = SocketAddr::from(([0, 0, 0, 0], port));
+            tokio::net::TcpListener::bind(v4)
+                .await
+                .expect("Failed to bind WebSocket server — is port 14921 already in use?")
+        }
+    }
 }
 
 fn verify_origin(headers: &HeaderMap) -> bool {
@@ -168,7 +185,7 @@ fn verify_origin(headers: &HeaderMap) -> bool {
         return config.allowed_extension_ids.iter().any(|allowed| allowed == id);
     }
     if let Ok(parsed) = url::Url::parse(origin) {
-        return parsed.hostname() == "localhost" || parsed.hostname() == "127.0.0.1";
+        return parsed.host_str() == Some("localhost") || parsed.host_str() == Some("127.0.0.1");
     }
     false
 }
@@ -367,9 +384,6 @@ async fn handle_message(
             }
 
             let download_id = uuid::Uuid::new_v4().to_string();
-            state
-                .clients
-                .broadcast_ack(&download_id, file_name, "queued");
 
             let app_state = state.app.clone();
             let req = StartDownloadRequest {

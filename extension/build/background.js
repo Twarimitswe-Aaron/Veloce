@@ -1,7 +1,7 @@
 // Veloce background service worker — sole owner of the WebSocket to the Local Coordinator.
 // Popup and content scripts route through here so only one connection exists.
 
-const WS_URL = 'ws://localhost:14921/ws';
+const WS_URL = 'ws://127.0.0.1:14921/ws';
 const RECONNECT_BASE_MS = 2000;
 const RECONNECT_MAX_MS = 30000;
 

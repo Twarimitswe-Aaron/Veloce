@@ -14,6 +14,7 @@ pub struct Config {
     pub base_dir: Option<String>,
     pub allowed_extension_ids: Vec<String>,
     pub block_private_hosts: bool,
+    pub db_path: Option<String>,
 }
 
 impl Config {
@@ -33,7 +34,19 @@ impl Config {
                 .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
                 .unwrap_or_default(),
             block_private_hosts: env_bool("VELOCE_BLOCK_PRIVATE_HOSTS", true),
+            db_path: env::var("VELOCE_DB_PATH").ok().filter(|s| !s.is_empty()),
         }
+    }
+
+    /// Shared SQLite path — same default as the Node backend when VELOCE_DB_PATH is unset.
+    pub fn database_path(&self) -> PathBuf {
+        if let Some(path) = &self.db_path {
+            return PathBuf::from(path);
+        }
+        dirs::data_dir()
+            .unwrap_or(PathBuf::from("."))
+            .join("Veloce")
+            .join("veloce.db")
     }
 
     pub fn base_directory(&self) -> PathBuf {

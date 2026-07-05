@@ -1,10 +1,15 @@
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
 import * as schema from './schema';
+import fs from 'fs';
 import path from 'path';
+import { config } from '../config';
 
-const dbPath = path.resolve(process.cwd(), 'veloce.db');
+const dbPath = config.dbPath;
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const client = createClient({ url: `file:${dbPath}` });
+
+console.log(`[Veloce] Database: ${dbPath}`);
 
 /** Add columns introduced after first release (SQLite has no IF NOT EXISTS for columns). */
 async function migrateSchema() {

@@ -5,8 +5,7 @@
   "identifier": "com.veloce.desktop",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm build",
     "beforeBuildCommand": "pnpm build"
   },
   "app": {

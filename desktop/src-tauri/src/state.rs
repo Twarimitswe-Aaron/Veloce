@@ -121,47 +121,16 @@ impl AppState {
             }
         });
 
+        let _ = self.db.update_download_progress(
+            id,
+            downloaded as i64,
+            total as i64,
+        );
+
         if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
             let _ = app.emit("download-progress", &event);
         }
         self.ws_clients.broadcast_progress(id, downloaded, total, speed_bps, eta_secs);
-    }
-
-    pub async fn update_progress(
-        &self,
-        app: &AppHandle,
-        id: &str,
-        downloaded: u64,
-        total: u64,
-        speed_bps: u64,
-        eta_secs: u64,
-    ) {
-        let pct = if total > 0 {
-            (downloaded as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        {
-            let mut progress = self.progress.lock().await;
-            if let Some(entry) = progress.get_mut(id) {
-                entry.downloaded = downloaded;
-                entry.total = total;
-                entry.speed_bps = speed_bps;
-                entry.eta_secs = eta_secs;
-                entry.progress_pct = pct;
-            }
-        }
-        let event = ProgressEvent {
-            id: id.to_string(),
-            downloaded,
-            total,
-            speed_bps,
-            eta_secs,
-            progress_pct: pct,
-        };
-        let _ = app.emit("download-progress", &event);
-        self.ws_clients
-            .broadcast_progress(id, downloaded, total, speed_bps, eta_secs);
     }
 
     pub async fn emit_status(&self, id: &str, status: &str, error: Option<String>) {
@@ -200,22 +169,6 @@ impl AppState {
         }
     }
 
-    pub async fn update_status(
-        &self,
-        app: &AppHandle,
-        id: &str,
-        status: &str,
-        error: Option<String>,
-    ) {
-        self.emit_status(id, status, error.clone()).await;
-        let event = StatusEvent {
-            id: id.to_string(),
-            status: status.to_string(),
-            error,
-        };
-        let _ = app.emit("download-status", &event);
-    }
-
     pub async fn remove_active(&self, id: &str) {
         let mut progress = self.progress.lock().await;
         progress.remove(id);
@@ -233,10 +186,5 @@ impl AppState {
     pub async fn all_statuses(&self) -> Vec<DownloadStatus> {
         let progress = self.progress.lock().await;
         progress.values().cloned().collect()
-    }
-
-    pub async fn get_status(&self, id: &str) -> Option<DownloadStatus> {
-        let progress = self.progress.lock().await;
-        progress.get(id).cloned()
     }
 }

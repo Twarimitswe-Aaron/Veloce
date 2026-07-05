@@ -20,6 +20,7 @@ pub struct JobState {
 }
 
 /// The download scheduler with a FIFO queue and concurrency cap.
+#[allow(dead_code)]
 pub struct Scheduler {
     config: Config,
     queue: Mutex<VecDeque<JobState>>,
@@ -27,6 +28,7 @@ pub struct Scheduler {
     active: Mutex<Vec<String>>,
 }
 
+#[allow(dead_code)]
 impl Scheduler {
     pub fn new(config: Config) -> Self {
         Self {
@@ -136,6 +138,7 @@ mod tests {
             base_dir: None,
             allowed_extension_ids: vec![],
             block_private_hosts: false,
+            db_path: None,
         })
     }
 

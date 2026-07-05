@@ -2,7 +2,7 @@
 // MV3 service workers suspend after ~30s; this offscreen document stays alive
 // while the browser is open so the link does not flap disconnect/connect.
 
-const WS_URL = 'ws://localhost:14921/ws';
+const WS_URL = 'ws://127.0.0.1:14921/ws';
 const RECONNECT_MS = 2000;
 const PING_MS = 25000;
 /** Delay CLOSE notify so a fast reconnect does not flash "disconnected" in the UI/logs. */
