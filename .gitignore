@@ -1,0 +1,74 @@
+# ── Dependency directories ─────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+
+# ── Build output ──────────────────────────────────────────────────────────────
+# Vite / SvelteKit (backend + extension + desktop)
+.output/
+.vercel/
+.netlify/
+.wrangler/
+/.svelte-kit/
+/build/
+/dist/
+
+# Vite timestamps
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust (core_engine + desktop)
+**/target/
+**/target/**/
+
+# Rust incremental compilation
+**/target/.rustc_info.json
+**/target/debug/
+**/target/release/.fingerprint/
+**/target/release/build/
+**/target/release/deps/
+**/target/release/examples/
+**/target/release/incremental/
+**/target/release/native/
+**/target/release/veloce-desktop.d
+
+# Keep release binary + bundle artifacts (uncomment to exclude):
+# !**/target/release/veloce-desktop
+# !**/target/release/bundle/
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Environment ──────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.test
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+
+# ── OS metadata ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── SQLite database (runtime data) ───────────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+*.trace
+
+# ── Generated icons (can regenerate from SVG) ────────────────────────────────
+desktop/src-tauri/icons/32x32.png
+desktop/src-tauri/icons/128x128.png
+desktop/src-tauri/icons/128x128@2x.png

@@ -252,6 +252,75 @@ Agents working on a site should **inspect the live DOM** (DevTools → Elements,
 
 ---
 
+## Desktop Native App (Phase 3 — Tauri 2 + Rust coordinator)
+
+### Architecture (`desktop/`)
+
+```
+desktop/
+├── src/                         # Svelte 5 frontend
+│   ├── main.ts                  #   Entry point
+│   ├── app.css                  #   Veloce design tokens
+│   └── App.svelte               #   Dashboard + History + Settings
+└── src-tauri/                   # Rust backend
+    ├── tauri.conf.json          #   Window + bundle config
+    ├── capabilities/default.json
+    ├── icons/                   #   App icons (32, 128, 256px)
+    └── src/
+        ├── main.rs              # Binary entry
+        ├── lib.rs               # Tauri commands :: list_formats, start_download, cancel, pause
+        ├── config.rs            # Env-based Config (VELOCE_PORT, etc.)
+        ├── db.rs                # SQLite (rusqlite bundled): devices, downloads, playlist_jobs
+        ├── engine.rs            # core_engine process spawn + progress reader
+        ├── formats.rs           # MediaSource enum, MediaFire resolver, FormatCache, Lazy<Regex>
+        ├── scheduler.rs         # FIFO queue with concurrency cap
+        ├── state.rs             # AppState: active_engines, cancellation_flags, progress
+        ├── util.rs              # format_bytes, find_core_engine, find_ytdlp (runtime paths)
+        └── ytdlp.rs             # yt-dlp list_formats, extract_best_url, parse_playlist
+```
+
+### IPC: Tauri Commands (invoke) + Events (emit/listen)
+
+| Command | Purpose |
+|---------|---------|
+| `list_formats` | List yt-dlp formats for a URL (cached 10 min) |
+| `start_download` | Spawn engine, insert into `active_engines`, monitor in bg thread |
+| `cancel_download` | Set cancellation flag + kill child process |
+| `pause_download` | Kill child (state preserved for resume) |
+| `get_statuses` | Snapshot of all active downloads |
+| `get_history` | Last 50 completed/failed downloads |
+| `get_settings` / `update_settings` | Device settings CRUD |
+| `get_config` | Runtime config (port, threads, etc.) |
+
+**Events:** `download-progress` (id, downloaded, total, speed, eta, pct), `download-status` (id, status, error?)
+
+### Engine Lifecycle (race-safe)
+
+1. `start_download` spawns core_engine, inserts into `active_engines` (std Mutex), adds `cancellation_flags`
+2. Monitoring thread takes ownership, calls `engine.wait()` (blocks)
+3. `cancel_download` sets AtomicBool flag + kills child (if still in map)
+4. After `wait()` returns, monitoring thread checks flag → "cancelled" vs "completed"/"failed"
+5. Engine removed from map only after `wait()` returns
+
+### Platform Independence
+
+- Binary discovery: `std::env::current_exe()` → sibling `binaries/` → Tauri sidecar → project build → PATH
+- All deps cross-platform (tokio, rusqlite bundled, reqwest, tauri)
+- Frontend uses Tauri IPC — no WebSocket dependency
+- Linux: GTK3 + WebKitGTK; Windows: WebView2; macOS: WKWebView
+
+### Key Design Decisions
+
+- **Engine not in map during wait**: Monitoring thread owns the engine; cancellation uses separate flag map
+- **Std Mutex for engines**: Accessed from both async commands and blocking threads
+- **Tokio Mutex for progress**: Only accessed from async context
+- **Runtime handle captured before spawn_blocking**: Avoids `Handle::current()` panic
+- **Runtime binary paths**: `find_core_engine()` / `find_ytdlp()` use `current_exe()` first, fall back to `env!("CARGO_MANIFEST_DIR")` for dev builds
+
+---
+
 ## Version
 
 Extension manifest version and notable behavior changes should be noted in commit messages. Current format-handling architecture: **v1.4.7+** (platform signatures in `formatSources.ts`).
+
+Desktop native app (Phase 3): **v0.1.0** (Tauri 2 + Rust coordinator rewrite).

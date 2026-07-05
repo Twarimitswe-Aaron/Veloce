@@ -1,0 +1,64 @@
+/* Veloce Design Tokens */
+:root {
+  --veloce-navy: #0a1628;
+  --veloce-navy-dark: #060e1a;
+  --veloce-navy-light: #0f1f35;
+  --veloce-white: #e8edf5;
+  --veloce-green: #00ff9d;
+  --veloce-error: #e74c3c;
+  --veloce-success: #0d6b4d;
+  --veloce-muted: #6b7a8f;
+  --veloce-border: rgba(255, 255, 255, 0.08);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--veloce-navy);
+  color: var(--veloce-white);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(0, 255, 157, 0.3);
+  color: var(--veloce-white);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Prevent text selection on UI elements */
+button, nav, header {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Smooth transitions for interactive elements */
+button, input, select {
+  transition: all 0.15s ease;
+}

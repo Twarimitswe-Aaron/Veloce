@@ -1,0 +1,60 @@
+use std::env;
+use std::path::PathBuf;
+
+/// Veloce coordinator configuration loaded from environment variables.
+pub struct Config {
+    pub port: u16,
+    pub max_concurrent_downloads: u32,
+    pub default_threads: u32,
+    pub max_rate_bytes: u64,
+    pub min_free_disk_mb: u64,
+    pub engine_quiet: bool,
+    pub engine_auto_tune: bool,
+    pub engine_read_buffer_bytes: u32,
+    pub base_dir: Option<String>,
+    pub allowed_extension_ids: Vec<String>,
+    pub block_private_hosts: bool,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            port: env_var("VELOCE_PORT", 14921),
+            max_concurrent_downloads: env_var("VELOCE_MAX_CONCURRENT_DOWNLOADS", 10),
+            default_threads: env_var("VELOCE_DEFAULT_THREADS", 8),
+            max_rate_bytes: env_var("VELOCE_MAX_RATE_BYTES", 0),
+            min_free_disk_mb: env_var("VELOCE_MIN_FREE_DISK_MB", 500),
+            engine_quiet: env_bool("VELOCE_ENGINE_QUIET", true),
+            engine_auto_tune: env_bool("VELOCE_ENGINE_AUTO_TUNE", true),
+            engine_read_buffer_bytes: env_var("VELOCE_ENGINE_READ_BUFFER_BYTES", 262144),
+            base_dir: env::var("VELOCE_BASE_DIR").ok().filter(|s| !s.is_empty()),
+            allowed_extension_ids: env::var("VELOCE_ALLOWED_EXTENSION_IDS")
+                .ok()
+                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+                .unwrap_or_default(),
+            block_private_hosts: env_bool("VELOCE_BLOCK_PRIVATE_HOSTS", true),
+        }
+    }
+
+    pub fn base_directory(&self) -> PathBuf {
+        if let Some(dir) = &self.base_dir {
+            PathBuf::from(dir)
+        } else {
+            dirs::home_dir()
+                .unwrap_or(PathBuf::from("."))
+                .join("Downloads")
+                .join("Veloce")
+        }
+    }
+}
+
+fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
+    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
+}
