@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use once_cell::sync::Lazy;
+use tokio::sync::{Mutex as TokioMutex, broadcast};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -10,6 +14,22 @@ use crate::formats::{self, MediaFormat};
 use crate::state::{AppState, DownloadStatus};
 use crate::util;
 use crate::ytdlp;
+
+const FAIL_CACHE_TTL_SECS: u64 = 90;
+
+static FORMAT_INFLIGHT: Lazy<
+    TokioMutex<HashMap<String, broadcast::Sender<Result<Vec<MediaFormat>, String>>>>,
+> = Lazy::new(|| TokioMutex::new(HashMap::new()));
+
+static FORMAT_FAIL_CACHE: Lazy<TokioMutex<HashMap<String, (String, u64)>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
 
 /// List formats with the same routing as the Tauri command (MediaFire, direct, GitHub, yt-dlp).
 pub async fn list_formats_for_url(
@@ -36,11 +56,53 @@ pub async fn list_formats_for_url(
     if !force {
         if let Some(cached) = state.format_cache.get(&normalized) {
             if let Ok(formats) = serde_json::from_str::<Vec<MediaFormat>>(&cached) {
-                return Ok(formats);
+                if !formats.is_empty() {
+                    return Ok(formats);
+                }
+            }
+        }
+        if let Some((reason, ts)) = FORMAT_FAIL_CACHE.lock().await.get(&normalized).cloned() {
+            if now_secs().saturating_sub(ts) < FAIL_CACHE_TTL_SECS {
+                return Err(reason);
             }
         }
     }
 
+    // Deduplicate concurrent LIST_FORMATS for the same URL (backend `inflight` map).
+    let waiter = {
+        let mut map = FORMAT_INFLIGHT.lock().await;
+        if let Some(tx) = map.get(&normalized) {
+            Some(tx.subscribe())
+        } else {
+            let (tx, _) = broadcast::channel(1);
+            map.insert(normalized.clone(), tx);
+            None
+        }
+    };
+
+    if let Some(mut rx) = waiter {
+        return rx
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err("Format list request was cancelled".to_string()));
+    }
+
+    let result = list_formats_uncached(state, url, &normalized, source, force).await;
+
+    if let Some(tx) = FORMAT_INFLIGHT.lock().await.remove(&normalized) {
+        let _ = tx.send(result.clone());
+    }
+
+    result
+}
+
+async fn list_formats_uncached(
+    state: &AppState,
+    url: &str,
+    normalized: &str,
+    source: formats::MediaSource,
+    force: bool,
+) -> Result<Vec<MediaFormat>, String> {
     let formats = match source {
         formats::MediaSource::MediaFire => {
             let info = formats::resolve_mediafire(url).await?;
@@ -81,11 +143,25 @@ pub async fn list_formats_for_url(
                 kind: Some("direct".to_string()),
             }]
         }
-        _ => ytdlp::list_formats(&normalized, force)?,
+        _ => {
+            let normalized = normalized.to_string();
+            tokio::task::spawn_blocking(move || ytdlp::list_formats(&normalized, force))
+                .await
+                .map_err(|e| format!("yt-dlp task failed: {e}"))??
+        }
     };
 
+    if formats.is_empty() {
+        let reason = "No downloadable formats found for this link".to_string();
+        FORMAT_FAIL_CACHE
+            .lock()
+            .await
+            .insert(normalized.to_string(), (reason.clone(), now_secs()));
+        return Err(reason);
+    }
+
     if let Ok(json) = serde_json::to_string(&formats) {
-        state.format_cache.set(&normalized, &json);
+        state.format_cache.set(normalized, &json);
     }
 
     Ok(formats)
@@ -127,7 +203,7 @@ pub fn resolve_download_url(
         return Ok(cached);
     }
 
-    let extracted = ytdlp::extract_best_url(page_url)?;
+    let extracted = ytdlp::extract_best_url(&normalized)?;
     state.best_url_cache.set(&normalized, &extracted);
     Ok(extracted)
 }

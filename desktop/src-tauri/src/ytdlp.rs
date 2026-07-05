@@ -1,10 +1,25 @@
+use once_cell::sync::Lazy;
 use serde_json;
-use std::process::{Command, Stdio};
 use std::io::Read;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-// MediaFormat is defined in formats.rs — use it here.
 pub use crate::formats::MediaFormat;
+
+/// Match extension prefetch limit — avoids Chrome cookie DB lock contention.
+static YTDLP_SLOTS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
+const YTDLP_MAX_CONCURRENT: usize = 2;
+
+#[derive(Clone)]
+struct YtAttempt {
+    cookie_args: Vec<String>,
+    extra_args: Vec<String>,
+    timeout_secs: u64,
+    label: String,
+}
 
 fn ytdlp_missing_err() -> String {
     static WARNED: std::sync::Once = std::sync::Once::new();
@@ -21,8 +36,27 @@ fn ytdlp_missing_err() -> String {
     )
 }
 
-fn ensure_ytdlp() -> Result<std::path::PathBuf, String> {
+fn ensure_ytdlp() -> Result<PathBuf, String> {
     crate::util::ytdlp_binary().ok_or_else(ytdlp_missing_err)
+}
+
+fn with_ytdlp_slot<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    loop {
+        {
+            let mut slots = YTDLP_SLOTS.lock().unwrap();
+            if *slots < YTDLP_MAX_CONCURRENT {
+                *slots += 1;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let result = f();
+    *YTDLP_SLOTS.lock().unwrap() -= 1;
+    result
 }
 
 fn youtube_extra_args(url: &str) -> Vec<&'static str> {
@@ -34,127 +68,351 @@ fn youtube_extra_args(url: &str) -> Vec<&'static str> {
     }
 }
 
-fn execute_ytdlp(args: &[&str], timeout_secs: u64) -> Result<String, String> {
-    let bin = ensure_ytdlp()?;
-    let mut cmd = Command::new(&bin);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+fn cookie_db_exists(browser: &str) -> bool {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return browser == "firefox",
+    };
+    let path = match browser {
+        "chrome" => home.join(".config/google-chrome/Default/Cookies"),
+        "chromium" => home.join(".config/chromium/Default/Cookies"),
+        "brave" => home.join(".config/BraveSoftware/Brave-Browser/Default/Cookies"),
+        "firefox" => return true,
+        _ => return false,
+    };
+    path.is_file()
+}
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?;
-
-    // Wait with approximate timeout
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
-                let mut stderr = String::new();
-                child.stderr.take().unwrap().read_to_string(&mut stderr).ok();
-
-                if status.success() && !stdout.trim().is_empty() {
-                    return Ok(stdout);
-                }
-                let err_msg = stderr.lines()
-                    .find(|l| l.starts_with("ERROR:"))
-                    .map(|l| l.trim_start_matches("ERROR: ").to_string())
-                    .unwrap_or_else(|| format!("yt-dlp exited with code {}", status.code().unwrap_or(-1)));
-                return Err(err_msg);
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    return Err("yt-dlp timed out".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("yt-dlp wait failed: {}", e)),
+fn available_cookie_browsers() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for browser in ["chrome", "chromium", "firefox", "brave"] {
+        if cookie_db_exists(browser) {
+            out.push(browser);
         }
+    }
+    if out.is_empty() {
+        out.push("chrome");
+    }
+    out
+}
+
+fn build_args(url: &str, attempt: &YtAttempt) -> Vec<String> {
+    let mut args = vec![
+        "--no-warnings".into(),
+        "--no-progress".into(),
+        "--no-playlist".into(),
+        "--socket-timeout".into(),
+        "15".into(),
+        "--retries".into(),
+        "1".into(),
+        "-J".into(),
+    ];
+    args.extend(
+        youtube_extra_args(url)
+            .into_iter()
+            .map(String::from),
+    );
+    args.extend(attempt.cookie_args.clone());
+    args.extend(attempt.extra_args.clone());
+    args.push("--".into());
+    args.push(url.to_string());
+    args
+}
+
+fn parse_stderr_error(stderr: &str, code: i32) -> String {
+    let mut last = String::new();
+    for line in stderr.lines() {
+        let t = line.trim();
+        if t.starts_with("ERROR:") {
+            last = t.trim_start_matches("ERROR:").trim().to_string();
+        } else if t.contains("Requested format is not available")
+            || t.contains("Sign in to confirm")
+            || t.contains("Video unavailable")
+        {
+            last = t.to_string();
+        }
+    }
+    if last.is_empty() {
+        format!("yt-dlp exited with code {code}")
+    } else {
+        last
     }
 }
 
+fn execute_ytdlp(
+    args: &[String],
+    timeout_secs: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
+    with_ytdlp_slot(|| {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err("yt-dlp cancelled".to_string());
+        }
+
+        let bin = ensure_ytdlp()?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut cmd = Command::new(&bin);
+        cmd.args(&arg_refs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?;
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(timeout_secs);
+
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                let _ = child.kill();
+                return Err("yt-dlp cancelled".to_string());
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
+                    let mut stderr = String::new();
+                    child.stderr.take().unwrap().read_to_string(&mut stderr).ok();
+
+                    if status.success() && !stdout.trim().is_empty() {
+                        return Ok(stdout);
+                    }
+                    return Err(parse_stderr_error(
+                        &stderr,
+                        status.code().unwrap_or(-1),
+                    ));
+                }
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        return Err("yt-dlp timed out".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("yt-dlp wait failed: {e}")),
+            }
+        }
+    })
+}
+
+fn try_attempt(url: &str, attempt: &YtAttempt, cancel: Option<&AtomicBool>) -> Result<Vec<MediaFormat>, String> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err("yt-dlp cancelled".to_string());
+    }
+    let args = build_args(url, attempt);
+    let output = execute_ytdlp(&args, attempt.timeout_secs, cancel)?;
+    parse_formats(&output, url)
+}
+
+fn youtube_attempts(force: bool) -> Vec<YtAttempt> {
+    let timeout = if force { 28 } else { 18 };
+    let mut out = Vec::new();
+
+    for browser in available_cookie_browsers() {
+        out.push(YtAttempt {
+            cookie_args: vec![
+                "--cookies-from-browser".into(),
+                browser.to_string(),
+            ],
+            extra_args: vec![],
+            timeout_secs: timeout,
+            label: format!("youtube/{browser}"),
+        });
+    }
+
+    for client in ["android", "web", "ios"] {
+        out.push(YtAttempt {
+            cookie_args: vec!["--cookies-from-browser".into(), "chrome".into()],
+            extra_args: vec![
+                "--extractor-args".into(),
+                format!("youtube:player_client={client}"),
+            ],
+            timeout_secs: if force { 24 } else { 14 },
+            label: format!("youtube/chrome/{client}"),
+        });
+    }
+
+    out.push(YtAttempt {
+        cookie_args: vec![],
+        extra_args: vec![],
+        timeout_secs: 10,
+        label: "youtube/no-cookies".into(),
+    });
+
+    out
+}
+
+fn generic_attempts(force: bool) -> Vec<YtAttempt> {
+    let timeout = if force { 24 } else { 20 };
+    vec![
+        YtAttempt {
+            cookie_args: vec!["--cookies-from-browser".into(), "chrome".into()],
+            extra_args: vec![],
+            timeout_secs: timeout,
+            label: "generic/chrome".into(),
+        },
+        YtAttempt {
+            cookie_args: vec!["--cookies-from-browser".into(), "chromium".into()],
+            extra_args: vec![],
+            timeout_secs: timeout,
+            label: "generic/chromium".into(),
+        },
+        YtAttempt {
+            cookie_args: vec![],
+            extra_args: vec![],
+            timeout_secs: 12,
+            label: "generic/no-cookies".into(),
+        },
+    ]
+}
+
+/// Parallel fallback race — mirrors backend `raceYoutubeFormats` fast path + parallel fallbacks.
+fn race_formats(url: &str, attempts: Vec<YtAttempt>, force: bool) -> (Vec<MediaFormat>, String) {
+    if attempts.is_empty() {
+        return (vec![], String::new());
+    }
+
+    let mut last_err = String::new();
+
+    if force {
+        for attempt in &attempts {
+            match try_attempt(url, attempt, None) {
+                Ok(formats) if !formats.is_empty() => return (formats, String::new()),
+                Ok(_) => {}
+                Err(e) => {
+                    log::debug!("yt-dlp {} failed: {}", attempt.label, e);
+                    last_err = e;
+                }
+            }
+        }
+        return (vec![], last_err);
+    }
+
+    // Fast path: primary browser attempt (~7s when cookies + node work).
+    match try_attempt(url, &attempts[0], None) {
+        Ok(formats) if !formats.is_empty() => return (formats, String::new()),
+        Ok(_) => {}
+        Err(e) => last_err = e,
+    }
+
+    let fallbacks: Vec<YtAttempt> = attempts.into_iter().skip(1).take(4).collect();
+    if fallbacks.is_empty() {
+        return (vec![], last_err);
+    }
+
+    let resolved = Arc::new(AtomicBool::new(false));
+    let result: Arc<Mutex<Option<Vec<MediaFormat>>>> = Arc::new(Mutex::new(None));
+    let err_out: Arc<Mutex<String>> = Arc::new(Mutex::new(last_err));
+
+    std::thread::scope(|scope| {
+        for attempt in fallbacks {
+            let url = url.to_string();
+            let resolved = Arc::clone(&resolved);
+            let result = Arc::clone(&result);
+            let err_out = Arc::clone(&err_out);
+            scope.spawn(move || {
+                if resolved.load(Ordering::Relaxed) {
+                    return;
+                }
+                match try_attempt(&url, &attempt, Some(&resolved)) {
+                    Ok(formats) if !formats.is_empty() => {
+                        *result.lock().unwrap() = Some(formats);
+                        resolved.store(true, Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if e != "yt-dlp cancelled" {
+                            log::debug!("yt-dlp {} failed: {}", attempt.label, e);
+                            let mut err = err_out.lock().unwrap();
+                            if err.is_empty() {
+                                *err = e;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let formats = result.lock().unwrap().clone().unwrap_or_default();
+    let err = err_out.lock().unwrap().clone();
+    (formats, err)
+}
+
+/// YouTube picker: hide silent video-only DASH; add merged "Best" row (backend parity).
+pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
+    let mut combined: Vec<MediaFormat> = formats
+        .into_iter()
+        .filter(|f| {
+            f.label.contains("video+audio")
+                || (f.label.contains("audio") && !f.label.contains("video only"))
+        })
+        .collect();
+
+    combined.sort_by(|a, b| {
+        let hb = parse_height(&b.label);
+        let ha = parse_height(&a.label);
+        hb.cmp(&ha).then(b.filesize.unwrap_or(0).cmp(&a.filesize.unwrap_or(0)))
+    });
+
+    let title_stem = combined
+        .first()
+        .map(|f| f.label.split(" — ").next().unwrap_or("video").to_string())
+        .unwrap_or_else(|| "video".to_string());
+
+    let best = MediaFormat {
+        id: "best".to_string(),
+        label: format!("{title_stem} — Best (video + audio)"),
+        url: String::new(),
+        ext: ".mp4".to_string(),
+        filesize: None,
+        source: Some("youtube".to_string()),
+        kind: Some("progressive".to_string()),
+    };
+
+    let mut out = vec![best];
+    out.extend(combined.into_iter().take(23));
+    out
+}
+
+fn parse_height(label: &str) -> u32 {
+    if let Some(cap) = regex::Regex::new(r"(\d{3,4})x(\d{3,4})")
+        .ok()
+        .and_then(|re| re.captures(label))
+    {
+        return cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    }
+    if let Some(cap) = regex::Regex::new(r"(\d{3,4})p")
+        .ok()
+        .and_then(|re| re.captures(label))
+    {
+        return cap.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    }
+    0
+}
+
 /// List available formats for a media URL using yt-dlp -J.
-/// `url` should already be normalized (no playlist params) for YouTube.
 pub fn list_formats(url: &str, force: bool) -> Result<Vec<MediaFormat>, String> {
     let is_youtube = url.contains("youtube.com") || url.contains("youtu.be");
-    let timeout = if force { 28 } else { 18 };
-
-    let mut attempts: Vec<(&[&str], Vec<String>, u64)> = Vec::new();
-
-    if is_youtube {
-        attempts.push((
-            &["--cookies-from-browser", "chrome"],
-            vec![],
-            timeout,
-        ));
-        attempts.push((
-            &["--cookies-from-browser", "chromium"],
-            vec![],
-            timeout,
-        ));
-        for client in ["android", "web", "ios"] {
-            attempts.push((
-                &["--cookies-from-browser", "chrome"],
-                vec![
-                    "--extractor-args".to_string(),
-                    format!("youtube:player_client={client}"),
-                ],
-                if force { 24 } else { 14 },
-            ));
-        }
-        attempts.push((&[], vec![], 10));
+    let attempts = if is_youtube {
+        youtube_attempts(force)
     } else {
-        attempts.push((&["--cookies-from-browser", "chrome"], vec![], timeout));
-        attempts.push((&["--cookies-from-browser", "chromium"], vec![], timeout));
-        attempts.push((&[], vec![], 12));
+        generic_attempts(force)
+    };
+
+    let (formats, err) = race_formats(url, attempts, force);
+
+    if formats.is_empty() && !err.is_empty() {
+        log::warn!("yt-dlp all attempts failed for {}: {}", url, err);
     }
 
-    for (cookie_args, extra_args, to) in &attempts {
-        let mut cmd_args: Vec<String> = vec![
-            "--no-warnings".into(),
-            "--no-progress".into(),
-            "--no-playlist".into(),
-            "--socket-timeout".into(),
-            "15".into(),
-            "--retries".into(),
-            "1".into(),
-            "-J".into(),
-        ];
-        cmd_args.extend(
-            youtube_extra_args(url)
-                .into_iter()
-                .map(String::from),
-        );
-        for arg in cookie_args.iter() {
-            cmd_args.push((*arg).into());
-        }
-        cmd_args.extend(extra_args.clone());
-        cmd_args.push("--".into());
-        cmd_args.push(url.to_string());
-
-        let arg_refs: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
-        match execute_ytdlp(&arg_refs, *to) {
-            Ok(output) => {
-                match parse_formats(&output, url) {
-                    Ok(formats) if !formats.is_empty() => return Ok(formats),
-                    _ => continue,
-                }
-            }
-            Err(e) => {
-                if e.contains("yt-dlp not found") {
-                    log::warn!("{}", e);
-                    return Ok(vec![]);
-                }
-                log::warn!("yt-dlp attempt failed for {}: {}", url, e);
-                continue;
-            }
-        }
-    }
-
-    Ok(vec![])
+    Ok(if is_youtube && !formats.is_empty() {
+        finalize_youtube_picker(formats)
+    } else {
+        formats
+    })
 }
 
 /// Extract the best direct media URL using yt-dlp -f b -g.
@@ -167,64 +425,43 @@ pub fn extract_best_url(url: &str) -> Result<String, String> {
     ];
 
     for cookies in &cookie_strategies {
-        let mut args = vec![
-            "--no-warnings",
-            "--no-progress",
-            "--socket-timeout", "12",
-            "--retries", "1",
-            "-f", "b",
-            "--no-playlist",
-            "-g",
-            "--",
+        let mut args: Vec<String> = vec![
+            "--no-warnings".into(),
+            "--no-progress".into(),
+            "--no-playlist".into(),
+            "--socket-timeout".into(),
+            "15".into(),
+            "--retries".into(),
+            "1".into(),
+            "-f".into(),
+            "b".into(),
+            "-g".into(),
         ];
-        args.extend(youtube_extra_args(url));
-        args.extend_from_slice(cookies);
-        args.push(url);
+        args.extend(
+            youtube_extra_args(url)
+                .into_iter()
+                .map(String::from),
+        );
+        for c in *cookies {
+            args.push((*c).into());
+        }
+        args.push("--".into());
+        args.push(url.to_string());
 
-        match execute_ytdlp(&args, 30) {
+        match execute_ytdlp(&args, 30, None) {
             Ok(output) => {
                 let url = output.lines().next().unwrap_or("").trim().to_string();
                 if !url.is_empty() && url.starts_with("http") {
                     return Ok(url);
                 }
             }
-            Err(_) => continue,
+            Err(e) => {
+                log::debug!("yt-dlp extract_best_url failed: {}", e);
+            }
         }
     }
 
     Err("Could not extract media URL".to_string())
-}
-
-/// List playlist entries using yt-dlp --flat-playlist -J.
-#[allow(dead_code)]
-pub fn list_playlist_entries(url: &str) -> Result<Vec<PlaylistEntry>, String> {
-    let cookie_strategies: [&[&str]; 2] = [
-        &["--cookies-from-browser", "chrome"],
-        &[],
-    ];
-
-    for cookies in &cookie_strategies {
-        let mut args = vec![
-            "--flat-playlist",
-            "--no-warnings",
-            "--no-progress",
-            "--socket-timeout", "12",
-            "--retries", "1",
-            "-J",
-            "--",
-        ];
-        args.extend_from_slice(cookies);
-        args.push(url);
-
-        match execute_ytdlp(&args, 90) {
-            Ok(output) => {
-                return parse_playlist(&output);
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Ok(vec![])
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -235,54 +472,104 @@ pub struct PlaylistEntry {
     pub index: Option<usize>,
 }
 
+#[allow(dead_code)]
+pub fn list_playlist_entries(url: &str) -> Result<Vec<PlaylistEntry>, String> {
+    let cookie_strategies: [&[&str]; 2] = [
+        &["--cookies-from-browser", "chrome"],
+        &[],
+    ];
+
+    for cookies in &cookie_strategies {
+        let mut args: Vec<String> = vec![
+            "--flat-playlist".into(),
+            "--no-warnings".into(),
+            "--no-progress".into(),
+            "--socket-timeout".into(),
+            "12".into(),
+            "--retries".into(),
+            "1".into(),
+            "-J".into(),
+        ];
+        for c in *cookies {
+            args.push((*c).into());
+        }
+        args.push("--".into());
+        args.push(url.to_string());
+
+        if let Ok(output) = execute_ytdlp(&args, 90, None) {
+            return parse_playlist(&output);
+        }
+    }
+
+    Ok(vec![])
+}
+
 fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, String> {
     let info: serde_json::Value = serde_json::from_str(output)
-        .map_err(|e| format!("Failed to parse yt-dlp JSON: {}", e))?;
+        .map_err(|e| format!("Failed to parse yt-dlp JSON: {e}"))?;
 
     let title = info["title"].as_str().unwrap_or("video");
-    let safe_title: String = title.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect();
+    let safe_title: String = title
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
 
     let mut formats: Vec<MediaFormat> = Vec::new();
 
-    // Single direct URL (no formats array)
     if info["url"].is_string() && info["formats"].as_array().map_or(true, |a| a.is_empty()) {
         let ext = info["ext"].as_str().unwrap_or("mp4");
         formats.push(MediaFormat {
             id: "0".to_string(),
-            label: format!("{} — {}", safe_title, ext),
+            label: format!("{safe_title} — {ext}"),
             url: info["url"].as_str().unwrap().to_string(),
             ext: format!(".{}", ext.trim_start_matches('.')),
-            filesize: info["filesize"].as_u64().or_else(|| info["filesize_approx"].as_u64()),
+            filesize: info["filesize"]
+                .as_u64()
+                .or_else(|| info["filesize_approx"].as_u64()),
             source: None,
             kind: Some("progressive".to_string()),
         });
         return Ok(formats);
     }
 
-    // Parse formats array
     if let Some(raw) = info["formats"].as_array() {
         for f in raw {
-            if !f["url"].is_string() { continue; }
+            if !f["url"].is_string() {
+                continue;
+            }
             let format_id = f["format_id"].as_str().unwrap_or("");
-            if f["ext"] == "mhtml" || f["format_note"] == "storyboard" || format_id.starts_with("sb") {
+            if f["ext"] == "mhtml" || f["format_note"] == "storyboard" || format_id.starts_with("sb")
+            {
                 continue;
             }
             let has_video = f["vcodec"].as_str().map(|c| c != "none").unwrap_or(false);
             let has_audio = f["acodec"].as_str().map(|c| c != "none").unwrap_or(false);
-            if !has_video && !has_audio { continue; }
+            if !has_video && !has_audio {
+                continue;
+            }
 
+            let av_tag = if has_video && has_audio {
+                "video+audio"
+            } else if has_video {
+                "video only"
+            } else {
+                "audio only"
+            };
             let resolution = f["resolution"].as_str().unwrap_or("");
-            let filesize = f["filesize"].as_u64().or_else(|| f["filesize_approx"].as_u64());
+            let filesize = f["filesize"]
+                .as_u64()
+                .or_else(|| f["filesize_approx"].as_u64());
             let ext = f["ext"].as_str().unwrap_or("mp4");
+            let size_str = filesize
+                .map(|s| format!(" · {}", crate::util::format_bytes(s)))
+                .unwrap_or_default();
+            let label = format!("{safe_title} — {} {}{}", resolution, av_tag, size_str);
 
-            let av_tag = if has_video && has_audio { "video+audio" }
-                else if has_video { "video only" }
-                else { "audio only" };
-            let size_str = filesize.map(|s| format!(" · {}", crate::util::format_bytes(s))).unwrap_or_default();
-            let label = format!("{} {}", resolution, av_tag);
-            let label = format!("{} — {}{}", safe_title, label.trim(), size_str);
-
-            let kind = if f["protocol"].as_str().map(|p| p.contains("m3u8") || p.contains("dash")).unwrap_or(false) {
+            let kind = if f["protocol"]
+                .as_str()
+                .map(|p| p.contains("m3u8") || p.contains("dash"))
+                .unwrap_or(false)
+            {
                 "manifest"
             } else {
                 "progressive"
@@ -300,16 +587,14 @@ fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, 
         }
     }
 
-    // Sort by filesize descending
     formats.sort_by(|a, b| b.filesize.unwrap_or(0).cmp(&a.filesize.unwrap_or(0)));
-
     Ok(formats)
 }
 
 #[allow(dead_code)]
 fn parse_playlist(output: &str) -> Result<Vec<PlaylistEntry>, String> {
     let info: serde_json::Value = serde_json::from_str(output)
-        .map_err(|e| format!("Failed to parse playlist JSON: {}", e))?;
+        .map_err(|e| format!("Failed to parse playlist JSON: {e}"))?;
 
     if info["_type"] != "playlist" {
         return Err("Not a playlist".to_string());
@@ -319,11 +604,13 @@ fn parse_playlist(output: &str) -> Result<Vec<PlaylistEntry>, String> {
     let mut out = Vec::new();
 
     for (i, entry) in entries.iter().enumerate() {
-        let entry_url: Option<String> = entry["url"].as_str().map(|s| s.to_string())
+        let entry_url: Option<String> = entry["url"]
+            .as_str()
+            .map(|s| s.to_string())
             .or_else(|| entry["webpage_url"].as_str().map(|s| s.to_string()))
             .or_else(|| {
                 entry["id"].as_str().map(|id| {
-                    format!("https://www.youtube.com/watch?v={}", id)
+                    format!("https://www.youtube.com/watch?v={id}")
                 })
             });
 
@@ -332,7 +619,12 @@ fn parse_playlist(output: &str) -> Result<Vec<PlaylistEntry>, String> {
                 out.push(PlaylistEntry {
                     url,
                     title: entry["title"].as_str().map(|s| s.to_string()),
-                    index: Some(entry["playlist_index"].as_u64().map(|i| i as usize).unwrap_or(i + 1)),
+                    index: Some(
+                        entry["playlist_index"]
+                            .as_u64()
+                            .map(|i| i as usize)
+                            .unwrap_or(i + 1),
+                    ),
                 });
             }
         }
@@ -340,5 +632,3 @@ fn parse_playlist(output: &str) -> Result<Vec<PlaylistEntry>, String> {
 
     Ok(out)
 }
-
-

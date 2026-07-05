@@ -293,46 +293,61 @@ async fn handle_message(
         }
 
         "LIST_FORMATS" => {
-            let url = data["payload"]["url"].as_str().unwrap_or("");
+            let url = data["payload"]["url"].as_str().unwrap_or("").to_string();
             let force = data["payload"]["force"].as_bool().unwrap_or(false);
-            let request_id = data["requestId"].as_str().unwrap_or("");
+            let request_id = data["requestId"].as_str().unwrap_or("").to_string();
+            let app = state.app.clone();
+            let tx = tx.clone();
 
-            match download::list_formats_for_url(&state.app, url, force).await {
-                Ok(formats) => {
-                    let formats_json: Vec<serde_json::Value> = formats
-                        .iter()
-                        .map(|f| {
+            // Do not block the WebSocket read loop — prefetches and user clicks share one connection.
+            tokio::spawn(async move {
+                match download::list_formats_for_url(&app, &url, force).await {
+                    Ok(formats) if formats.is_empty() => {
+                        let _ = tx.send(
                             serde_json::json!({
-                                "id": f.id,
-                                "label": f.label,
-                                "url": f.url,
-                                "ext": f.ext,
-                                "filesize": f.filesize,
-                                "source": f.source,
-                                "kind": f.kind,
+                                "type": "FORMATS_ERROR",
+                                "requestId": request_id,
+                                "error": "No formats found for this URL.",
                             })
-                        })
-                        .collect();
-                    let _ = tx.send(
-                        serde_json::json!({
-                            "type": "FORMATS_LIST",
-                            "requestId": request_id,
-                            "formats": formats_json,
-                        })
-                        .to_string(),
-                    );
+                            .to_string(),
+                        );
+                    }
+                    Ok(formats) => {
+                        let formats_json: Vec<serde_json::Value> = formats
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "id": f.id,
+                                    "label": f.label,
+                                    "url": f.url,
+                                    "ext": f.ext,
+                                    "filesize": f.filesize,
+                                    "source": f.source,
+                                    "kind": f.kind,
+                                })
+                            })
+                            .collect();
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "FORMATS_LIST",
+                                "requestId": request_id,
+                                "formats": formats_json,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "FORMATS_ERROR",
+                                "requestId": request_id,
+                                "error": e,
+                            })
+                            .to_string(),
+                        );
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(
-                        serde_json::json!({
-                            "type": "FORMATS_ERROR",
-                            "requestId": request_id,
-                            "error": e,
-                        })
-                        .to_string(),
-                    );
-                }
-            }
+            });
         }
 
         "NEW_DOWNLOAD" => {
