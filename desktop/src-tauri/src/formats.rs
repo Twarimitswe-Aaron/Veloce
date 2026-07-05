@@ -127,6 +127,9 @@ pub fn is_direct_file_url(url: &str) -> bool {
     // Strip query string before checking extension
     let without_query = lower.split('?').next().unwrap_or(&lower);
     let without_fragment = without_query.split('#').next().unwrap_or(without_query);
+    if without_fragment.contains("github.com") && without_fragment.contains("/blob/") {
+        return false;
+    }
     direct_exts.iter().any(|ext| without_fragment.ends_with(ext))
 }
 
@@ -161,6 +164,62 @@ pub fn github_blob_to_raw(url: &str) -> Option<String> {
 
 pub fn resolve_list_url(url: &str) -> String {
     github_blob_to_raw(url).unwrap_or_else(|| url.to_string())
+}
+
+/// True when the URL should go through yt-dlp (video/social platforms).
+pub fn is_extractor_domain(url: &str) -> bool {
+    matches!(
+        detect_source(url),
+        MediaSource::YouTube
+            | MediaSource::Instagram
+            | MediaSource::TikTok
+            | MediaSource::Twitter
+            | MediaSource::MediaFire
+    )
+}
+
+/// Instagram reel and /p/ URLs share the same shortcode — try both if one fails.
+pub fn instagram_url_variants(url: &str) -> Vec<String> {
+    if !url.to_lowercase().contains("instagram.com") {
+        return vec![normalize_url(url)];
+    }
+
+    let mut variants = std::collections::HashSet::new();
+    variants.insert(normalize_url(url));
+
+    if let Some(caps) = regex::Regex::new(r"(?i)instagram\.com/(reel|p|tv)/([^/?#]+)")
+        .ok()
+        .and_then(|re| re.captures(url))
+    {
+        let kind = caps.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
+        let code = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if !code.is_empty() {
+            variants.insert(format!("https://www.instagram.com/p/{code}"));
+            variants.insert(format!("https://www.instagram.com/reel/{code}"));
+            if kind == "tv" {
+                variants.insert(format!("https://www.instagram.com/tv/{code}"));
+            }
+        }
+    }
+
+    if let Some(caps) = regex::Regex::new(r"(?i)instagram\.com/stories/([^/?#]+)(?:/(\d+))?")
+        .ok()
+        .and_then(|re| re.captures(url))
+    {
+        let user = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if let Some(story_id) = caps.get(2).map(|m| m.as_str()) {
+            variants.insert(format!("https://www.instagram.com/stories/{user}/{story_id}"));
+        }
+        variants.insert(format!("https://www.instagram.com/stories/{user}"));
+    }
+
+    variants.into_iter().collect()
+}
+
+/// HLS/DASH manifest URLs need special handling in the download engine.
+pub fn is_manifest_format_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains(".m3u8") || lower.contains(".mpd")
 }
 
 /// Normalize a URL for consistent caching.
@@ -297,7 +356,8 @@ fn extract_mediafire_size(html: &str) -> Option<u64> {
     let patterns = ["class=\"file_size\"", "class=\"details\"", "\"size\""];
     for pattern in &patterns {
         if let Some(start) = html.find(pattern) {
-            let section = &html[start..start + 200];
+            let end = (start + 200).min(html.len());
+            let section = &html[start..end];
             // Find numbers followed by KB/MB/GB
             for line in section.lines() {
                 if let Some(size) = parse_size_string(line) {
@@ -466,6 +526,121 @@ mod tests {
             normalize_url("https://example.com/page/"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn test_normalize_url_instagram_reel_strips_query() {
+        assert_eq!(
+            normalize_url("https://www.instagram.com/reel/AbCd/?igsh=1"),
+            "https://www.instagram.com/reel/AbCd"
+        );
+    }
+
+    #[test]
+    fn test_normalize_url_instagram_story() {
+        assert_eq!(
+            normalize_url("https://www.instagram.com/stories/li_estas_leul/345678901234/?utm=x"),
+            "https://www.instagram.com/stories/li_estas_leul/345678901234"
+        );
+        assert_eq!(
+            normalize_url("https://www.instagram.com/stories/user/"),
+            "https://www.instagram.com/stories/user"
+        );
+    }
+
+    #[test]
+    fn test_instagram_url_variants_reel_and_post() {
+        let variants = instagram_url_variants("https://www.instagram.com/reel/AbCd123/?igsh=x");
+        assert!(variants.contains(&"https://www.instagram.com/reel/AbCd123".to_string()));
+        assert!(variants.contains(&"https://www.instagram.com/p/AbCd123".to_string()));
+    }
+
+    #[test]
+    fn test_instagram_url_variants_story() {
+        let variants =
+            instagram_url_variants("https://www.instagram.com/stories/someuser/999/?x=1");
+        assert!(variants.contains(&"https://www.instagram.com/stories/someuser/999".to_string()));
+        assert!(variants.contains(&"https://www.instagram.com/stories/someuser".to_string()));
+    }
+
+    #[test]
+    fn test_is_extractor_domain() {
+        assert!(is_extractor_domain("https://www.youtube.com/watch?v=x"));
+        assert!(is_extractor_domain("https://youtu.be/x"));
+        assert!(is_extractor_domain("https://www.instagram.com/reel/x"));
+        assert!(is_extractor_domain("https://www.mediafire.com/file/x/y"));
+        assert!(!is_extractor_domain("https://example.com/a.mp4"));
+        assert!(!is_extractor_domain("bad url"));
+    }
+
+    #[test]
+    fn test_is_manifest_format_url() {
+        assert!(is_manifest_format_url("https://cdn.example.com/stream.m3u8?sig=1"));
+        assert!(is_manifest_format_url("https://cdn.example.com/manifest.mpd"));
+        assert!(!is_manifest_format_url(
+            "https://googlevideo.com/videoplayback?id=1&itag=22"
+        ));
+    }
+
+    #[test]
+    fn test_github_blob_to_raw() {
+        assert_eq!(
+            github_blob_to_raw("https://github.com/o/r/blob/main/file.xml"),
+            Some("https://raw.githubusercontent.com/o/r/main/file.xml".to_string())
+        );
+        assert_eq!(
+            github_blob_to_raw("https://raw.githubusercontent.com/o/r/main/file.xml"),
+            Some("https://raw.githubusercontent.com/o/r/main/file.xml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_list_url_github() {
+        assert_eq!(
+            resolve_list_url("https://github.com/o/r/blob/main/readme.md"),
+            "https://raw.githubusercontent.com/o/r/main/readme.md"
+        );
+    }
+
+    #[test]
+    fn test_parse_size_string() {
+        assert_eq!(parse_size_string("102.4 MB"), Some(107_374_182));
+        assert_eq!(parse_size_string("512 KB"), Some(524_288));
+        assert_eq!(parse_size_string("no size"), None);
+    }
+
+    #[test]
+    fn test_extract_mediafire_download_url() {
+        let html = r#"<a class="download_link" href="https://download2393.mediafire.com/abc/key/file.zip">Download</a>"#;
+        assert_eq!(
+            extract_mediafire_download_url(html),
+            Some("https://download2393.mediafire.com/abc/key/file.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mediafire_size() {
+        let html = r#"<span class="file_size">12.5 MB</span>"#;
+        assert_eq!(extract_mediafire_size(html), Some(13_107_200));
+    }
+
+    #[test]
+    fn test_detect_source_github() {
+        assert_eq!(
+            detect_source("https://github.com/o/r/blob/main/file.xml"),
+            MediaSource::GitHub
+        );
+        assert_eq!(
+            detect_source("https://raw.githubusercontent.com/o/r/main/file.xml"),
+            MediaSource::GitHub
+        );
+    }
+
+    #[test]
+    fn test_is_direct_file_url_rejects_github_blob_pages() {
+        assert!(!is_direct_file_url(
+            "https://github.com/o/r/blob/main/file.xml"
+        ));
     }
 
     // ── FormatCache ─────────────────────────────────────────────────────

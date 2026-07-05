@@ -508,3 +508,139 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::Database;
+    use crate::scheduler::Scheduler;
+    use crate::ws::WsClients;
+
+    fn test_state() -> Arc<AppState> {
+        let db = Database::open_in_memory().expect("db");
+        let ws = Arc::new(WsClients::new());
+        let handle = tokio::runtime::Handle::current();
+        Arc::new(AppState::new(
+            db,
+            Scheduler::new(Config::from_env()),
+            ws,
+            handle,
+        ))
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_url() {
+        let state = test_state();
+        let err = list_formats_for_url(&state, "", false).await.unwrap_err();
+        assert!(err.contains("No URL"));
+    }
+
+    #[tokio::test]
+    async fn rejects_blob_urls() {
+        let state = test_state();
+        let err = list_formats_for_url(&state, "blob:https://x", false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Browser-only blob URL"));
+    }
+
+    #[tokio::test]
+    async fn rejects_private_hosts_when_blocked() {
+        let state = test_state();
+        let err = list_formats_for_url(&state, "http://127.0.0.1/secret.mp4", false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Blocked"));
+    }
+
+    #[tokio::test]
+    async fn direct_file_url_returns_single_format_without_ytdlp() {
+        let state = test_state();
+        let formats = list_formats_for_url(
+            &state,
+            "https://cdn.example.com/video.mp4",
+            false,
+        )
+        .await
+        .expect("direct formats");
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].id, "0");
+        assert!(formats[0].label.contains("Direct"));
+        assert_eq!(formats[0].url, "https://cdn.example.com/video.mp4");
+        assert_eq!(formats[0].source.as_deref(), Some("direct"));
+    }
+
+    #[tokio::test]
+    async fn github_blob_url_resolves_to_raw() {
+        let state = test_state();
+        let formats = list_formats_for_url(
+            &state,
+            "https://github.com/o/r/blob/main/readme.md",
+            false,
+        )
+        .await
+        .expect("github formats");
+        assert_eq!(
+            formats[0].url,
+            "https://raw.githubusercontent.com/o/r/main/readme.md"
+        );
+        assert_eq!(formats[0].source.as_deref(), Some("github"));
+    }
+
+    #[tokio::test]
+    async fn format_cache_hit_skips_second_lookup() {
+        let state = test_state();
+        let url = "https://cdn.example.com/cached-file.zip";
+        let first = list_formats_for_url(&state, url, false)
+            .await
+            .expect("first");
+        let second = list_formats_for_url(&state, url, false)
+            .await
+            .expect("cached");
+        assert_eq!(first[0].url, second[0].url);
+    }
+
+    #[tokio::test]
+    async fn force_still_validates_url() {
+        let state = test_state();
+        let err = list_formats_for_url(&state, "", true).await.unwrap_err();
+        assert!(err.contains("No URL"));
+    }
+
+    #[tokio::test]
+    async fn resolve_download_url_uses_direct_when_provided() {
+        let state = test_state();
+        let url = resolve_download_url(
+            &state,
+            "https://www.youtube.com/watch?v=x",
+            Some("https://cdn.example.com/direct.mp4"),
+        )
+        .expect("direct");
+        assert_eq!(url, "https://cdn.example.com/direct.mp4");
+    }
+
+    #[tokio::test]
+    async fn resolve_download_url_uses_page_for_direct_file() {
+        let state = test_state();
+        let url = resolve_download_url(
+            &state,
+            "https://cdn.example.com/file.mp4",
+            None,
+        )
+        .expect("page direct");
+        assert_eq!(url, "https://cdn.example.com/file.mp4");
+    }
+
+    #[tokio::test]
+    async fn resolve_download_url_blocks_unsafe_direct() {
+        let state = test_state();
+        let err = resolve_download_url(
+            &state,
+            "https://example.com/x",
+            Some("http://127.0.0.1/internal"),
+        )
+        .unwrap_err();
+        assert!(err.contains("Blocked"));
+    }
+}

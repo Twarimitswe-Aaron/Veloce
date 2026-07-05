@@ -1,0 +1,41 @@
+{
+  "id": "abc123",
+  "title": "Song",
+  "formats": [
+    {
+      "format_id": "sb0",
+      "format_note": "storyboard",
+      "ext": "mhtml",
+      "url": "https://i.ytimg.com/sb/storyboard.jpg",
+      "vcodec": "none",
+      "acodec": "none"
+    },
+    {
+      "format_id": "137",
+      "ext": "webm",
+      "url": "https://v.example/137.webm",
+      "vcodec": "vp9",
+      "acodec": "none",
+      "resolution": "1920x1080",
+      "filesize": 209715200
+    },
+    {
+      "format_id": "18",
+      "ext": "mp4",
+      "url": "https://v.example/18.mp4",
+      "vcodec": "avc1",
+      "acodec": "mp4a",
+      "resolution": "640x360",
+      "filesize": 11534336
+    },
+    {
+      "format_id": "140",
+      "ext": "m4a",
+      "url": "https://v.example/140.m4a",
+      "vcodec": "none",
+      "acodec": "mp4a",
+      "resolution": "audio only",
+      "filesize": 3000000
+    }
+  ]
+}

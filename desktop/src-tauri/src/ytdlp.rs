@@ -345,10 +345,7 @@ fn race_formats(url: &str, attempts: Vec<YtAttempt>, force: bool) -> (Vec<MediaF
 pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
     let mut combined: Vec<MediaFormat> = formats
         .into_iter()
-        .filter(|f| {
-            f.label.contains("video+audio")
-                || (f.label.contains("audio") && !f.label.contains("video only"))
-        })
+        .filter(|f| f.label.contains("video+audio"))
         .collect();
 
     combined.sort_by(|a, b| {
@@ -631,4 +628,165 @@ fn parse_playlist(output: &str) -> Result<Vec<PlaylistEntry>, String> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const YOUTUBE_MULTI: &str = include_str!("../tests/fixtures/youtube_multi_format.json");
+    const INSTAGRAM_DIRECT: &str = include_str!("../tests/fixtures/instagram_direct.json");
+    const YOUTUBE_PLAYLIST: &str = include_str!("../tests/fixtures/youtube_playlist.json");
+
+    #[test]
+    fn parse_youtube_formats_filters_storyboard_and_video_only_labels() {
+        let formats = parse_formats(YOUTUBE_MULTI, "https://www.youtube.com/watch?v=abc").unwrap();
+        let ids: Vec<_> = formats.iter().map(|f| f.id.as_str()).collect();
+        assert!(!ids.contains(&"sb0"));
+        assert!(ids.contains(&"137"));
+        assert!(ids.contains(&"18"));
+        assert!(ids.contains(&"140"));
+        assert!(formats.iter().any(|f| f.label.contains("video only")));
+        assert!(formats.iter().any(|f| f.label.contains("video+audio")));
+    }
+
+    #[test]
+    fn parse_youtube_marks_dash_as_manifest() {
+        let json = r#"{
+            "title": "Clip",
+            "formats": [{
+                "format_id": "96",
+                "url": "https://example.com/dash.mpd",
+                "ext": "mp4",
+                "protocol": "http_dash_segments",
+                "vcodec": "avc1",
+                "acodec": "mp4a",
+                "resolution": "1920x1080"
+            }]
+        }"#;
+        let formats = parse_formats(json, "https://youtube.com/watch?v=x").unwrap();
+        assert_eq!(formats[0].kind.as_deref(), Some("manifest"));
+    }
+
+    #[test]
+    fn parse_instagram_direct_single_url() {
+        let formats =
+            parse_formats(INSTAGRAM_DIRECT, "https://www.instagram.com/reel/AbCd/").unwrap();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].ext, ".mp4");
+        assert!(formats[0].url.starts_with("https://"));
+        assert!(formats[0].label.contains("Reel"));
+        assert_eq!(formats[0].filesize, Some(5_000_000));
+    }
+
+    #[test]
+    fn parse_formats_rejects_invalid_json() {
+        assert!(parse_formats("{not json", "https://example.com").is_err());
+    }
+
+    #[test]
+    fn finalize_youtube_picker_adds_best_and_hides_video_only() {
+        let raw = vec![
+            MediaFormat {
+                id: "137".into(),
+                label: "Song — 1920x1080 video only webm · 200 MB".into(),
+                url: "https://v.example/v".into(),
+                ext: ".webm".into(),
+                filesize: Some(200_000_000),
+                source: None,
+                kind: Some("progressive".into()),
+            },
+            MediaFormat {
+                id: "18".into(),
+                label: "Song — 640x360 video+audio mp4 · 11 MB".into(),
+                url: "https://v.example/p".into(),
+                ext: ".mp4".into(),
+                filesize: Some(11_000_000),
+                source: None,
+                kind: Some("progressive".into()),
+            },
+            MediaFormat {
+                id: "140".into(),
+                label: "Song — audio only m4a".into(),
+                url: "https://v.example/a".into(),
+                ext: ".m4a".into(),
+                filesize: None,
+                source: None,
+                kind: Some("progressive".into()),
+            },
+        ];
+        let out = finalize_youtube_picker(raw);
+        assert_eq!(out[0].id, "best");
+        assert!(out.iter().any(|f| f.id == "18"));
+        assert!(!out.iter().any(|f| f.id == "137"));
+        assert!(!out.iter().any(|f| f.id == "140"));
+        assert_eq!(out[0].source.as_deref(), Some("youtube"));
+    }
+
+    #[test]
+    fn parse_height_from_resolution_and_p_label() {
+        assert_eq!(parse_height("1920x1080 video+audio"), 1080);
+        assert_eq!(parse_height("720p mp4"), 720);
+        assert_eq!(parse_height("audio only"), 0);
+    }
+
+    #[test]
+    fn parse_stderr_error_prefers_youtube_messages() {
+        let stderr = "WARNING: foo\nERROR: [youtube] abc: Sign in to confirm you're not a bot";
+        assert!(parse_stderr_error(stderr, 1).contains("Sign in"));
+    }
+
+    #[test]
+    fn youtube_extra_args_includes_node_runtime() {
+        let args = youtube_extra_args("https://www.youtube.com/watch?v=x");
+        assert_eq!(args, vec!["--js-runtimes", "node"]);
+        assert!(youtube_extra_args("https://example.com/v.mp4").is_empty());
+    }
+
+    #[test]
+    fn build_args_includes_no_playlist_and_js_runtime_for_youtube() {
+        let attempt = YtAttempt {
+            cookie_args: vec!["--cookies-from-browser".into(), "chrome".into()],
+            extra_args: vec![],
+            timeout_secs: 18,
+            label: "test".into(),
+        };
+        let args = build_args("https://www.youtube.com/watch?v=x", &attempt);
+        assert!(args.contains(&"--no-playlist".to_string()));
+        assert!(args.contains(&"--js-runtimes".to_string()));
+        assert!(args.contains(&"node".to_string()));
+        assert!(args.contains(&"https://www.youtube.com/watch?v=x".to_string()));
+    }
+
+    #[test]
+    fn youtube_attempts_include_cookie_browsers_and_player_clients() {
+        let attempts = youtube_attempts(false);
+        assert!(attempts.len() >= 5);
+        assert!(attempts.iter().any(|a| a.label.starts_with("youtube/chrome")));
+        assert!(attempts.iter().any(|a| a.label == "youtube/no-cookies"));
+        assert!(attempts
+            .iter()
+            .any(|a| a.extra_args.iter().any(|x| x.contains("player_client"))));
+    }
+
+    #[test]
+    fn parse_playlist_entries() {
+        let entries = parse_playlist(YOUTUBE_PLAYLIST).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].url, "https://www.youtube.com/watch?v=abc111");
+        assert_eq!(entries[1].title.as_deref(), Some("Second Track"));
+    }
+
+    #[test]
+    fn parse_playlist_rejects_non_playlist() {
+        assert!(parse_playlist(r#"{"_type":"video","title":"solo"}"#).is_err());
+    }
+
+    #[test]
+    fn list_formats_applies_youtube_picker_to_fixture_json() {
+        let parsed = parse_formats(YOUTUBE_MULTI, "https://www.youtube.com/watch?v=abc").unwrap();
+        let picked = finalize_youtube_picker(parsed);
+        assert!(!picked.is_empty());
+        assert_eq!(picked[0].id, "best");
+    }
 }

@@ -1,0 +1,18 @@
+{
+  "_type": "playlist",
+  "title": "My Mix",
+  "entries": [
+    {
+      "id": "abc111",
+      "title": "First Track",
+      "webpage_url": "https://www.youtube.com/watch?v=abc111",
+      "playlist_index": 1
+    },
+    {
+      "id": "def222",
+      "title": "Second Track",
+      "url": "https://www.youtube.com/watch?v=def222",
+      "playlist_index": 2
+    }
+  ]
+}
