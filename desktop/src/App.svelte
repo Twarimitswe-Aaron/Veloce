@@ -102,6 +102,9 @@
   let maxConcurrent = 10;
   let defaultThreads = 8;
 
+  // Cached file stats per playlist (populated on completion).
+  let playlistFileStats: Record<string, { fileCount: number; totalSize: number }> = {};
+
   // ── Event listeners ───────────────────────────────────────────────────
 
   let unlistenProgress: UnlistenFn | undefined;
@@ -183,6 +186,15 @@
         downloaded: 0,
         totalBytes: 0,
       });
+      // Fetch file stats for the save directory.
+      if (p.saveDir) {
+        invoke<any>("list_playlist_files", { path: p.saveDir })
+          .then((stats) => {
+            playlistFileStats[p.playlistId] = stats;
+            playlistFileStats = playlistFileStats; // trigger reactivity
+          })
+          .catch((e) => console.error("Failed to list playlist files", e));
+      }
     });
 
     unlistenPlaylistRemoved = await listen<PlaylistRemovedEvent>("playlist-removed", (event) => {
@@ -549,7 +561,12 @@
             <div class="download-item playlist-item">
               <div class="dl-header">
                 <span class="dl-name" title={pl.fileName}>{pl.fileName}</span>
-                <span class="dl-status">{pl.status}</span>
+                <span class="dl-status">
+                  {#if pl.fileName.includes("- Retry")}
+                    <span class="pl-retry-badge">retry</span>
+                  {/if}
+                  {pl.status}
+                </span>
               </div>
               <div class="pl-tracks">
                 <span class="pl-track-progress">
@@ -603,8 +620,15 @@
                 {/if}
               {/if}
               {#if pl.status === "completed" && pl.saveDir}
+                {@const stats = playlistFileStats[pl.playlistId]}
                 <div class="pl-save-dir">
-                  <span class="pl-save-dir-path" title={pl.saveDir}>{pl.saveDir}</span>
+                  {#if stats}
+                    <span class="pl-save-dir-summary">
+                      {stats.fileCount} file{stats.fileCount !== 1 ? "s" : ""} · {formatBytes(stats.totalSize)}
+                    </span>
+                  {:else}
+                    <span class="pl-save-dir-summary">Scanning files…</span>
+                  {/if}
                   <button class="btn-open" onclick={() => open(pl.saveDir)}>Open folder</button>
                 </div>
               {/if}
@@ -1086,10 +1110,10 @@
     border-radius: 3px;
   }
 
-  .pl-save-dir-path {
+  .pl-save-dir-summary {
     flex: 1;
-    font-size: 10px;
-    font-family: monospace;
+    font-size: 11px;
+    font-weight: 500;
     color: var(--veloce-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1205,6 +1229,21 @@
 
   .pl-track-progress-detail .dl-meta {
     margin-bottom: 0;
+  }
+
+  .pl-retry-badge {
+    display: inline-block;
+    font-size: 8px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 1px 4px;
+    margin-right: 4px;
+    border-radius: 3px;
+    background: rgba(255, 200, 0, 0.15);
+    color: #ffc800;
+    border: 1px solid rgba(255, 200, 0, 0.3);
+    vertical-align: middle;
   }
 
   /* ── Settings ───────────────────────────────────────── */

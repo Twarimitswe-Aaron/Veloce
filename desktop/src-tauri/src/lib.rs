@@ -149,6 +149,33 @@ async fn retry_failed_playlist(
 }
 
 #[tauri::command]
+async fn list_playlist_files(path: String) -> Result<serde_json::Value, String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err("Directory not found".to_string());
+    }
+
+    let mut file_count: i64 = 0;
+    let mut total_size: i64 = 0;
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    file_count += 1;
+                    total_size += metadata.len() as i64;
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "fileCount": file_count,
+        "totalSize": total_size,
+    }))
+}
+
+#[tauri::command]
 async fn get_config() -> Result<serde_json::Value, String> {
     let config = config::Config::from_env();
     Ok(serde_json::json!({
@@ -213,6 +240,7 @@ pub fn run() {
             resume_download,
             dismiss_playlist,
             retry_failed_playlist,
+            list_playlist_files,
             get_statuses,
             get_history,
             get_settings,
