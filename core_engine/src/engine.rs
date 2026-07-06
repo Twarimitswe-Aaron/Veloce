@@ -246,7 +246,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     .unwrap()
     .progress_chars("█▇▆▅▄▃▂▁░");
     let conn_style = ProgressStyle::with_template(
-        " C{prefix:>2} [{bar:16.green/black}] {percent:>3}% {bytes:>8}/{total_bytes}",
+        " C{prefix:>2} [{bar:16.green/black}] {percent:>3}% {bytes:>8}/{total_bytes} {msg}",
     )
     .unwrap()
     .progress_chars("█░░");
@@ -331,6 +331,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 let (start, end) = pieces[idx];
                 let piece_len = end - start + 1;
                 let bar = &conn_bars[w];
+                bar.set_message(""); // clear timing from previous piece
                 let expect_partial = piece_len < total_size;
 
                 let res = download_piece(
@@ -506,12 +507,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     eprintln!("");
     eprintln!("━━━ [5/5] Complete ─────────────────────────────── +{:.1}s", elapsed);
 
-    // Chunk summary table
-    eprintln!("   ┌──── Chunk Download Summary ───────────────────────────────────────────────────┐");
-    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>8} │ {:>8} │",
-        "Chunk", "Range", "Bytes", "Downloaded", "Time", "Speed");
-    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>10}┼{:─>10}┤",
-        "─", "─", "─", "─", "─", "─");
+    // Chunk summary table with timing breakdown
+    eprintln!("   ┌──── Chunk Download Summary ─────────────────────────────────────────────────────────────────────────────┐");
+    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>6} │ {:>6} │ {:>8} │",
+        "Chunk", "Range", "Bytes", "Downloaded", "TTFB", "Xfer", "Speed");
+    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>8}┼{:─>8}┼{:─>10}┤",
+        "─", "─", "─", "─", "─", "─", "─");
 
     let mut total_dl_bytes: u64 = 0;
     for m in &sorted_metrics {
@@ -521,32 +522,34 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let size_s = format_bytes(m.size());
         let dl_s = format_bytes(m.bytes_downloaded);
         total_dl_bytes += m.bytes_downloaded;
-        eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.1}s │ {:>5.1} MB/s│",
+        eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.2}s │ {:>5.2}s │ {:>5.1} MB/s│",
             m.piece_idx,
             range,
             size_s,
             dl_s,
-            m.duration_secs,
+            m.ttfb_secs,
+            m.transfer_secs,
             m.speed_mbps()
         );
     }
 
-    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>10}┼{:─>10}┤",
-        "─", "─", "─", "─", "─", "─");
+    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>8}┼{:─>8}┼{:─>10}┤",
+        "─", "─", "─", "─", "─", "─", "─");
 
     let total_speed_mbps = if avg_mbps > 0.0 { avg_mbps } else {
         total_dl_bytes as f64 / 1_048_576.0 / elapsed.max(0.001)
     };
-    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.1}s │ {:>5.1} MB/s│",
+    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>6} │ {:>5.2}s │ {:>5.1} MB/s│",
         "Σ",
         format!("0–{:.1} MB", total_size as f64 / 1_048_576.0),
         format_bytes(total_size),
         format_bytes(total_dl_bytes),
+        "—",
         elapsed,
         total_speed_mbps
     );
-    eprintln!("   └{:─>7}┴{:─>20}┴{:─>11}┴{:─>12}┴{:─>10}┴{:─>10}┘",
-        "─", "─", "─", "─", "─", "─");
+    eprintln!("   └{:─>7}┴{:─>20}┴{:─>11}┴{:─>12}┴{:─>8}┴{:─>8}┴{:─>10}┘",
+        "─", "─", "─", "─", "─", "─", "─");
 
     eprintln!("   📦 Downloaded: {} / {} bytes", final_dl, total_size);
     eprintln!("   ⚡ Avg speed:  {:.1} MB/s", avg_mbps);

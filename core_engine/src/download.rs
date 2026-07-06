@@ -26,18 +26,24 @@ pub struct PieceMetrics {
     pub end_byte: u64,
     pub bytes_downloaded: u64,
     pub duration_secs: f64,
+    /// Time from request start to first body byte (includes any DNS, TCP, TLS, and server processing).
+    pub ttfb_secs: f64,
+    /// Time from first body byte to last body byte (actual data transfer).
+    pub transfer_secs: f64,
 }
 
 impl PieceMetrics {
     pub fn size(&self) -> u64 {
         self.end_byte - self.start_byte + 1
     }
+    /// Transfer speed based on actual data transfer time (excluding TTFB overhead).
     pub fn speed_mbps(&self) -> f64 {
-        if self.duration_secs > 0.0 {
-            self.bytes_downloaded as f64 / 1_048_576.0 / self.duration_secs
+        let t = if self.transfer_secs > 0.001 {
+            self.transfer_secs
         } else {
-            0.0
-        }
+            self.duration_secs.max(0.001)
+        };
+        self.bytes_downloaded as f64 / 1_048_576.0 / t
     }
 }
 
@@ -74,7 +80,6 @@ pub async fn download_piece(
     bar.set_length(piece_len);
     bar.set_position(0);
 
-    let piece_start = Instant::now();
     let range_str = format!("bytes={}-{}", start, end);
     eprintln!("   🧩 Piece [{:.1} MB - {:.1} MB] ({:.1} MB)",
         start as f64 / 1_048_576.0,
@@ -82,6 +87,7 @@ pub async fn download_piece(
         piece_len as f64 / 1_048_576.0
     );
 
+    let t_req = Instant::now();
     let res = client
         .get(url)
         .header(RANGE, &range_str)
@@ -110,6 +116,7 @@ pub async fn download_piece(
     }
 
     let mut stream = res.bytes_stream();
+    let mut t_first_byte: Option<Instant> = None;
     let mut file_offset = start;
     let mut buf: Vec<u8> = Vec::with_capacity(read_buffer_bytes);
     let mut piece_done: u64 = 0;
@@ -123,6 +130,7 @@ pub async fn download_piece(
             Ok(None) => break,
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(bytes))) => {
+                let _ = t_first_byte.get_or_insert_with(Instant::now);
                 let n = bytes.len();
                 limiter.acquire(n as u64).await;
                 buf.extend_from_slice(&bytes);
@@ -180,15 +188,26 @@ pub async fn download_piece(
         engine.flush()?;
     }
 
-    let duration = piece_start.elapsed();
+    let t_done = Instant::now();
+    let duration_secs = (t_done - t_req).as_secs_f64();
+    let ttfb_secs = t_first_byte
+        .map(|t| (t - t_req).as_secs_f64())
+        .unwrap_or(duration_secs);
+    let transfer_secs = duration_secs - ttfb_secs;
+
     let bytes_dl = piece_done;
-    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — {:3.1}s — {:5.1} MB/s",
+    let xfer_speed = bytes_dl as f64 / 1_048_576.0 / transfer_secs.max(0.001);
+    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — TTFB {:5.2}s — Xfer {:5.2}s — {:5.1} MB/s",
         start as f64 / 1_048_576.0,
         end as f64 / 1_048_576.0,
         format_bytes(piece_len),
-        duration.as_secs_f64(),
-        bytes_dl as f64 / 1_048_576.0 / duration.as_secs_f64().max(0.001)
+        ttfb_secs,
+        transfer_secs,
+        xfer_speed
     );
+
+    // Update the connection bar with timing info for live overlay
+    bar.set_message(format!("#{} T{:.2}s+X{:.2}s", piece_idx, ttfb_secs, transfer_secs));
 
     if let Some(q) = metrics {
         q.push(PieceMetrics {
@@ -197,7 +216,9 @@ pub async fn download_piece(
             start_byte: start,
             end_byte: end,
             bytes_downloaded: bytes_dl,
-            duration_secs: duration.as_secs_f64(),
+            duration_secs,
+            ttfb_secs,
+            transfer_secs,
         });
     }
 
