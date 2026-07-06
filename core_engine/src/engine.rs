@@ -94,6 +94,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         t_discover.as_secs(), t_discover.subsec_millis() / 10
     );
 
+    let ranges_ok = thread_ceiling > 1
+        && match discovery.ranges_hint {
+            Some(v) => v,
+            None => supports_ranges(&client, &args.url).await,
+        };
+
     let piece_size: u64;
     let completed_init: Vec<bool>;
     let output: SharedOutput;
@@ -120,11 +126,6 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         }
         let _ = std::fs::remove_file(state_path);
 
-        let ranges_ok = thread_ceiling > 1
-            && match discovery.ranges_hint {
-                Some(v) => v,
-                None => supports_ranges(&client, &args.url).await,
-            };
         eprintln!("   📐 Range requests: {}", if ranges_ok { "supported ✓" } else { "NOT supported — single connection only" });
 
         let profile_piece = profiles.piece_bytes(&args.url);
@@ -233,6 +234,9 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     eprintln!("━━━ [4/5] Downloading ──────────────────────────── +{}.{:02}s",
         t_prep.as_secs(), t_prep.subsec_millis() / 10
     );
+    if !ranges_ok && thread_ceiling > 1 {
+        eprintln!("   ⚠️  Single connection — no parallel download (server does not support range requests)");
+    }
     eprintln!("   🚀 Starting {} worker(s) for {} piece(s)", effective_ceiling, num_pieces);
     eprintln!("   📊 Progress: ████████████████████████████████████ 0%");
 

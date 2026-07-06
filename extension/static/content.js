@@ -468,7 +468,14 @@
 			box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
 		}
 		.badge:hover { background: #002a55; }
-		.badge-loading { opacity: 0.7; }
+		.badge-loading {
+			opacity: 0.7;
+			animation: veloce-pulse 1.2s ease-in-out infinite;
+		}
+		@keyframes veloce-pulse {
+			0%, 100% { opacity: 0.7; box-shadow: 0 2px 8px rgba(0,0,0,0.45); }
+			50% { opacity: 1; box-shadow: 0 2px 14px rgba(0, 255, 157, 0.25); }
+		}
 		.badge-ready { opacity: 1; }
 		.badge-ready::after {
 			content: '';
@@ -1200,6 +1207,10 @@
 			if (msg.type === 'VELOCE_FORMATS_FAILED' && msg.url) {
 				interceptLog('prefetch failed (background)', { url: msg.url, prefetch: msg.prefetch });
 				prefetchStarted.delete(normalizeBadgeKey(msg.url));
+			}
+			if (msg.type === 'VELOCE_DOWNLOAD_CANCELLED') {
+				interceptLog('download cancelled', { fileName: msg.fileName });
+				showVeloceToast(`Veloce: cancelled ${msg.fileName || 'download'}`, true);
 			}
 		});
 	}

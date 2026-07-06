@@ -555,6 +555,8 @@
 
 			article.setAttribute(SCANNED_ATTR, '1');
 			for (const v of article.querySelectorAll('video')) v.setAttribute(SCANNED_ATTR, '1');
+			// Prefetch formats immediately so badge click shows formats instantly.
+			ctx.eagerPrefetch(url);
 			return url;
 		}
 
@@ -577,6 +579,7 @@
 			const placed = placeBadge(url, anchor, url, false);
 			if (!placed) return null;
 			anchor.setAttribute(SCANNED_ATTR, '1');
+			ctx.eagerPrefetch(url);
 			return url;
 		}
 
