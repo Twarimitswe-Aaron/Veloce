@@ -71,8 +71,8 @@ impl IoUringEngine {
         }
         let (pipe_rd, pipe_wr) = (pipe_fds[0], pipe_fds[1]);
 
-        // Bump pipe capacity so a full batch fits (deadlock prevention).
-        let target_cap = (entries as usize) * 256 * 1024;
+        // Bump pipe capacity. Max unprivileged size on Linux is 1048576 (1MB).
+        let target_cap = 1048576;
         unsafe { libc::fcntl(pipe_wr, libc::F_SETPIPE_SZ, target_cap as libc::c_int); }
         let pipe_capacity = match unsafe { libc::fcntl(pipe_wr, libc::F_GETPIPE_SZ) } {
             cap if cap > 0 => cap as usize,
@@ -121,23 +121,31 @@ impl IoUringEngine {
         }
 
         if self.use_splice {
-            let total: usize = self.pending.iter().map(|p| p.data.len()).sum();
-            let result = if total <= self.pipe_capacity {
-                self.flush_batch_splice()
-            } else {
-                self.flush_seq_splice()
-            };
+            let max_pw = self.pending.iter().map(|p| p.data.len()).max().unwrap_or(0);
+            
+            if max_pw <= self.pipe_capacity {
+                let total: usize = self.pending.iter().map(|p| p.data.len()).sum();
+                let result = if total <= self.pipe_capacity {
+                    self.flush_batch_splice()
+                } else {
+                    self.flush_seq_splice()
+                };
 
-            match result {
-                Ok(()) => {
-                    self.pending.clear();
-                    return Ok(());
+                match result {
+                    Ok(()) => {
+                        self.pending.clear();
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Splice failed — permanently fall back to WRITE.
+                        self.use_splice = false;
+                        let _ = self.drain_pipe();
+                    }
                 }
-                Err(_) => {
-                    // Splice failed — permanently fall back to WRITE.
-                    self.use_splice = false;
-                    let _ = self.drain_pipe();
-                }
+            } else {
+                // If a single chunk exceeds pipe capacity, splice will deadlock.
+                // We fallback to standard IORING_OP_WRITE for this batch.
+                // We do NOT disable use_splice permanently, as future batches might be smaller.
             }
         }
 
