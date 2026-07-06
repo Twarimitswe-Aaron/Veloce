@@ -237,7 +237,9 @@ pub async fn resolve_download_url(
     page_url: &str,
     direct_url: Option<&str>,
 ) -> Result<String, String> {
+    log::info!("[Step 1: Resolve URL] Page URL: {}, Direct URL: {:?}", page_url, direct_url);
     if formats::detect_source(page_url) == formats::MediaSource::MediaFire {
+        log::info!(" -> Detected MediaFire, resolving direct link via scrape...");
         let info = formats::resolve_mediafire(page_url).await?;
         return Ok(info.direct_url);
     }
@@ -261,14 +263,17 @@ pub async fn resolve_download_url(
 
     let normalized = formats::normalize_url(page_url);
     if let Some(cached) = state.best_url_cache.get(&normalized) {
+        log::info!(" -> Using cached extraction for {}", normalized);
         return Ok(cached);
     }
 
+    log::info!(" -> Running yt-dlp extraction for {}", normalized);
     let norm_clone = normalized.clone();
     let extracted = tokio::task::spawn_blocking(move || {
         ytdlp::extract_best_url(&norm_clone)
     }).await.map_err(|e| format!("yt-dlp task failed: {}", e))??;
 
+    log::info!(" -> yt-dlp extraction successful");
     state.best_url_cache.set(&normalized, &extracted);
     Ok(extracted)
 }
@@ -280,6 +285,7 @@ pub async fn enqueue_download_job(
 ) -> Result<String, String> {
     let config = Config::from_env();
     let download_id = req.download_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    log::info!("[Step 2: Enqueue Job] ID: {}, URL: {}", download_id, req.url);
     let save_dir = config.base_directory();
 
     std::fs::create_dir_all(&save_dir)
@@ -379,20 +385,26 @@ pub async fn enqueue_download_job(
     };
 
     state.scheduler.enqueue(job_state);
+    log::info!(" -> Job {} enqueued successfully. Pumping scheduler...", download_id);
     pump_scheduler(state.clone());
 
     Ok(download_id)
 }
 
 pub fn pump_scheduler(state: Arc<AppState>) {
+    let mut dequeued_count = 0;
     while let Some(job) = state.scheduler.dequeue() {
+        dequeued_count += 1;
         let state_clone = state.clone();
         tokio::spawn(async move {
             let referer = state_clone.db.get_download(&job.id).ok().flatten().and_then(|r| r.referer);
             if let Err(e) = start_engine_for_job(state_clone, job, referer).await {
-                log::error!("pump_scheduler engine spawn error: {}", e);
+                log::error!("[Step 3: Pump Scheduler] Engine spawn error: {}", e);
             }
         });
+    }
+    if dequeued_count > 0 {
+        log::info!("[Step 3: Pump Scheduler] Dequeued {} jobs", dequeued_count);
     }
 }
 
@@ -438,6 +450,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         on_progress,
     ) {
         Ok((engine, _reader)) => {
+            log::info!("[Step 4: Spawn Engine] Engine spawned for ID: {}", download_id);
             {
                 let mut engines = state.active_engines.lock().unwrap();
                 engines.insert(download_id.clone(), engine);
@@ -458,10 +471,13 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                     Some(mut eng) => {
                         let code = eng.wait();
                         if cancel_mon.load(Ordering::SeqCst) {
+                            log::info!("[Step 5: Engine Exit] {} was cancelled", id_mon);
                             ("cancelled".to_string(), None)
                         } else if code == Some(0) {
+                            log::info!("[Step 5: Engine Exit] {} completed successfully", id_mon);
                             ("completed".to_string(), None)
                         } else {
+                            log::error!("[Step 5: Engine Exit] {} failed with code {:?}", id_mon, code);
                             (
                                 "failed".to_string(),
                                 Some(format!(
@@ -472,6 +488,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                         }
                     }
                     None => {
+                        log::warn!("[Step 5: Engine Exit] Engine process lost for {}", id_mon);
                         if cancel_mon.load(Ordering::SeqCst) {
                             ("cancelled".to_string(), None)
                         } else {
