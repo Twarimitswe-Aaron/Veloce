@@ -33,6 +33,11 @@ impl AdaptiveController {
         self.current.load(Ordering::Relaxed)
     }
 
+    pub fn set_limit(&self, new_limit: usize) {
+        let limit = new_limit.clamp(1, self.ceiling);
+        self.current.store(limit, Ordering::SeqCst);
+    }
+
     pub fn try_acquire_slot(&self) -> bool {
         loop {
             let a = self.active.load(Ordering::Relaxed);

@@ -3,7 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-shell";
-  import "./app.css";
+  import "app.css";
 
   interface MediaFormat {
     id: string;
@@ -528,11 +528,9 @@
                 </span>
               </div>
               <div class="dl-meta">
-                {#if dl.speed_bps > 0}
+                {#if dl.status === "downloading"}
                   <span class="dl-speed">{formatSpeed(dl.speed_bps)}</span>
-                {/if}
-                {#if dl.eta_secs > 0}
-                  <span class="dl-eta">ETA: {formatEta(dl.eta_secs)}</span>
+                  <span class="dl-eta">ETA: {dl.eta_secs > 0 ? formatEta(dl.eta_secs) : '--'}</span>
                 {/if}
               </div>
               <div class="dl-actions">
@@ -609,11 +607,9 @@
                       </span>
                     </div>
                     <div class="dl-meta">
-                      {#if trk.speed_bps > 0}
+                      {#if trk.status === "downloading"}
                         <span class="dl-speed">{formatSpeed(trk.speed_bps)}</span>
-                      {/if}
-                      {#if trk.eta_secs > 0}
-                        <span class="dl-eta">ETA: {formatEta(trk.eta_secs)}</span>
+                        <span class="dl-eta">ETA: {trk.eta_secs > 0 ? formatEta(trk.eta_secs) : '--'}</span>
                       {/if}
                     </div>
                   </div>

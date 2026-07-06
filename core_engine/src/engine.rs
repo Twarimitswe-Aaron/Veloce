@@ -433,6 +433,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             let mut last_bytes = baseline_bytes;
             let mut last_tick = Instant::now();
             let mut last_save = Instant::now();
+            let mut smoothed_speed: f64 = 0.0;
+            
+            let mut last_tune = Instant::now();
+            let mut last_tune_speed: f64 = 0.0;
+            let mut probing_up = false;
 
             loop {
                 ticker.tick().await;
@@ -444,13 +449,63 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 current = std::cmp::min(current, total_size);
 
                 let tick_secs = last_tick.elapsed().as_secs_f64();
-                let speed_bps = (current.saturating_sub(last_bytes) as f64 / tick_secs) as u64;
+                let current_speed = (current.saturating_sub(last_bytes) as f64) / tick_secs.max(0.001);
+                
+                if smoothed_speed == 0.0 && current_speed > 0.0 {
+                    smoothed_speed = current_speed;
+                } else {
+                    // Exponential Moving Average (alpha = 0.2 for smoothing over ~2.5 seconds)
+                    smoothed_speed = (smoothed_speed * 0.8) + (current_speed * 0.2);
+                }
+                
+                // If speed drops extremely low, snap it to 0
+                if smoothed_speed < 1.0 {
+                    smoothed_speed = 0.0;
+                }
+
+                let speed_bps = smoothed_speed as u64;
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let eta_secs = if speed_bps > 0 {
                     (total_size.saturating_sub(current) as f64 / speed_bps as f64) as u64
                 } else {
                     0
                 };
+                
+                // Adaptive Tuning every 5 seconds
+                if auto_tune && last_tune.elapsed().as_secs() >= 5 {
+                    let limit = adaptive.current_limit();
+                    let ceiling = adaptive.ceiling();
+                    
+                    if probing_up {
+                        // We probed up last time. Did speed increase by at least 5%?
+                        if smoothed_speed > (last_tune_speed * 1.05) && last_tune_speed > 1024.0 {
+                            if limit < ceiling {
+                                adaptive.set_limit(limit + 1);
+                                slot_notify.notify_waiters();
+                                eprintln!("   📈 Auto-tune: Speed increased to {:.1} MB/s. Probing {} -> {} connections.", smoothed_speed / 1_048_576.0, limit, limit + 1);
+                            }
+                        } else {
+                            // No speed increase, we hit the bottleneck. Step back.
+                            if limit > 1 {
+                                adaptive.set_limit(limit - 1);
+                            }
+                            probing_up = false;
+                            eprintln!("   🛑 Auto-tune: Bandwidth ceiling reached at {:.1} MB/s. Stepping back to {} connections.", smoothed_speed / 1_048_576.0, limit.saturating_sub(1).max(1));
+                        }
+                    } else {
+                        // We weren't probing. Start a probe to see if more bandwidth freed up.
+                        if limit < ceiling {
+                            probing_up = true;
+                            adaptive.set_limit(limit + 1);
+                            slot_notify.notify_waiters();
+                            eprintln!("   🔍 Auto-tune: Probing for more bandwidth ({} -> {} connections).", limit, limit + 1);
+                        }
+                    }
+                    
+                    last_tune = Instant::now();
+                    last_tune_speed = smoothed_speed;
+                }
+
                 last_bytes = current;
                 last_tick = Instant::now();
                 header_bar.set_position(current);
