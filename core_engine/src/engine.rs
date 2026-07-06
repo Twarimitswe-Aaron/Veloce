@@ -34,21 +34,32 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         std::fs::create_dir_all(parent)?;
     }
 
+    eprintln!("");
+    eprintln!("━━━ [1/5] Initializing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
     let profiles = ProfileStore::load(args.profiles_path.as_deref().map(Path::new));
     let thread_ceiling = profiles.thread_ceiling(&args.url, args.threads) as usize;
+    eprintln!("   📋 Thread ceiling: {} (from {})", thread_ceiling, if args.profiles_path.is_some() { "host profile" } else { "args" });
 
     let client = Arc::new(build_http_client(
         thread_ceiling,
         args.referer.as_deref(),
         args.origin.as_deref(),
     )?);
+    eprintln!("   🌐 HTTP client ready (pool: {}, referer: {})",
+        thread_ceiling,
+        args.referer.as_deref().unwrap_or("none")
+    );
 
+    eprintln!("");
+    eprintln!("━━━ [2/5] Discovering file ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     let discovery = discover(&client, &args.url).await?;
     let total_size = discovery.total_size;
+    eprintln!("   ✅ Discovery complete: {} bytes ({:.1} MB)", total_size, total_size as f64 / 1_048_576.0);
 
     let sidecar = format!("{}.veloce_done", args.save_path);
     if Path::new(&sidecar).exists() {
-        eprintln!("✅ Already complete (sidecar found).");
+        eprintln!("   ✅ Already complete (sidecar found).");
         println!(
             "{}",
             json!({
@@ -74,6 +85,9 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         None
     };
 
+    eprintln!("");
+    eprintln!("━━━ [3/5] Preparing download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
     let piece_size: u64;
     let completed_init: Vec<bool>;
     let output: SharedOutput;
@@ -83,12 +97,17 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         completed_init = state.completed;
         output = SharedOutput::open_existing(path)?;
         let done = completed_init.iter().filter(|c| **c).count();
-        eprintln!("🔄 Resuming: {}/{} pieces already complete.", done, completed_init.len());
+        eprintln!("   🔄 Resume state found: {}/{} pieces already complete ({:.1}%)",
+            done, completed_init.len(),
+            (done as f64 / completed_init.len() as f64) * 100.0
+        );
+        eprintln!("   📐 Piece size: {} bytes ({:.1} MB)", piece_size, piece_size as f64 / 1_048_576.0);
     } else {
+        eprintln!("   🆕 Fresh download — no resume state found");
         if path.exists() {
             let existing = std::fs::metadata(path)?.len();
             eprintln!(
-                "⚠️  Partial file without valid state ({} / {} bytes). Restarting...",
+                "   ⚠️  Partial file without valid state: {} / {} bytes. Restarting...",
                 existing, total_size
             );
             std::fs::remove_file(path)?;
@@ -100,20 +119,23 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 Some(v) => v,
                 None => supports_ranges(&client, &args.url).await,
             };
-        if !ranges_ok {
-            eprintln!("⚠️  Server does not support range requests — using a single connection.");
-        }
+        eprintln!("   📐 Range requests: {}", if ranges_ok { "supported ✓" } else { "NOT supported — single connection only" });
 
         let profile_piece = profiles.piece_bytes(&args.url);
         piece_size = if args.piece_size_bytes > 0 {
+            eprintln!("   📐 Piece size: {} B (from args)", args.piece_size_bytes);
             args.piece_size_bytes
         } else if ranges_ok {
-            adaptive_piece_size(total_size, profile_piece)
+            let ps = adaptive_piece_size(total_size, profile_piece);
+            eprintln!("   📐 Piece size: {} B ({:.1} MB) (adaptive)", ps, ps as f64 / 1_048_576.0);
+            ps
         } else {
+            eprintln!("   📐 Piece size: {} B (entire file — no ranges)", total_size);
             total_size.max(1)
         };
 
         if let Some(avail) = available_space(path) {
+            eprintln!("   💾 Free space: {} MB", avail as f64 / 1_048_576.0);
             if avail < total_size.saturating_add(SAFETY_MARGIN) {
                 println!(
                     "{}",
@@ -132,17 +154,24 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
         output = SharedOutput::create_or_open(path, true)?;
         output.preallocate(total_size)?;
+        eprintln!("   💾 File pre-allocated: {} bytes", total_size);
         completed_init = vec![false; piece_ranges(total_size, piece_size).len()];
     }
 
     let pieces: Arc<Vec<(u64, u64)>> = Arc::new(piece_ranges(total_size, piece_size));
+    let num_pieces = pieces.len();
+    eprintln!("   🧩 Pieces:     {} total ({} bytes each)", num_pieces, piece_size);
 
     let mut effective_ceiling = std::cmp::min(thread_ceiling.max(1), pieces.len().max(1));
     let auto_tune = args.auto_tune && !args.no_auto_tune;
     if auto_tune && effective_ceiling > 1 && pieces.len() > 1 {
         let tuned = probe_optimal_threads(&client, &args.url, effective_ceiling, piece_size).await;
-        eprintln!("📊 Auto-tune selected {tuned} connections (ceiling {effective_ceiling}).");
+        eprintln!("   📊 Auto-tune selected {tuned} connections (ceiling {effective_ceiling}).");
         effective_ceiling = tuned.max(1).min(effective_ceiling);
+    } else if !auto_tune {
+        eprintln!("   ⏭  Auto-tune disabled, using {} connection(s)", effective_ceiling);
+    } else if pieces.len() <= 1 {
+        eprintln!("   ⏭  Only 1 piece, using 1 connection");
     }
 
     let adaptive = Arc::new(AdaptiveController::new(effective_ceiling));
@@ -189,6 +218,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             "auto_tune": auto_tune,
         })
     );
+
+    eprintln!("");
+    eprintln!("━━━ [4/5] Downloading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("   🚀 Starting {} worker(s) for {} piece(s)", effective_ceiling, num_pieces);
+    eprintln!("   📊 Progress: ████████████████████████████████████ 0%");
 
     let mp = Arc::new(if args.quiet {
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
@@ -444,6 +478,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let final_dl = completed_bytes.load(Ordering::SeqCst);
     let elapsed = start_time.elapsed().as_secs_f64();
     let avg_mbps = (final_dl as f64 / 1_048_576.0) / elapsed;
+
+    eprintln!("");
+    eprintln!("━━━ [5/5] Complete ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("   📦 Downloaded: {} / {} bytes", final_dl, total_size);
+    eprintln!("   ⏱  Elapsed:    {:.1}s", elapsed);
+    eprintln!("   ⚡ Avg speed:  {:.1} MB/s", avg_mbps);
 
     println!(
         "{}",

@@ -88,6 +88,8 @@ pub async fn supports_ranges(client: &Client, url: &str) -> bool {
 pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
     let _warmup_start = Instant::now();
 
+    eprintln!(" 🔍 Discovering file metadata...");
+
     if let Ok(head) = client.head(url).send().await {
         if head.status().is_success() {
             if let Some(len) = parse_content_length(head.headers()) {
@@ -98,6 +100,15 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
                     .get(ACCEPT_RANGES)
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.eq_ignore_ascii_case("bytes"));
+                eprintln!("   ✓ HEAD request succeeded");
+                eprintln!("   📦 Size:       {} bytes ({:.1} MB)", len, len as f64 / 1_048_576.0);
+                if let Some(ref e) = etag {
+                    eprintln!("   🏷️  ETag:       {}", e);
+                }
+                if let Some(ref l) = lm {
+                    eprintln!("   📅 Modified:   {}", l);
+                }
+                eprintln!("   📐 Ranges:     {}", ar.map(|v| if v { "supported" } else { "unsupported" }).unwrap_or("unknown"));
                 return Ok(Discovery {
                     total_size: len,
                     etag,
@@ -109,6 +120,8 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
         }
     }
 
+    eprintln!("   ⚠️  HEAD failed or no content-length — trying ranged GET");
+
     let res = client
         .get(url)
         .header(RANGE, "bytes=0-0")
@@ -119,8 +132,18 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
     let etag = header_string(res.headers(), ETAG);
     let lm = header_string(res.headers(), LAST_MODIFIED);
 
+    eprintln!("   ℹ️  Ranged GET response: {} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+
     if status.as_u16() == 206 {
         if let Some(total) = parse_total_from_content_range(res.headers()) {
+            eprintln!("   ✓ Server supports ranges (206 Partial Content)");
+            eprintln!("   📦 Size:       {} bytes ({:.1} MB)", total, total as f64 / 1_048_576.0);
+            if let Some(ref e) = etag {
+                eprintln!("   🏷️  ETag:       {}", e);
+            }
+            if let Some(ref l) = lm {
+                eprintln!("   📅 Modified:   {}", l);
+            }
             return Ok(Discovery {
                 total_size: total,
                 etag,
@@ -129,21 +152,35 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
                 warmed_client: client.clone(),
             });
         }
+        eprintln!("   ⚠️  206 response without Content-Range total — falling back to full GET");
     }
 
     // Some hosts (e.g. GitHub HTML) answer ranges with `bytes 0-0/*` — try a full GET.
+    eprintln!("   📥 Performing full GET to determine file size...");
     let full = client.get(url).send().await.context("discovery full GET failed")?;
     let full_status = full.status();
     let full_etag = header_string(full.headers(), ETAG).or_else(|| etag.clone());
     let full_lm = header_string(full.headers(), LAST_MODIFIED).or_else(|| lm.clone());
 
+    eprintln!("   ℹ️  Full GET response: {} {}", full_status.as_u16(), full_status.canonical_reason().unwrap_or(""));
+
     if full_status.is_success() {
         if let Some(len) = parse_content_length(full.headers()) {
+            eprintln!("   ✓ File size determined from full GET");
+            eprintln!("   📦 Size:       {} bytes ({:.1} MB)", len, len as f64 / 1_048_576.0);
+            if let Some(ref e) = full_etag {
+                eprintln!("   🏷️  ETag:       {}", e);
+            }
+            if let Some(ref l) = full_lm {
+                eprintln!("   📅 Modified:   {}", l);
+            }
+            let ranges_ok = status.as_u16() == 206;
+            eprintln!("   📐 Ranges:     {}", if ranges_ok { "supported (from earlier probe)" } else { "unsupported" });
             return Ok(Discovery {
                 total_size: len,
                 etag: full_etag,
                 last_modified: full_lm,
-                ranges_hint: Some(status.as_u16() == 206),
+                ranges_hint: Some(ranges_ok),
                 warmed_client: client.clone(),
             });
         }
@@ -151,6 +188,14 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
 
     if status.is_success() {
         if let Some(len) = parse_content_length(res.headers()) {
+            eprintln!("   ✓ File size from initial ranged GET");
+            eprintln!("   📦 Size:       {} bytes ({:.1} MB)", len, len as f64 / 1_048_576.0);
+            if let Some(ref e) = etag {
+                eprintln!("   🏷️  ETag:       {}", e);
+            }
+            if let Some(ref l) = lm {
+                eprintln!("   📅 Modified:   {}", l);
+            }
             return Ok(Discovery {
                 total_size: len,
                 etag,

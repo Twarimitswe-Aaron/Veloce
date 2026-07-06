@@ -46,9 +46,16 @@ pub async fn download_piece(
     bar.set_length(piece_len);
     bar.set_position(0);
 
+    let range_str = format!("bytes={}-{}", start, end);
+    eprintln!("   🧩 Piece [{:.1} MB - {:.1} MB] ({:.1} MB)",
+        start as f64 / 1_048_576.0,
+        end as f64 / 1_048_576.0,
+        piece_len as f64 / 1_048_576.0
+    );
+
     let res = client
         .get(url)
-        .header(RANGE, format!("bytes={}-{}", start, end))
+        .header(RANGE, &range_str)
         .send()
         .await?;
 
@@ -76,6 +83,10 @@ pub async fn download_piece(
     let mut stream = res.bytes_stream();
     let mut file_offset = start;
     let mut buf: Vec<u8> = Vec::with_capacity(read_buffer_bytes);
+    let mut piece_done: u64 = 0;
+    let next_milestone = piece_len / 4; // log at 25%, 50%, 75%
+    let mut next_milestone_at = next_milestone;
+    let mut milestone_printed = false;
 
     loop {
         match time::timeout(idle_timeout, stream.next()).await {
@@ -99,9 +110,27 @@ pub async fn download_piece(
                     buf.clear();
                 }
                 worker_partial.fetch_add(n as u64, Ordering::Relaxed);
+                piece_done += n as u64;
                 bar.inc(n as u64);
+
+                // Milestone progress — in-place update (no newline)
+                while piece_done >= next_milestone_at && next_milestone > 0 {
+                    let pct = (piece_done as f64 / piece_len as f64) * 100.0;
+                    eprint!("   \r📦 Chunk progress: {:.0}% ({:.1} MB / {:.1} MB)  ",
+                        pct,
+                        piece_done as f64 / 1_048_576.0,
+                        piece_len as f64 / 1_048_576.0
+                    );
+                    milestone_printed = true;
+                    next_milestone_at += next_milestone;
+                }
             }
         }
+    }
+
+    // Clear the in-place progress line so the "✅ Piece complete" lands cleanly.
+    if milestone_printed {
+        eprintln!("");
     }
 
     if !buf.is_empty() {
@@ -122,7 +151,23 @@ pub async fn download_piece(
         engine.flush()?;
     }
 
+    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({})",
+        start as f64 / 1_048_576.0,
+        end as f64 / 1_048_576.0,
+        format_bytes(piece_len)
+    );
+
     Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 #[cfg(test)]

@@ -24,10 +24,13 @@ pub async fn probe_optimal_threads(
     piece_size: u64,
 ) -> usize {
     let ceiling = ceiling.max(1);
+    eprintln!("   📊 Running auto-tune probe (up to {:.1}s)...", PROBE_SECONDS);
     if ceiling == 1 {
+        eprintln!("   → Ceiling is 1, using single connection");
         return 1;
     }
     if !supports_ranges(client, url).await {
+        eprintln!("   → No range support, using single connection");
         return 1;
     }
 
@@ -36,8 +39,12 @@ pub async fn probe_optimal_threads(
         .filter(|&t| t <= ceiling)
         .collect();
 
+    eprintln!("   Testing candidates: {:?} connections", candidates);
+
     if candidates.len() <= 1 {
-        return candidates.first().copied().unwrap_or(2).max(1).min(ceiling);
+        let result = candidates.first().copied().unwrap_or(2).max(1).min(ceiling);
+        eprintln!("   → Only one candidate: {} connection(s)", result);
+        return result;
     }
 
     // Spawn all probe levels concurrently so total wall time ≈ PROBE_SECONDS.
@@ -59,6 +66,11 @@ pub async fn probe_optimal_threads(
         }
     }
 
+    // Print probe results
+    for &(t, bps) in &results {
+        eprintln!("   ⏱  {} conn(s): {:.1} MB/s", t, bps as f64 / 1_048_576.0);
+    }
+
     // Same selection logic as before — pick first level that shows ≤ 10 %
     // improvement, or the best if all are better.
     let mut best_threads = 2usize.min(ceiling);
@@ -71,13 +83,16 @@ pub async fn probe_optimal_threads(
                 best_threads = try_threads;
             } else {
                 // Improvement ≤ 10 % — diminishing returns, stop.
+                eprintln!("   → Diminishing returns at {} connections (≤10% improvement)", try_threads);
                 break;
             }
         } else if try_threads >= 4 {
+            eprintln!("   → Performance dropped at {} connections", try_threads);
             break;
         }
     }
 
+    eprintln!("   ✓ Selected: {} connection(s) at {:.1} MB/s", best_threads, best_bps as f64 / 1_048_576.0);
     best_threads.max(1).min(ceiling)
 }
 
