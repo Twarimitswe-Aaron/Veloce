@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -182,10 +184,14 @@ fn verify_origin(headers: &HeaderMap) -> bool {
             .split('/')
             .next()
             .unwrap_or("");
-        return config.allowed_extension_ids.iter().any(|allowed| allowed == id);
+        return config
+            .allowed_extension_ids
+            .iter()
+            .any(|allowed| allowed == id);
     }
     if let Ok(parsed) = url::Url::parse(origin) {
-        return parsed.host_str() == Some("localhost") || parsed.host_str() == Some("127.0.0.1");
+        return parsed.host_str() == Some("localhost")
+            || parsed.host_str() == Some("127.0.0.1");
     }
     false
 }
@@ -199,7 +205,8 @@ async fn ws_handler(
         log::warn!("Rejected WebSocket from disallowed origin");
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state)).into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
@@ -272,6 +279,29 @@ fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<St
                 .to_string(),
             );
         }
+    }
+}
+
+/// Strip tracking query parameters from a URL — backend parity.
+fn strip_tracking_params(url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        let tracking_params = [
+            "utm_source", "utm_medium", "utm_campaign",
+            "igsh", "fbclid", "gclid", "si",
+        ];
+        let query = parsed.query().unwrap_or("").to_string();
+        let pairs: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+            .filter(|(k, _)| !tracking_params.contains(&k.as_ref()))
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        if pairs.is_empty() {
+            parsed.set_query(None);
+        } else {
+            parsed.set_query(Some(&pairs.join("&")));
+        }
+        parsed.to_string()
+    } else {
+        url.to_string()
     }
 }
 
@@ -352,7 +382,7 @@ async fn handle_message(
 
         "NEW_DOWNLOAD" => {
             let payload = &data["payload"];
-            let url = payload["url"].as_str().unwrap_or("");
+            let raw_url = payload["url"].as_str().unwrap_or("");
             let direct_url = payload["directUrl"].as_str().map(|s| s.to_string());
             let file_name = payload["fileName"].as_str().unwrap_or("download_file");
             let referer = payload["referer"]
@@ -360,7 +390,7 @@ async fn handle_message(
                 .or_else(|| payload["pageUrl"].as_str())
                 .map(|s| s.to_string());
 
-            if url.is_empty() {
+            if raw_url.is_empty() {
                 let _ = tx.send(
                     serde_json::json!({
                         "type": "DOWNLOAD_ERROR",
@@ -372,7 +402,10 @@ async fn handle_message(
                 return;
             }
 
-            if !crate::util::is_safe_download_url(url) {
+            // Normalize URL: strip tracking params (backend parity).
+            let url = strip_tracking_params(raw_url);
+
+            if !crate::util::is_safe_download_url(&url) {
                 let _ = tx.send(
                     serde_json::json!({
                         "type": "DOWNLOAD_ERROR",
@@ -402,7 +435,7 @@ async fn handle_message(
 
             let app_state = state.app.clone();
             let req = StartDownloadRequest {
-                url: url.to_string(),
+                url,
                 direct_url,
                 file_name: file_name.to_string(),
                 referer,
@@ -463,9 +496,24 @@ async fn handle_message(
             }
         }
 
-        "CANCEL_DOWNLOAD" | "REMOVE_DOWNLOAD" => {
+        "CANCEL_DOWNLOAD" => {
+            // Kills the engine process, cleans up files, deletes DB row — backend parity.
             if let Some(id) = data["downloadId"].as_str() {
                 let _ = download::cancel_download_job(&state.app, id).await;
+            }
+        }
+
+        "REMOVE_DOWNLOAD" => {
+            // Remove from history only (keeps any completed file on disk) — backend parity.
+            if let Some(id) = data["downloadId"].as_str() {
+                let is_running = {
+                    let engines = state.app.active_engines.lock().unwrap();
+                    engines.contains_key(id)
+                };
+                if !is_running {
+                    let _ = state.app.db.delete_download(id);
+                    state.app.ws_clients.broadcast_removed(id);
+                }
             }
         }
 
@@ -486,10 +534,211 @@ async fn handle_message(
             );
         }
 
+        "SET_SETTINGS" => {
+            // Persist settings via DB and broadcast to all clients — backend parity.
+            if let Some(payload) = data["payload"].as_object() {
+                let settings_json = serde_json::to_string(payload).unwrap_or_default();
+                let _ = state
+                    .app
+                    .db
+                    .update_device_settings("extension", &settings_json);
+
+                let config = Config::from_env();
+                let mut merged = serde_json::json!({
+                    "maxConcurrentDownloads": config.max_concurrent_downloads,
+                    "defaultThreads": config.default_threads,
+                    "maxRateBytes": config.max_rate_bytes,
+                    "baseDirectory": config.base_directory().to_string_lossy().to_string(),
+                    "engineQuiet": config.engine_quiet,
+                });
+                if let Some(obj) = merged.as_object_mut() {
+                    for (k, v) in payload {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+                state.app.ws_clients.broadcast(
+                    &serde_json::json!({
+                        "type": "SETTINGS",
+                        "settings": merged,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+
+        "REQUEST_DIRECTORY_PICKER" => {
+            // Open graphical folder picker (zenity/kdialog) — backend parity.
+            let result = pick_directory();
+            if let Some(path) = result {
+                let settings = serde_json::json!({"baseDirectory": &path});
+                let _ = state
+                    .app
+                    .db
+                    .update_device_settings("extension", &settings.to_string());
+
+                let _ = tx.send(
+                    serde_json::json!({
+                        "type": "DIRECTORY_SELECTED",
+                        "payload": { "path": path },
+                    })
+                    .to_string(),
+                );
+            } else {
+                let _ = tx.send(
+                    serde_json::json!({
+                        "type": "DIRECTORY_PICKER_UNAVAILABLE",
+                        "error": "No graphical folder picker found. Install zenity or kdialog, or type the path manually."
+                    })
+                    .to_string(),
+                );
+            }
+        }
+
+        "OPEN_FILE" | "REVEAL_FILE" => {
+            let is_reveal = msg_type == "REVEAL_FILE";
+            if let Some(id) = data["downloadId"].as_str() {
+                if let Ok(Some(row)) = state.app.db.get_download(id) {
+                    let path = Path::new(&row.save_path);
+                    if !path.exists() {
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "DOWNLOAD_ERROR",
+                                "downloadId": id,
+                                "error": "File no longer exists on disk."
+                            })
+                            .to_string(),
+                        );
+                        return;
+                    }
+                    if is_reveal {
+                        reveal_in_file_manager(&row.save_path);
+                    } else {
+                        xdg_open(&row.save_path);
+                    }
+                }
+            }
+        }
+
         _ => {
             log::debug!("Unhandled WebSocket message type: {}", msg_type);
         }
     }
+}
+
+// ── File/directory utilities (backend parity) ─────────────────────────────
+
+/// Open a file or folder with the desktop's default handler (xdg-open).
+fn xdg_open(target: &str) {
+    let child = Command::new("xdg-open")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            // Detach — don't wait for completion
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
+        }
+        Err(e) => log::error!("xdg-open failed: {}", e),
+    }
+}
+
+/// Reveal a file in the file manager, highlighting it when DBus API is available.
+fn reveal_in_file_manager(file_path: &str) {
+    let child = Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("array:string:file://{}", file_path),
+            "string:",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            let path = file_path.to_string();
+            std::thread::spawn(move || {
+                let status = c.wait();
+                if status.map_or(true, |s| !s.success()) {
+                    // Fallback: open parent folder
+                    if let Some(parent) = Path::new(&path).parent() {
+                        xdg_open(parent.to_str().unwrap_or("."));
+                    }
+                }
+            });
+        }
+        Err(_) => {
+            // Fallback: open parent folder
+            if let Some(parent) = Path::new(file_path).parent() {
+                xdg_open(parent.to_str().unwrap_or("."));
+            }
+        }
+    }
+}
+
+/// Open a graphical folder picker via zenity or kdialog.
+fn pick_directory() -> Option<String> {
+    // Try zenity first
+    let zenity = Command::new("zenity")
+        .args(["--file-selection", "--directory"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = zenity {
+        use std::io::Read;
+        let mut output = String::new();
+        if child
+            .stdout
+            .take()
+            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
+        {
+            let trimmed = output.trim().to_string();
+            if !trimmed.is_empty() {
+                if child.wait().map_or(false, |s| s.success()) {
+                    return Some(trimmed);
+                }
+                return None; // user cancelled
+            }
+        }
+    }
+
+    // Fallback to kdialog
+    let kdialog = Command::new("kdialog")
+        .args(["--getexistingdirectory", "$HOME"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = kdialog {
+        use std::io::Read;
+        let mut output = String::new();
+        if child
+            .stdout
+            .take()
+            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
+        {
+            let trimmed = output.trim().to_string();
+            if !trimmed.is_empty() {
+                if child.wait().map_or(false, |s| s.success()) {
+                    return Some(trimmed);
+                }
+                return None; // user cancelled
+            }
+        }
+    }
+
+    log::warn!("No graphical folder picker available (tried zenity, kdialog).");
+    None
 }
 
 #[cfg(test)]
@@ -520,14 +769,50 @@ mod tests {
     #[test]
     fn test_verify_extension_origin() {
         let mut headers = HeaderMap::new();
-        headers.insert("origin", "chrome-extension://abcdefghijklmnop".parse().unwrap());
+        headers
+            .insert(
+                "origin",
+                "chrome-extension://abcdefghijklmnop".parse().unwrap(),
+            );
         assert!(verify_origin(&headers));
     }
 
     #[test]
     fn test_reject_random_origin() {
         let mut headers = HeaderMap::new();
-        headers.insert("origin", "https://evil.example".parse().unwrap());
+        headers
+            .insert("origin", "https://evil.example".parse().unwrap());
         assert!(!verify_origin(&headers));
+    }
+
+    #[test]
+    fn test_strip_tracking_params_removes_known_params() {
+        let url = "https://www.instagram.com/p/ABC123/?utm_source=ig_web_copy_link&igsh=abc123&si=def456";
+        let result = strip_tracking_params(url);
+        assert_eq!(result, "https://www.instagram.com/p/ABC123/");
+    }
+
+    #[test]
+    fn test_strip_tracking_params_keeps_other_params() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDMM";
+        let result = strip_tracking_params(url);
+        assert_eq!(
+            result,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDMM"
+        );
+    }
+
+    #[test]
+    fn test_strip_tracking_params_invalid_url_returns_original() {
+        let url = "not a valid url";
+        let result = strip_tracking_params(url);
+        assert_eq!(result, "not a valid url");
+    }
+
+    #[test]
+    fn test_strip_tracking_params_no_params_unchanged() {
+        let url = "https://example.com/video.mp4";
+        let result = strip_tracking_params(url);
+        assert_eq!(result, url);
     }
 }
