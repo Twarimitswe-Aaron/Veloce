@@ -335,32 +335,33 @@ fn extract_title(html: &str) -> Option<String> {
 }
 
 fn extract_mediafire_download_url(html: &str) -> Option<String> {
-    // Pattern 1: download_link class
-    if let Some(start) = html.find("class=\"download_link\"") {
-        let rest = &html[start..];
-        if let Some(href_start) = rest.find("href=\"") {
-            let url_start = href_start + 6;
-            let url_end = rest[url_start..].find('\"')?;
-            let url = &rest[url_start..url_start + url_end];
-            if url.starts_with("http") {
-                return Some(url.to_string());
-            }
-        }
+    // Pattern 0 (primary): regex — finds any href pointing to a mediafire.com CDN.
+    // Works regardless of attribute order (TypeScript backend parity).
+    static MF_DOWNLOAD_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r###"href="(https?://download\d+\.mediafire\.com[^"]+)"###)
+            .expect("mediafire download url regex")
+    });
+    if let Some(caps) = MF_DOWNLOAD_RE.captures(html) {
+        return Some(caps[1].to_string());
     }
-    // Pattern 2: #downloadButton
+
+    // Fallback: look backwards from downloadButton for an href attribute.
     if let Some(start) = html.find("id=\"downloadButton\"") {
-        let rest = &html[start..];
-        if let Some(href_start) = rest.find("href=\"") {
+        // Search backwards from the id position for href="..."
+        let before = &html[..start];
+        if let Some(href_start) = before.rfind("href=\"") {
             let url_start = href_start + 6;
-            let url_end = rest[url_start..].find('\"')?;
-            let url = &rest[url_start..url_start + url_end];
+            let quote_end = html[url_start..].find('\"')?;
+            let url = &html[url_start..url_start + quote_end];
             if url.starts_with("http") {
                 return Some(url.to_string());
             }
         }
     }
-    // Pattern 3: any link in download box
-    if let Some(start) = html.find("class=\"input\"") {
+
+    // Legacy fallback patterns
+    // Pattern: download_link class
+    if let Some(start) = html.find("class=\"download_link\"") {
         let rest = &html[start..];
         if let Some(href_start) = rest.find("href=\"") {
             let url_start = href_start + 6;
@@ -634,11 +635,31 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_mediafire_download_url() {
+    fn test_extract_mediafire_download_url_download_link_class() {
         let html = r#"<a class="download_link" href="https://download2393.mediafire.com/abc/key/file.zip">Download</a>"#;
         assert_eq!(
             extract_mediafire_download_url(html),
             Some("https://download2393.mediafire.com/abc/key/file.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mediafire_download_url_href_before_id() {
+        // Actual MediaFire HTML: href comes before id="downloadButton"
+        let html = r#"<a class="input popsok" href="https://download2447.mediafire.com/abc123/key/video.mp4" id="downloadButton">Download</a>"#;
+        assert_eq!(
+            extract_mediafire_download_url(html),
+            Some("https://download2447.mediafire.com/abc123/key/video.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_mediafire_download_url_regex_anywhere() {
+        // Regex pattern finds the CDN URL regardless of surrounding markup
+        let html = r#"<div class="dl-btn-wrap"><a href="https://download999.mediafire.com/some/token/file.mkv" class="input">Grab</a></div>"#;
+        assert_eq!(
+            extract_mediafire_download_url(html),
+            Some("https://download999.mediafire.com/some/token/file.mkv".to_string())
         );
     }
 
