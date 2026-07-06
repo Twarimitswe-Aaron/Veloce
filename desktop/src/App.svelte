@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { open } from "@tauri-apps/plugin-shell";
   import "./app.css";
 
   interface MediaFormat {
@@ -312,6 +313,14 @@
     }
   }
 
+  async function dismissPlaylist(playlistId: string) {
+    try {
+      await invoke("dismiss_playlist", { id: playlistId });
+    } catch (e) {
+      console.error("Dismiss playlist failed", e);
+    }
+  }
+
   async function retryPlaylist(playlistId: string) {
     try {
       const result = await invoke<any>("retry_failed_playlist", { playlistId });
@@ -593,14 +602,23 @@
                   </div>
                 {/if}
               {/if}
+              {#if pl.status === "completed" && pl.saveDir}
+                <div class="pl-save-dir">
+                  <span class="pl-save-dir-path" title={pl.saveDir}>{pl.saveDir}</span>
+                  <button class="btn-open" onclick={() => open(pl.saveDir)}>Open folder</button>
+                </div>
+              {/if}
               <div class="dl-actions">
                 {#if pl.status === "downloading"}
                   <button onclick={() => pausePlaylist(pl.playlistId)}>Pause</button>
                   <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
                 {:else if pl.status === "queued"}
                   <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
-                {:else if pl.status === "completed" && pl.failed > 0}
-                  <button class="btn-retry" onclick={() => retryPlaylist(pl.playlistId)}>Retry Failed ({pl.failed})</button>
+                {:else if pl.status === "completed"}
+                  <button class="btn-dismiss" onclick={() => dismissPlaylist(pl.playlistId)}>Dismiss</button>
+                  {#if pl.failed > 0}
+                    <button class="btn-retry" onclick={() => retryPlaylist(pl.playlistId)}>Retry Failed ({pl.failed})</button>
+                  {/if}
                 {:else if pl.status === "paused"}
                   <button class="btn-resume" onclick={() => resumePlaylist(pl.playlistId)}>Resume</button>
                   <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
@@ -1034,6 +1052,48 @@
   .btn-retry {
     color: var(--veloce-green) !important;
     border-color: var(--veloce-green) !important;
+  }
+
+  .btn-dismiss {
+    color: var(--veloce-muted) !important;
+    border-color: var(--veloce-border) !important;
+  }
+
+  .btn-open {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    background: rgba(0, 200, 255, 0.1);
+    color: #00c8ff;
+    border: 1px solid rgba(0, 200, 255, 0.3);
+    border-radius: 3px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+
+  .btn-open:hover {
+    background: rgba(0, 200, 255, 0.2);
+  }
+
+  .pl-save-dir {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    padding: 4px 6px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 3px;
+  }
+
+  .pl-save-dir-path {
+    flex: 1;
+    font-size: 10px;
+    font-family: monospace;
+    color: var(--veloce-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .dl-error {

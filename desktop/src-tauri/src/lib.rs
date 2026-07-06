@@ -126,6 +126,12 @@ async fn update_settings(settings: String, state: State<'_, Arc<AppState>>) -> R
 }
 
 #[tauri::command]
+async fn dismiss_playlist(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    playlist::dismiss_playlist_job(&state, &id);
+    Ok(())
+}
+
+#[tauri::command]
 async fn retry_failed_playlist(
     playlist_id: String,
     state: State<'_, Arc<AppState>>,
@@ -205,6 +211,7 @@ pub fn run() {
             cancel_download,
             pause_download,
             resume_download,
+            dismiss_playlist,
             retry_failed_playlist,
             get_statuses,
             get_history,

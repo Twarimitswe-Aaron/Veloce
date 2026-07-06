@@ -692,6 +692,16 @@ pub fn cancel_playlist_job(app: &AppState, playlist_id: &str) {
     RUNNING_PLAYLISTS.lock().unwrap().remove(playlist_id);
 }
 
+/// Dismiss a completed playlist — deletes the DB row and removes from UI.
+pub fn dismiss_playlist_job(app: &AppState, playlist_id: &str) {
+    app.emit_playlist_removed(&PlaylistRemovedEvent {
+        playlist_id: playlist_id.to_string(),
+    });
+    app.ws_clients.broadcast_playlist_removed(playlist_id);
+    let _ = app.db.delete_playlist_job(playlist_id);
+    RUNNING_PLAYLISTS.lock().unwrap().remove(playlist_id);
+}
+
 /// Resume a paused playlist job.
 pub fn resume_playlist_job(state: Arc<AppState>, playlist_id: &str) {
     let row = match state.db.get_playlist_job(playlist_id).ok().flatten() {
