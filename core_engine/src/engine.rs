@@ -209,6 +209,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let remaining = Arc::new(AtomicUsize::new(remaining_count));
     let completed_count = Arc::new(AtomicU64::new((pieces.len() - remaining_count) as u64));
     let had_failure = Arc::new(AtomicBool::new(false));
+    let failed_count = Arc::new(AtomicU64::new(0));
     let worker_partial: Arc<Vec<AtomicU64>> =
         Arc::new((0..effective_ceiling).map(|_| AtomicU64::new(0)).collect());
     let limiter = Arc::new(RateLimiter::new(args.max_rate));
@@ -241,7 +242,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         MultiProgress::new()
     });
     let header_style = ProgressStyle::with_template(
-        "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} | {binary_bytes_per_sec} | ETA {eta}",
+        "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} | {binary_bytes_per_sec} | ETA {eta} {msg}",
     )
     .unwrap()
     .progress_chars("█▇▆▅▄▃▂▁░");
@@ -283,6 +284,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let completed_count = Arc::clone(&completed_count);
         let adaptive = Arc::clone(&adaptive);
         let had_failure = Arc::clone(&had_failure);
+        let failed_count = Arc::clone(&failed_count);
         let worker_partial = Arc::clone(&worker_partial);
         let conn_bars = Arc::clone(&conn_bars);
         let limiter = Arc::clone(&limiter);
@@ -392,6 +394,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     if n >= MAX_PIECE_RETRIES {
                         eprintln!("[C{w}] piece {idx} permanently failed");
                         had_failure.store(true, Ordering::Relaxed);
+                        failed_count.fetch_add(1, Ordering::Relaxed);
                         if remaining.fetch_sub(1, Ordering::Release) == 1 {
                             notify.notify_waiters();
                         }
@@ -413,9 +416,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let remaining = Arc::clone(&remaining);
         let completed = Arc::clone(&completed);
         let completed_count = Arc::clone(&completed_count);
+        let failed_count = Arc::clone(&failed_count);
         let adaptive = Arc::clone(&adaptive);
         let header_bar = header_bar.clone();
         let state_path = state_path.to_path_buf();
+        let total_pieces = num_pieces;
         let etag = discovery.etag.clone();
         let last_modified = discovery.last_modified.clone();
         let mut last_persisted_done = completed_count.load(Ordering::Relaxed) as usize;
@@ -447,6 +452,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 header_bar.set_position(current);
 
                 let done_count = completed_count.load(Ordering::Relaxed) as usize;
+                let fail = failed_count.load(Ordering::Relaxed);
+                if fail > 0 {
+                    header_bar.set_message(format!("{}/{} pieces, {} failed", done_count, total_pieces, fail));
+                } else {
+                    header_bar.set_message(format!("{}/{} pieces", done_count, total_pieces));
+                }
                 let should_save = last_save.elapsed() >= Duration::from_millis(RESUME_INTERVAL_MS)
                     || done_count != last_persisted_done;
 
