@@ -738,7 +738,6 @@ async function parseMediafirePage(url: string): Promise<string | null> {
 		const res = await fetch(url, {
 			redirect: 'follow',
 			headers: {
-				Range: 'bytes=0-131071',
 				'User-Agent': MF_UA
 			}
 		});

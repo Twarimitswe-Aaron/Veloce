@@ -265,7 +265,7 @@ async fn run_playlist_job(state: Arc<AppState>, playlist_id: &str) {
                 return;
             }
 
-            let (ok, new_index, new_completed, new_failed) = process_single_track(
+            let (ok, _new_index, new_completed, new_failed) = process_single_track(
                 &state, playlist_id, idx, &entries, &save_dir, &referer, &config,
                 completed, failed,
             )

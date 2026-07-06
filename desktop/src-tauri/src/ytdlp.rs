@@ -274,7 +274,7 @@ pub fn run_attempts(url: &str, attempts: &[YtAttempt], force: bool) -> Result<Ve
         match try_attempt(url, attempt, None) {
             Ok(formats) if !formats.is_empty() => return Ok(formats),
             Ok(_) => {}
-            Err(e) => {
+            Err(_) => {
                 if force {
                     // In force mode, continue to next attempt
                     continue;
