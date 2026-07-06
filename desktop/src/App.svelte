@@ -44,10 +44,47 @@
     error?: string;
   }
 
+  interface PlaylistStatus {
+    playlistId: string;
+    fileName: string;
+    status: string;
+    current: number;
+    total: number;
+    completed: number;
+    failed: number;
+    trackTitle?: string;
+    saveDir: string;
+    downloaded: number;
+    totalBytes: number;
+    error?: string;
+  }
+
+  interface PlaylistQueuedEvent {
+    playlistId: string;
+    count: number;
+    total: number;
+    folder: string;
+    title: string;
+  }
+
+  interface PlaylistFinishedEvent {
+    playlistId: string;
+    title: string;
+    saveDir: string;
+    completed: number;
+    failed: number;
+    total: number;
+  }
+
+  interface PlaylistRemovedEvent {
+    playlistId: string;
+  }
+
   // ── State ──────────────────────────────────────────────────────────────
 
   let connected = true; // Tauri is always connected
   let downloads: DownloadStatus[] = [];
+  let playlists: PlaylistStatus[] = [];
   let newUrl = "";
   let newFileName = "";
   let formats: MediaFormat[] = [];
@@ -67,6 +104,10 @@
 
   let unlistenProgress: UnlistenFn | undefined;
   let unlistenStatus: UnlistenFn | undefined;
+  let unlistenPlaylistUpdate: UnlistenFn | undefined;
+  let unlistenPlaylistQueued: UnlistenFn | undefined;
+  let unlistenPlaylistFinished: UnlistenFn | undefined;
+  let unlistenPlaylistRemoved: UnlistenFn | undefined;
 
   onMount(async () => {
     unlistenProgress = await listen<ProgressEvent>("download-progress", (event) => {
@@ -102,6 +143,51 @@
       });
     });
 
+    // ── Playlist event listeners ─────────────────────────────────────────
+
+    unlistenPlaylistQueued = await listen<PlaylistQueuedEvent>("playlist-queued", (event) => {
+      const p = event.payload;
+      const playlist: PlaylistStatus = {
+        playlistId: p.playlistId,
+        fileName: `${p.title} (0/${p.total} tracks)`,
+        status: "queued",
+        current: 0,
+        total: p.total,
+        completed: 0,
+        failed: 0,
+        saveDir: p.folder,
+        downloaded: 0,
+        totalBytes: 0,
+      };
+      playlists = [...playlists, playlist];
+    });
+
+    unlistenPlaylistUpdate = await listen<PlaylistStatus>("playlist-update", (event) => {
+      const p = event.payload;
+      updatePlaylist(p);
+    });
+
+    unlistenPlaylistFinished = await listen<PlaylistFinishedEvent>("playlist-finished", (event) => {
+      const p = event.payload;
+      updatePlaylist({
+        playlistId: p.playlistId,
+        fileName: `${p.title} (${p.total}/${p.total} tracks)`,
+        status: "completed",
+        current: p.total,
+        total: p.total,
+        completed: p.completed,
+        failed: p.failed,
+        saveDir: p.saveDir,
+        downloaded: 0,
+        totalBytes: 0,
+      });
+    });
+
+    unlistenPlaylistRemoved = await listen<PlaylistRemovedEvent>("playlist-removed", (event) => {
+      const p = event.payload;
+      playlists = playlists.filter((pl) => pl.playlistId !== p.playlistId);
+    });
+
     // Load initial state
     try {
       const statuses = await invoke<DownloadStatus[]>("get_statuses");
@@ -123,6 +209,10 @@
   onDestroy(() => {
     unlistenProgress?.();
     unlistenStatus?.();
+    unlistenPlaylistUpdate?.();
+    unlistenPlaylistQueued?.();
+    unlistenPlaylistFinished?.();
+    unlistenPlaylistRemoved?.();
   });
 
   // ── Actions ────────────────────────────────────────────────────────────
@@ -195,6 +285,16 @@
     formatError = "";
   }
 
+  // ── Playlist actions ──────────────────────────────────────────────────
+
+  async function cancelPlaylist(playlistId: string) {
+    try {
+      await invoke("cancel_download", { id: playlistId });
+    } catch (e) {
+      console.error("Cancel playlist failed", e);
+    }
+  }
+
   // ── Utilities ─────────────────────────────────────────────────────────
 
   function upsertDownload(dl: DownloadStatus) {
@@ -204,6 +304,16 @@
       downloads = downloads;
     } else {
       downloads = [...downloads, dl];
+    }
+  }
+
+  function updatePlaylist(pl: PlaylistStatus) {
+    const idx = playlists.findIndex((p) => p.playlistId === pl.playlistId);
+    if (idx >= 0) {
+      playlists[idx] = { ...playlists[idx], ...pl };
+      playlists = playlists;
+    } else {
+      playlists = [...playlists, pl];
     }
   }
 
@@ -387,6 +497,56 @@
         </div>
       {/if}
     </section>
+
+    <!-- Playlist Queue -->
+    {#if playlists.length > 0}
+      <section class="queue">
+        <h2>Playlists ({playlists.length})</h2>
+        <div class="downloads-list">
+          {#each playlists as pl (pl.playlistId)}
+            <div class="download-item playlist-item">
+              <div class="dl-header">
+                <span class="dl-name" title={pl.fileName}>{pl.fileName}</span>
+                <span class="dl-status">{pl.status}</span>
+              </div>
+              <div class="pl-tracks">
+                <span class="pl-track-progress">
+                  Track {pl.current}/{pl.total}
+                </span>
+                <span class="pl-track-counts">
+                  {#if pl.completed > 0}<span class="pl-ok">{pl.completed} ok</span>{/if}
+                  {#if pl.failed > 0}<span class="pl-err">{pl.failed} failed</span>{/if}
+                </span>
+              </div>
+              {#if pl.trackTitle}
+                <div class="pl-current-track" title={pl.trackTitle}>
+                  Currently: {pl.trackTitle}
+                </div>
+              {/if}
+              <div class="dl-progress">
+                <div class="progress-bar">
+                  <div
+                    class="progress-fill pl-fill"
+                    style="width: {pl.total > 0 ? (pl.current / pl.total * 100) : 0}%"
+                  ></div>
+                </div>
+                <span class="dl-size">
+                  {pl.completed + pl.failed} / {pl.total} tracks
+                </span>
+              </div>
+              <div class="dl-actions">
+                {#if pl.status === "downloading" || pl.status === "queued"}
+                  <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
+                {/if}
+              </div>
+              {#if pl.error}
+                <div class="dl-error">{pl.error}</div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
 
   {:else if activeTab === "history"}
     <!-- History Tab -->
@@ -848,6 +1008,54 @@
   .hist-status { font-size: 10px; text-transform: uppercase; color: var(--veloce-muted); flex-shrink: 0; }
   .hist-size { color: var(--veloce-muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .hist-path { color: var(--veloce-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+
+  /* ── Playlist Items ──────────────────────────────────── */
+
+  .playlist-item {
+    border-color: rgba(0, 200, 255, 0.15);
+  }
+
+  .pl-tracks {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+    gap: 8px;
+  }
+
+  .pl-track-progress {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--veloce-white);
+  }
+
+  .pl-track-counts {
+    display: flex;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .pl-ok {
+    color: var(--veloce-success);
+  }
+
+  .pl-err {
+    color: var(--veloce-error);
+  }
+
+  .pl-current-track {
+    font-size: 11px;
+    color: var(--veloce-muted);
+    margin-bottom: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pl-fill {
+    background: linear-gradient(90deg, var(--veloce-green), #00c8ff);
+  }
 
   /* ── Settings ───────────────────────────────────────── */
 

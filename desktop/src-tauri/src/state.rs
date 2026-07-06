@@ -46,6 +46,59 @@ pub struct StatusEvent {
     pub error: Option<String>,
 }
 
+/// Playlist progress update payload emitted via Tauri events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistProgressEvent {
+    #[serde(rename = "playlistId")]
+    pub playlist_id: String,
+    #[serde(rename = "fileName")]
+    pub file_name: String,
+    pub status: String,
+    pub current: i64,
+    pub total: i64,
+    pub completed: i64,
+    pub failed: i64,
+    #[serde(rename = "trackTitle")]
+    pub track_title: Option<String>,
+    #[serde(rename = "saveDir")]
+    pub save_dir: String,
+    pub downloaded: i64,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: i64,
+    pub error: Option<String>,
+}
+
+/// Playlist queued event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistQueuedEvent {
+    #[serde(rename = "playlistId")]
+    pub playlist_id: String,
+    pub count: i64,
+    pub total: i64,
+    pub folder: String,
+    pub title: String,
+}
+
+/// Playlist finished event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistFinishedEvent {
+    #[serde(rename = "playlistId")]
+    pub playlist_id: String,
+    pub title: String,
+    #[serde(rename = "saveDir")]
+    pub save_dir: String,
+    pub completed: i64,
+    pub failed: i64,
+    pub total: i64,
+}
+
+/// Playlist removed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistRemovedEvent {
+    #[serde(rename = "playlistId")]
+    pub playlist_id: String,
+}
+
 /// Shared application state.
 pub struct AppState {
     pub db: Database,
@@ -181,6 +234,30 @@ impl AppState {
             flags.remove(id);
         }
         self.scheduler.finish(id);
+    }
+
+    pub fn emit_playlist_update(&self, event: &PlaylistProgressEvent) {
+        if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
+            let _ = app.emit("playlist-update", event);
+        }
+    }
+
+    pub fn emit_playlist_queued(&self, event: &PlaylistQueuedEvent) {
+        if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
+            let _ = app.emit("playlist-queued", event);
+        }
+    }
+
+    pub fn emit_playlist_finished(&self, event: &PlaylistFinishedEvent) {
+        if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
+            let _ = app.emit("playlist-finished", event);
+        }
+    }
+
+    pub fn emit_playlist_removed(&self, event: &PlaylistRemovedEvent) {
+        if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
+            let _ = app.emit("playlist-removed", event);
+        }
     }
 
     pub async fn all_statuses(&self) -> Vec<DownloadStatus> {

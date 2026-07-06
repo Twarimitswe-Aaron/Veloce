@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::db;
 use crate::engine::EngineProcess;
-use crate::state::AppState;
+use crate::state::{AppState, PlaylistProgressEvent, PlaylistQueuedEvent, PlaylistFinishedEvent, PlaylistRemovedEvent};
 use crate::util;
 use crate::ytdlp;
 
@@ -388,6 +388,17 @@ async fn run_playlist_job(state: Arc<AppState>, playlist_id: &str) {
         }),
     );
 
+    // Tauri event.
+    state.emit_playlist_finished(&PlaylistFinishedEvent {
+        playlist_id: playlist_id.to_string(),
+        title: row.title.clone(),
+        save_dir: row.save_dir.clone(),
+        completed,
+        failed,
+        total: entries.len() as i64,
+    });
+
+    // WebSocket broadcast.
     state.ws_clients.broadcast(
         &serde_json::json!({
             "type": "PLAYLIST_FINISHED",
@@ -478,8 +489,13 @@ pub fn cancel_playlist_job(app: &AppState, playlist_id: &str) {
             rp.cancel_flag.store(true, Ordering::SeqCst);
         }
     }
-    let _ = app.db.delete_playlist_job(playlist_id);
+    // Tauri event.
+    app.emit_playlist_removed(&PlaylistRemovedEvent {
+        playlist_id: playlist_id.to_string(),
+    });
+    // WebSocket broadcast.
     app.ws_clients.broadcast_playlist_removed(playlist_id);
+    let _ = app.db.delete_playlist_job(playlist_id);
     RUNNING_PLAYLISTS.lock().unwrap().remove(playlist_id);
 }
 
@@ -503,7 +519,7 @@ pub fn is_playlist_running(playlist_id: &str) -> bool {
     RUNNING_PLAYLISTS.lock().unwrap().contains_key(playlist_id)
 }
 
-/// Broadcast a playlist update event.
+/// Broadcast a playlist update event (WebSocket + Tauri event).
 fn broadcast_playlist_update(
     state: &AppState,
     playlist_id: &str,
@@ -518,20 +534,45 @@ fn broadcast_playlist_update(
         None => return,
     };
 
+    let file_name = format!("{} ({}/{})", row.title, current + 1, total);
+    let tauri_event = PlaylistProgressEvent {
+        playlist_id: playlist_id.to_string(),
+        file_name: file_name.clone(),
+        status: status.to_string(),
+        current: current + 1,
+        total,
+        completed: row.completed_tracks,
+        failed: row.failed_tracks,
+        track_title: if stem.is_empty() {
+            row.current_track_title.clone()
+        } else {
+            Some(track_title.to_string())
+        },
+        save_dir: row.save_dir.clone(),
+        downloaded: row.downloaded_bytes.unwrap_or(0),
+        total_bytes: row.total_bytes.unwrap_or(0),
+        error: row.error.clone(),
+    };
+
+    // Emit Tauri event for the desktop frontend.
+    state.emit_playlist_update(&tauri_event);
+
+    // Broadcast via WebSocket for the extension.
     state.ws_clients.broadcast(
         &serde_json::json!({
             "type": "PLAYLIST_UPDATE",
             "playlistId": playlist_id,
-            "fileName": format!("{} ({}/{})", row.title, current + 1, total),
+            "fileName": file_name,
             "status": status,
             "current": current + 1,
             "total": total,
             "completed": row.completed_tracks,
             "failed": row.failed_tracks,
-            "trackTitle": if stem.is_empty() { row.current_track_title } else { Some(track_title.to_string()) },
+            "trackTitle": tauri_event.track_title,
             "saveDir": row.save_dir,
             "downloaded": row.downloaded_bytes.unwrap_or(0),
             "totalBytes": row.total_bytes.unwrap_or(0),
+            "error": row.error,
             "isPlaylist": true,
         })
         .to_string(),

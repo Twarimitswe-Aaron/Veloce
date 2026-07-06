@@ -476,6 +476,19 @@ async fn handle_message(
                         Ok((playlist_id, total, title, folder)) => {
                             // Schedule the playlist, broadcast queued event.
                             playlist::schedule_playlist_job(app.clone(), playlist_id.clone());
+
+                            // Tauri event for desktop frontend.
+                            app.emit_playlist_queued(
+                                &crate::state::PlaylistQueuedEvent {
+                                    playlist_id: playlist_id.clone(),
+                                    count: total,
+                                    total,
+                                    folder: folder.clone(),
+                                    title: title.clone(),
+                                },
+                            );
+
+                            // WebSocket broadcast for extension.
                             app.ws_clients.broadcast_playlist_queued(
                                 &playlist_id, total, total, &folder, &title,
                             );

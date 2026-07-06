@@ -53,11 +53,21 @@ async fn start_download(
 
 #[tauri::command]
 async fn cancel_download(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Check playlist jobs first (backend parity).
+    if playlist::is_playlist_running(&id) {
+        playlist::cancel_playlist_job(&state, &id);
+        return Ok(());
+    }
     download::cancel_download_job(&state, &id).await
 }
 
 #[tauri::command]
 async fn pause_download(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Check playlist jobs first (backend parity).
+    if playlist::is_playlist_running(&id) {
+        playlist::pause_playlist_job(&id);
+        return Ok(());
+    }
     download::pause_download_job(&state, &id).await
 }
 
