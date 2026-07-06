@@ -3,7 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-shell";
-  import "app.css";
+  import "./app.css";
 
   interface MediaFormat {
     id: string;
@@ -118,14 +118,14 @@
     }
   }
 
-  async function saveSettings() {
+  async function saveSettings(dir: string, max: number, threads: number) {
     if (!settingsLoaded) return;
     try {
       await invoke("update_settings", {
         settings: JSON.stringify({
-          base_dir: baseDir,
-          max_concurrent: maxConcurrent,
-          default_threads: defaultThreads,
+          base_dir: dir,
+          max_concurrent: max,
+          default_threads: threads,
         })
       });
     } catch (e) {
@@ -134,9 +134,9 @@
   }
 
   // Auto-save settings when they change
-  $effect(() => {
-    saveSettings();
-  });
+  $: if (settingsLoaded) {
+    saveSettings(baseDir, maxConcurrent, defaultThreads);
+  }
 
   // Cached file stats per playlist (populated on completion).
   let playlistFileStats: Record<string, { fileCount: number; totalSize: number }> = {};
