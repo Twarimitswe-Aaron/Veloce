@@ -517,13 +517,35 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                     engines.remove(&id_mon);
                 }
 
-                let _ = state_mon.db.update_download_status(&id_mon, &exit_status);
+                let current_status = state_mon.db.get_download(&id_mon).ok().flatten().map(|r| r.status).unwrap_or_default();
 
                 runtime_handle.block_on(async {
-                    state_mon.scheduler.finish(&id_mon);
-                    state_mon.emit_status(&id_mon, &exit_status, error.clone()).await;
-                    state_mon.remove_active(&id_mon).await;
-                    pump_scheduler(state_mon.clone());
+                    if current_status == "paused" {
+                        log::info!("[Step 5: Engine Exit] {} is paused, keeping state", id_mon);
+                        state_mon.scheduler.finish(&id_mon);
+                        state_mon.remove_active(&id_mon).await;
+                        pump_scheduler(state_mon.clone());
+                    } else if current_status == "cancelled" || exit_status == "cancelled" {
+                        log::info!("[Step 5: Engine Exit] {} is cancelled, cleaning up files", id_mon);
+                        if let Ok(Some(row)) = state_mon.db.get_download(&id_mon) {
+                            let _ = std::fs::remove_file(std::path::Path::new(&row.save_path));
+                            let _ = std::fs::remove_file(format!("{}.veloce_state", row.save_path));
+                            let _ = std::fs::remove_file(format!("{}.veloce_done", row.save_path));
+                        }
+                        if current_status != "cancelled" {
+                            let _ = state_mon.db.update_download_status(&id_mon, "cancelled");
+                            state_mon.emit_status(&id_mon, "cancelled", None).await;
+                        }
+                        state_mon.scheduler.finish(&id_mon);
+                        state_mon.remove_active(&id_mon).await;
+                        pump_scheduler(state_mon.clone());
+                    } else {
+                        let _ = state_mon.db.update_download_status(&id_mon, &exit_status);
+                        state_mon.scheduler.finish(&id_mon);
+                        state_mon.emit_status(&id_mon, &exit_status, error.clone()).await;
+                        state_mon.remove_active(&id_mon).await;
+                        pump_scheduler(state_mon.clone());
+                    }
                 });
             });
 

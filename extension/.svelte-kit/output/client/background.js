@@ -787,14 +787,11 @@ function scheduleKeepaliveAlarm() {
 }
 
 function interceptLog(step, detail) {
-	const ts = new Date().toISOString();
-	const prefix = `[Veloce intercept][bg] ${ts}`;
-	if (detail !== undefined) console.log(prefix, step, detail);
-	else console.log(prefix, step);
+	// Debug logging moved to Rust backend
 }
 
 function traceFormats(step, detail) {
-	interceptLog(`formats: ${step}`, detail);
+	// Debug logging moved to Rust backend
 }
 
 const BROWSER_ONLY_URL = /^(blob:|data:|mediastream:)/i;

@@ -16,7 +16,7 @@
 	window.__veloceContentSession = contentSession;
 	const teardownFns = [];
 
-	console.log('%c[Veloce] content script active', 'color:#00ff9d;font-weight:bold', location.href);
+	// Debug logging removed
 
 	// Page hook is injected via manifest MAIN-world content_script — no backup <script> tag.
 
@@ -1238,24 +1238,7 @@
 
 	function clickTargetsVeloceUi(e) {
 		const path = e.composedPath();
-		const result = path.some((n) => {
-			if (!n?.classList) return false;
-			return n.classList.contains('menu')
-				|| n.classList.contains('menu-close')
-				|| n.classList.contains('menu-item')
-				|| n.classList.contains('badge')
-				|| n.classList.contains('badge-close');
-		});
-		// Debug: log when click is on a menu-item but we fail to detect it
-		const target = path[0];
-		if (target?.classList?.contains?.('menu-item') && !result) {
-			console.log('[Veloce DEBUG] clickTargetsVeloceUi FALSE for menu-item!', {
-				classes: [...target.classList],
-				pathLen: path.length,
-				pathTypes: path.map(n => n?.nodeName || typeof n)
-			});
-		}
-		return result;
+		return path.some((n) => n?.id === 'veloce-host' || n?.classList?.contains?.('veloce'));
 	}
 
 	function dismissBadge(key, anchor) {

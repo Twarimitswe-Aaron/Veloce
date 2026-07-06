@@ -20,7 +20,7 @@ pub struct EngineProgress {
     pub total: Option<u64>,
     pub speed_bps: Option<u64>,
     pub eta_secs: Option<u64>,
-    pub elapsed_secs: Option<u64>,
+    pub elapsed_secs: Option<f64>,
     pub error: Option<String>,
 }
 
@@ -95,8 +95,13 @@ impl EngineProcess {
                     Ok(_) => {
                         let trimmed = line.trim();
                         if trimmed.is_empty() { continue; }
-                        if let Ok(progress) = serde_json::from_str::<EngineProgress>(trimmed) {
-                            on_progress(progress);
+                        match serde_json::from_str::<EngineProgress>(trimmed) {
+                            Ok(progress) => on_progress(progress),
+                            Err(e) => {
+                                if trimmed.starts_with('{') {
+                                    log::warn!("[EngineReader] Failed to parse JSON progress: {} (line: {})", e, trimmed);
+                                }
+                            }
                         }
                     }
                     Err(_) => break,
@@ -110,7 +115,19 @@ impl EngineProcess {
     /// Send SIGTERM to pause the engine (state file preserved).
     pub fn pause(&mut self) {
         if let Some(ref mut child) = *self.child.lock().unwrap() {
-            let _ = child.kill();
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                log::info!("[Engine] Sending SIGTERM to pause engine {}", pid);
+                let _ = std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -119,7 +136,19 @@ impl EngineProcess {
         log::debug!("Cancelling engine for download {}", self.download_id);
         self.cancelled.store(true, Ordering::SeqCst);
         if let Some(ref mut child) = *self.child.lock().unwrap() {
-            let _ = child.kill();
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                log::info!("[Engine] Sending SIGTERM to cancel engine {}", pid);
+                let _ = std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
         }
     }
 

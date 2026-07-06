@@ -285,30 +285,56 @@ fn extract_youtube_id(url: &str) -> Option<String> {
     None
 }
 
-/// Resolve a MediaFire file page URL to a direct CDN URL by scraping the page.
 pub async fn resolve_mediafire(url: &str) -> Result<MediaFireInfo, String> {
+    log::info!("[MediaFire] Step 1: Building HTTP client for URL: {}", url);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|e| {
+            log::error!("[MediaFire] Failed to build HTTP client: {}", e);
+            format!("Failed to build HTTP client: {}", e)
+        })?;
 
+    log::info!("[MediaFire] Step 2: Fetching page HTML");
     let resp = client.get(url).send().await
-        .map_err(|e| format!("Failed to fetch MediaFire page: {}", e))?;
+        .map_err(|e| {
+            log::error!("[MediaFire] HTTP GET failed: {}", e);
+            format!("Failed to fetch MediaFire page: {}", e)
+        })?;
+        
     let html = resp.text().await
-        .map_err(|e| format!("Failed to read MediaFire page: {}", e))?;
+        .map_err(|e| {
+            log::error!("[MediaFire] Failed to read response body: {}", e);
+            format!("Failed to read MediaFire page: {}", e)
+        })?;
+
+    log::info!("[MediaFire] Step 3: Page fetched successfully ({} bytes). Extracting title...", html.len());
 
     // Extract file name from og:title or title
     let file_name = extract_meta_content(&html, "og:title")
         .or_else(|| extract_title(&html))
-        .unwrap_or_else(|| "mediafire_file".to_string());
+        .unwrap_or_else(|| {
+            log::warn!("[MediaFire] Could not extract title, using fallback");
+            "mediafire_file".to_string()
+        });
+        
+    log::info!("[MediaFire] Step 4: Title extracted: {}", file_name);
+    log::info!("[MediaFire] Step 5: Extracting direct download URL");
 
     // Extract download URL from the download button or link
     let direct_url = extract_mediafire_download_url(&html)
-        .ok_or_else(|| "Could not find download link on MediaFire page".to_string())?;
+        .ok_or_else(|| {
+            log::error!("[MediaFire] Failed to find direct CDN download URL in HTML");
+            "Could not find download link on MediaFire page".to_string()
+        })?;
+
+    log::info!("[MediaFire] Step 6: Extracted direct URL: {}", direct_url);
+    log::info!("[MediaFire] Step 7: Extracting file size");
 
     // Extract file size from the info section
     let size_bytes = extract_mediafire_size(&html);
+    log::info!("[MediaFire] Step 8: File size extracted: {:?}", size_bytes);
 
     Ok(MediaFireInfo {
         file_name,
