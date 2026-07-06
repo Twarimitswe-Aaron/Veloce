@@ -2,7 +2,7 @@
 name = "veloce-desktop"
 version = "0.1.0"
 description = "Veloce Native Desktop Application"
-authors = ["Veloce","Twarimitswe Aaron"]
+authors = ["Veloce", "Twarimitswe Aaron"]
 edition = "2021"
 
 [lib]

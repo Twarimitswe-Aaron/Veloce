@@ -462,14 +462,29 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
             let runtime_handle = state_spawn.runtime_handle.clone();
 
             std::thread::spawn(move || {
-                let engine = {
-                    let mut engines = state_mon.active_engines.lock().unwrap();
-                    engines.remove(&id_mon)
+                let waiter = {
+                    let engines = state_mon.active_engines.lock().unwrap();
+                    engines.get(&id_mon).map(|eng| eng.waiter())
                 };
 
-                let (exit_status, error) = match engine {
-                    Some(mut eng) => {
-                        let code = eng.wait();
+                let (exit_status, error) = match waiter {
+                    Some((child_arc, cancel_mon)) => {
+                        let mut code_opt = None;
+                        loop {
+                            {
+                                let mut lock = child_arc.lock().unwrap();
+                                if let Some(child) = lock.as_mut() {
+                                    if let Ok(Some(status)) = child.try_wait() {
+                                        code_opt = Some(status.code().unwrap_or(-1));
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        let code = code_opt;
                         if cancel_mon.load(Ordering::SeqCst) {
                             log::info!("[Step 5: Engine Exit] {} was cancelled", id_mon);
                             ("cancelled".to_string(), None)
@@ -496,6 +511,11 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                         }
                     }
                 };
+
+                {
+                    let mut engines = state_mon.active_engines.lock().unwrap();
+                    engines.remove(&id_mon);
+                }
 
                 let _ = state_mon.db.update_download_status(&id_mon, &exit_status);
 

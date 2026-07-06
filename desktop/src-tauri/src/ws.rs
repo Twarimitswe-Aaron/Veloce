@@ -371,6 +371,7 @@ async fn handle_message(
     };
 
     let msg_type = data["type"].as_str().unwrap_or("");
+    log::info!("[WS] Received message type: {}", msg_type);
 
     match msg_type {
         "PING" => {
@@ -438,6 +439,7 @@ async fn handle_message(
         "NEW_DOWNLOAD" => {
             let payload = &data["payload"];
             let raw_url = payload["url"].as_str().unwrap_or("");
+            log::info!("[WS] NEW_DOWNLOAD requested for url: {}", raw_url);
             let direct_url = payload["directUrl"].as_str().map(|s| s.to_string());
             let file_name = payload["fileName"].as_str().unwrap_or("download_file");
             let referer = payload["referer"]
@@ -462,6 +464,7 @@ async fn handle_message(
             let url = strip_tracking_params(raw_url);
 
             if !crate::util::is_safe_download_url(&url) {
+                log::error!("[WS] Blocked NEW_DOWNLOAD: unsafe download URL: {}", url);
                 let _ = tx.send(
                     serde_json::json!({
                         "type": "DOWNLOAD_ERROR",
@@ -475,6 +478,7 @@ async fn handle_message(
 
             if let Some(ref direct) = direct_url {
                 if !crate::util::is_safe_download_url(direct) {
+                    log::error!("[WS] Blocked NEW_DOWNLOAD: unsafe direct URL: {}", direct);
                     let _ = tx.send(
                         serde_json::json!({
                             "type": "DOWNLOAD_ERROR",

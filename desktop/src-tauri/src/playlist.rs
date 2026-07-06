@@ -653,8 +653,8 @@ async fn download_track(
         referer,
         on_progress,
     ) {
-        Ok((mut engine, _reader)) => {
-            let code = engine.wait();
+        Ok((engine, _reader)) => {
+            let code = engine.blocking_wait();
             if code == Some(0) {
                 (true, None)
             } else {

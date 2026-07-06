@@ -16,7 +16,7 @@
 	window.__veloceContentSession = contentSession;
 	const teardownFns = [];
 
-	console.log('%c[Veloce] content script active', 'color:#00ff9d;font-weight:bold', location.href);
+	// Debug logging removed
 
 	// Page hook is injected via manifest MAIN-world content_script — no backup <script> tag.
 

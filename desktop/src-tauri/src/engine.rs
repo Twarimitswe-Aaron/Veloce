@@ -1,13 +1,13 @@
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use serde_json;
 
 /// Represents a running core_engine process.
 pub struct EngineProcess {
     download_id: String,
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -81,6 +81,7 @@ impl EngineProcess {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_clone = cancelled.clone();
         let stdout = child.stdout.take().unwrap();
+        let child_arc = Arc::new(Mutex::new(Some(child)));
 
         // Background thread reads JSON progress lines from the engine
         let reader_thread = std::thread::spawn(move || {
@@ -103,12 +104,12 @@ impl EngineProcess {
             }
         });
 
-        Ok((Self { download_id, child: Some(child), cancelled: cancelled_clone }, reader_thread))
+        Ok((Self { download_id, child: child_arc, cancelled: cancelled_clone }, reader_thread))
     }
 
     /// Send SIGTERM to pause the engine (state file preserved).
     pub fn pause(&mut self) {
-        if let Some(ref mut child) = self.child {
+        if let Some(ref mut child) = *self.child.lock().unwrap() {
             let _ = child.kill();
         }
     }
@@ -117,14 +118,34 @@ impl EngineProcess {
     pub fn cancel(&mut self) {
         log::debug!("Cancelling engine for download {}", self.download_id);
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(ref mut child) = self.child {
+        if let Some(ref mut child) = *self.child.lock().unwrap() {
             let _ = child.kill();
         }
     }
 
-    /// Wait for the engine process to exit and return the exit code.
-    pub fn wait(&mut self) -> Option<i32> {
-        self.child.as_mut().and_then(|c| c.wait().ok()).map(|s| s.code().unwrap_or(-1))
+    /// Returns the components needed to wait for the process to exit without taking ownership.
+    pub fn waiter(&self) -> (Arc<Mutex<Option<Child>>>, Arc<AtomicBool>) {
+        (self.child.clone(), self.cancelled.clone())
+    }
+
+    /// Blocks until the engine process exits, without holding the mutex continuously.
+    pub fn blocking_wait(&self) -> Option<i32> {
+        let mut code_opt = None;
+        loop {
+            {
+                let mut lock = self.child.lock().unwrap();
+                if let Some(child) = lock.as_mut() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        code_opt = Some(status.code().unwrap_or(-1));
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        code_opt
     }
 
     fn find_engine() -> PathBuf {
