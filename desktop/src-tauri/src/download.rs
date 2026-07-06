@@ -143,6 +143,60 @@ async fn list_formats_uncached(
                 kind: Some("direct".to_string()),
             }]
         }
+        formats::MediaSource::Instagram => {
+            // Instagram: try URL variants (/p/ & /reel/) with Chrome/Chromium — backend parity.
+            let variants = formats::instagram_url_variants(url);
+            let browsers: &[&str] = if force {
+                &["chrome", "chromium", "brave", "firefox"]
+            } else {
+                &["chrome", "chromium"]
+            };
+            let timeout_secs = if force { 24 } else { 14 };
+
+            let mut last_err = String::new();
+            let mut result: Vec<MediaFormat> = vec![];
+
+            for variant in &variants {
+                for browser in browsers {
+                    let v = variant.clone();
+                    let b = browser.to_string();
+                    match tokio::task::spawn_blocking(move || {
+                        // Build specific instagram attempt with single browser
+                        let attempts = vec![ytdlp::YtAttempt {
+                            cookie_args: vec!["--cookies-from-browser".into(), b],
+                            extra_args: vec![],
+                            timeout_secs,
+                            label: format!("instagram/{browser}"),
+                        }];
+                        ytdlp::run_attempts(&v, &attempts, false)
+                    }).await {
+                        Ok(Ok(formats)) if !formats.is_empty() => {
+                            result = formats;
+                            break;
+                        }
+                        Ok(Ok(_)) => {} // empty formats, continue
+                        Ok(Err(e)) => last_err = e,
+                        Err(e) => last_err = format!("Task failed: {e}"),
+                    }
+                }
+                if !result.is_empty() {
+                    break;
+                }
+            }
+
+            if result.is_empty() {
+                FORMAT_FAIL_CACHE
+                    .lock()
+                    .await
+                    .insert(normalized.to_string(), (last_err.clone(), now_secs()));
+                return Err(if last_err.is_empty() {
+                    "Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry.".to_string()
+                } else {
+                    last_err
+                });
+            }
+            result
+        }
         _ => {
             let normalized = normalized.to_string();
             tokio::task::spawn_blocking(move || ytdlp::list_formats(&normalized, force))

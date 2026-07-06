@@ -14,11 +14,11 @@ static YTDLP_SLOTS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
 const YTDLP_MAX_CONCURRENT: usize = 2;
 
 #[derive(Clone)]
-struct YtAttempt {
-    cookie_args: Vec<String>,
-    extra_args: Vec<String>,
-    timeout_secs: u64,
-    label: String,
+pub struct YtAttempt {
+    pub cookie_args: Vec<String>,
+    pub extra_args: Vec<String>,
+    pub timeout_secs: u64,
+    pub label: String,
 }
 
 fn ytdlp_missing_err() -> String {
@@ -59,13 +59,9 @@ where
     result
 }
 
-fn youtube_extra_args(url: &str) -> Vec<&'static str> {
-    let lower = url.to_lowercase();
-    if lower.contains("youtube.com") || lower.contains("youtu.be") {
-        vec!["--js-runtimes", "node"]
-    } else {
-        vec![]
-    }
+/// Shared yt-dlp args applied for all invocations — mirrors backend `ytdlpSharedArgs()`.
+fn ytdlp_shared_args() -> Vec<&'static str> {
+    vec!["--js-runtimes", "node"]
 }
 
 fn cookie_db_exists(browser: &str) -> bool {
@@ -108,7 +104,7 @@ fn build_args(url: &str, attempt: &YtAttempt) -> Vec<String> {
         "-J".into(),
     ];
     args.extend(
-        youtube_extra_args(url)
+        ytdlp_shared_args()
             .into_iter()
             .map(String::from),
     );
@@ -266,6 +262,29 @@ fn generic_attempts(force: bool) -> Vec<YtAttempt> {
             label: "generic/no-cookies".into(),
         },
     ]
+}
+
+/// Run specific attempts against a URL and return the first successful result.
+/// Used by download.rs for Instagram URL variants (backend parity).
+pub fn run_attempts(url: &str, attempts: &[YtAttempt], force: bool) -> Result<Vec<MediaFormat>, String> {
+    if attempts.is_empty() {
+        return Err("No yt-dlp attempts configured".to_string());
+    }
+    for attempt in attempts {
+        match try_attempt(url, attempt, None) {
+            Ok(formats) if !formats.is_empty() => return Ok(formats),
+            Ok(_) => {}
+            Err(e) => {
+                if force {
+                    // In force mode, continue to next attempt
+                    continue;
+                }
+                // In non-force mode, return first non-empty result
+            }
+        }
+    }
+    // All attempts exhausted
+    Err("No formats found".to_string())
 }
 
 /// Parallel fallback race — mirrors backend `raceYoutubeFormats` fast path + parallel fallbacks.
@@ -435,7 +454,7 @@ pub fn extract_best_url(url: &str) -> Result<String, String> {
             "-g".into(),
         ];
         args.extend(
-            youtube_extra_args(url)
+            ytdlp_shared_args()
                 .into_iter()
                 .map(String::from),
         );
@@ -737,14 +756,13 @@ mod tests {
     }
 
     #[test]
-    fn youtube_extra_args_includes_node_runtime() {
-        let args = youtube_extra_args("https://www.youtube.com/watch?v=x");
+    fn ytdlp_shared_args_includes_node_runtime() {
+        let args = ytdlp_shared_args();
         assert_eq!(args, vec!["--js-runtimes", "node"]);
-        assert!(youtube_extra_args("https://example.com/v.mp4").is_empty());
     }
 
     #[test]
-    fn build_args_includes_no_playlist_and_js_runtime_for_youtube() {
+    fn build_args_includes_no_playlist_and_js_runtime() {
         let attempt = YtAttempt {
             cookie_args: vec!["--cookies-from-browser".into(), "chrome".into()],
             extra_args: vec![],
@@ -756,6 +774,11 @@ mod tests {
         assert!(args.contains(&"--js-runtimes".to_string()));
         assert!(args.contains(&"node".to_string()));
         assert!(args.contains(&"https://www.youtube.com/watch?v=x".to_string()));
+
+        // Non-YouTube URLs also get --js-runtimes node (backend parity).
+        let args_non_yt = build_args("https://www.instagram.com/reel/x", &attempt);
+        assert!(args_non_yt.contains(&"--js-runtimes".to_string()));
+        assert!(args_non_yt.contains(&"node".to_string()));
     }
 
     #[test]

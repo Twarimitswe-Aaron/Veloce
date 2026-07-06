@@ -118,6 +118,8 @@ pub fn is_direct_file_url(url: &str) -> bool {
         ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mp3",
         ".wav", ".flac", ".ogg", ".m4a", ".zip", ".rar", ".7z",
         ".tar", ".gz", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".xml",
+        ".svg", ".iso", ".txt", ".csv", ".json", ".md", ".yaml", ".yml",
+        ".html", ".css", ".js", ".ts",
     ];
     let lower = url.to_lowercase();
     // Must be http(s) and end with a direct file extension
@@ -220,6 +222,27 @@ pub fn instagram_url_variants(url: &str) -> Vec<String> {
 pub fn is_manifest_format_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.contains(".m3u8") || lower.contains(".mpd")
+}
+
+/// Redirect/API/graphql trap URLs — backend parity.
+pub fn is_trap_download_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    if lower.contains("/redirect") || lower.contains("/pkg/")
+        || lower.contains("/api/") || lower.contains("/graphql")
+        || lower.contains("/download?")
+    {
+        return true;
+    }
+    // Check query parameter 'a' for redirect/download
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(a) = parsed.query_pairs().find(|(k, _)| k == "a") {
+            let val = a.1.to_lowercase();
+            if val.contains("redirect") || val.contains("download") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Normalize a URL for consistent caching.
@@ -464,7 +487,8 @@ mod tests {
     #[test]
     fn test_is_direct_file_url_negative() {
         assert!(!is_direct_file_url("https://example.com/page"));
-        assert!(!is_direct_file_url("https://example.com/video.html"));
+        // .html IS a direct extension per backend parity (backend includes html/css/js/ts)
+        assert!(is_direct_file_url("https://example.com/video.html"));
         assert!(!is_direct_file_url("not-a-url.mp4"));
         assert!(!is_direct_file_url(""));
         assert!(!is_direct_file_url("ftp://example.com/file.mp4"));
