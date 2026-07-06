@@ -74,6 +74,7 @@
     completed: number;
     failed: number;
     total: number;
+    failedIndices: number[];
   }
 
   interface PlaylistRemovedEvent {
@@ -287,6 +288,14 @@
 
   // ── Playlist actions ──────────────────────────────────────────────────
 
+  async function pausePlaylist(playlistId: string) {
+    try {
+      await invoke("pause_download", { id: playlistId });
+    } catch (e) {
+      console.error("Pause playlist failed", e);
+    }
+  }
+
   async function cancelPlaylist(playlistId: string) {
     try {
       await invoke("cancel_download", { id: playlistId });
@@ -295,7 +304,31 @@
     }
   }
 
+  async function resumePlaylist(playlistId: string) {
+    try {
+      await invoke("resume_download", { id: playlistId });
+    } catch (e) {
+      console.error("Resume playlist failed", e);
+    }
+  }
+
+  async function retryPlaylist(playlistId: string) {
+    try {
+      const result = await invoke<any>("retry_failed_playlist", { playlistId });
+      console.log("Retry playlist created:", result);
+    } catch (e) {
+      console.error("Retry playlist failed", e);
+    }
+  }
+
   // ── Utilities ─────────────────────────────────────────────────────────
+
+  /// Find the currently-active track download for a playlist, if any.
+  function currentTrackDownload(playlistId: string): DownloadStatus | undefined {
+    return downloads.find(
+      (d) => d.id.startsWith(playlistId + "-t") && d.status === "downloading"
+    );
+  }
 
   function upsertDownload(dl: DownloadStatus) {
     const idx = downloads.findIndex((d) => d.id === dl.id);
@@ -534,8 +567,42 @@
                   {pl.completed + pl.failed} / {pl.total} tracks
                 </span>
               </div>
+              {#if pl.status === "downloading"}
+                {@const trk = currentTrackDownload(pl.playlistId)}
+                {#if trk}
+                  <div class="pl-track-progress-detail">
+                    <div class="dl-progress pl-inline-progress">
+                      <div class="progress-bar pl-track-bar">
+                        <div
+                          class="progress-fill"
+                          style="width: {trk.progress_pct}%"
+                        ></div>
+                      </div>
+                      <span class="dl-size">
+                        {formatBytes(trk.downloaded)}{#if trk.total > 0} / {formatBytes(trk.total)}{/if}
+                      </span>
+                    </div>
+                    <div class="dl-meta">
+                      {#if trk.speed_bps > 0}
+                        <span class="dl-speed">{formatSpeed(trk.speed_bps)}</span>
+                      {/if}
+                      {#if trk.eta_secs > 0}
+                        <span class="dl-eta">ETA: {formatEta(trk.eta_secs)}</span>
+                      {/if}
+                    </div>
+                  </div>
+                {/if}
+              {/if}
               <div class="dl-actions">
-                {#if pl.status === "downloading" || pl.status === "queued"}
+                {#if pl.status === "downloading"}
+                  <button onclick={() => pausePlaylist(pl.playlistId)}>Pause</button>
+                  <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
+                {:else if pl.status === "queued"}
+                  <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
+                {:else if pl.status === "completed" && pl.failed > 0}
+                  <button class="btn-retry" onclick={() => retryPlaylist(pl.playlistId)}>Retry Failed ({pl.failed})</button>
+                {:else if pl.status === "paused"}
+                  <button class="btn-resume" onclick={() => resumePlaylist(pl.playlistId)}>Resume</button>
                   <button class="btn-cancel" onclick={() => cancelPlaylist(pl.playlistId)}>Cancel</button>
                 {/if}
               </div>
@@ -964,6 +1031,11 @@
     border-color: var(--veloce-error) !important;
   }
 
+  .btn-retry {
+    color: var(--veloce-green) !important;
+    border-color: var(--veloce-green) !important;
+  }
+
   .dl-error {
     margin-top: 6px;
     font-size: 11px;
@@ -1055,6 +1127,24 @@
 
   .pl-fill {
     background: linear-gradient(90deg, var(--veloce-green), #00c8ff);
+  }
+
+  .pl-track-progress-detail {
+    margin: 4px 0 0 8px;
+    padding: 4px 0 4px 8px;
+    border-left: 1px solid rgba(0, 200, 255, 0.2);
+  }
+
+  .pl-inline-progress {
+    margin-bottom: 2px;
+  }
+
+  .pl-track-bar {
+    height: 3px;
+  }
+
+  .pl-track-progress-detail .dl-meta {
+    margin-bottom: 0;
   }
 
   /* ── Settings ───────────────────────────────────────── */

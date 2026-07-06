@@ -72,6 +72,20 @@ async fn pause_download(id: String, state: State<'_, Arc<AppState>>) -> Result<(
 }
 
 #[tauri::command]
+async fn resume_download(id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Check if this is a playlist job (backend parity).
+    let db_row = state.db.get_playlist_job(&id).map_err(|e| format!("DB error: {}", e))?;
+    if let Some(row) = db_row {
+        if row.status == "paused" || row.status == "queued" {
+            playlist::resume_playlist_job(state.inner().clone(), &id);
+            return Ok(());
+        }
+    }
+    // Fall through to regular download resume if not a playlist.
+    download::resume_download_job(state.inner().clone(), &id).await
+}
+
+#[tauri::command]
 async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadStatus>, String> {
     Ok(state.all_statuses().await)
 }
@@ -109,6 +123,23 @@ async fn update_settings(settings: String, state: State<'_, Arc<AppState>>) -> R
         .db
         .update_device_settings("desktop", &settings)
         .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+async fn retry_failed_playlist(
+    playlist_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    playlist::retry_failed_playlist(state.inner().clone(), &playlist_id)
+        .await
+        .map(|(id, count, title, folder)| {
+            serde_json::json!({
+                "id": id,
+                "count": count,
+                "title": title,
+                "folder": folder,
+            })
+        })
 }
 
 #[tauri::command]
@@ -173,6 +204,8 @@ pub fn run() {
             start_download,
             cancel_download,
             pause_download,
+            resume_download,
+            retry_failed_playlist,
             get_statuses,
             get_history,
             get_settings,

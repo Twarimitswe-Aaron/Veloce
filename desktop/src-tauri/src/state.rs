@@ -90,6 +90,8 @@ pub struct PlaylistFinishedEvent {
     pub completed: i64,
     pub failed: i64,
     pub total: i64,
+    #[serde(rename = "failedIndices")]
+    pub failed_indices: Vec<i64>,
 }
 
 /// Playlist removed event.
