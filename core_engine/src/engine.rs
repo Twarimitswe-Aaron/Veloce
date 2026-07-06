@@ -6,7 +6,7 @@ use crate::io_uring_writer::IoUringEngine;
 use crate::adaptive::{AdaptiveController, FailureKind};
 use crate::args::EngineArgs;
 use crate::discover::{build_http_client, discover, supports_ranges};
-use crate::download::{download_piece, IDLE_TIMEOUT, MAX_PIECE_RETRIES};
+use crate::download::{download_piece, format_bytes, PieceMetrics, IDLE_TIMEOUT, MAX_PIECE_RETRIES};
 use crate::file_io::{available_space, SharedOutput};
 use crate::piece::{adaptive_piece_size, piece_ranges};
 use crate::profiles::ProfileStore;
@@ -35,7 +35,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     }
 
     eprintln!("");
-    eprintln!("━━━ [1/5] Initializing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("━━━ [1/5] Initializing ───────────────────────────── +0.00s");
 
     let profiles = ProfileStore::load(args.profiles_path.as_deref().map(Path::new));
     let thread_ceiling = profiles.thread_ceiling(&args.url, args.threads) as usize;
@@ -50,12 +50,16 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         thread_ceiling,
         args.referer.as_deref().unwrap_or("none")
     );
+    let t_init = start_time.elapsed();
 
     eprintln!("");
-    eprintln!("━━━ [2/5] Discovering file ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("━━━ [2/5] Discovering file ───────────────────────── +{}.{:02}s",
+        t_init.as_secs(), t_init.subsec_millis() / 10
+    );
     let discovery = discover(&client, &args.url).await?;
     let total_size = discovery.total_size;
     eprintln!("   ✅ Discovery complete: {} bytes ({:.1} MB)", total_size, total_size as f64 / 1_048_576.0);
+    let t_discover = start_time.elapsed();
 
     let sidecar = format!("{}.veloce_done", args.save_path);
     if Path::new(&sidecar).exists() {
@@ -86,7 +90,9 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     };
 
     eprintln!("");
-    eprintln!("━━━ [3/5] Preparing download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("━━━ [3/5] Preparing download ──────────────────── +{}.{:02}s",
+        t_discover.as_secs(), t_discover.subsec_millis() / 10
+    );
 
     let piece_size: u64;
     let completed_init: Vec<bool>;
@@ -174,6 +180,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         eprintln!("   ⏭  Only 1 piece, using 1 connection");
     }
 
+    let piece_metrics: Arc<SegQueue<PieceMetrics>> = Arc::new(SegQueue::new());
     let adaptive = Arc::new(AdaptiveController::new(effective_ceiling));
     let queue: Arc<SegQueue<usize>> = Arc::new(SegQueue::new());
     let notify = Arc::new(Notify::new());
@@ -219,8 +226,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         })
     );
 
+    let t_prep = start_time.elapsed();
+
     eprintln!("");
-    eprintln!("━━━ [4/5] Downloading ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("━━━ [4/5] Downloading ──────────────────────────── +{}.{:02}s",
+        t_prep.as_secs(), t_prep.subsec_millis() / 10
+    );
     eprintln!("   🚀 Starting {} worker(s) for {} piece(s)", effective_ceiling, num_pieces);
     eprintln!("   📊 Progress: ████████████████████████████████████ 0%");
 
@@ -259,6 +270,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let mut handles = vec![];
 
     for w in 0..effective_ceiling {
+        let piece_metrics = Arc::clone(&piece_metrics);
         let client = Arc::clone(&client);
         let url = args.url.clone();
         let output = Arc::clone(&output);
@@ -328,11 +340,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     start,
                     end,
                     expect_partial,
+                    idx,
+                    w,
                     &worker_partial[w],
                     bar,
                     IDLE_TIMEOUT,
                     &limiter,
                     read_buf,
+                    Some(&piece_metrics),
                     #[cfg(target_os = "linux")]
                     uring.as_mut(),
                 )
@@ -479,11 +494,68 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let elapsed = start_time.elapsed().as_secs_f64();
     let avg_mbps = (final_dl as f64 / 1_048_576.0) / elapsed;
 
+    let t_download = start_time.elapsed() - t_prep;
+
+    // Collect and sort piece metrics for the summary table
+    let mut sorted_metrics: Vec<PieceMetrics> = Vec::with_capacity(num_pieces);
+    while let Some(m) = piece_metrics.pop() {
+        sorted_metrics.push(m);
+    }
+    sorted_metrics.sort_by_key(|m| m.piece_idx);
+
     eprintln!("");
-    eprintln!("━━━ [5/5] Complete ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("━━━ [5/5] Complete ─────────────────────────────── +{:.1}s", elapsed);
+
+    // Chunk summary table
+    eprintln!("   ┌──── Chunk Download Summary ───────────────────────────────────────────────────┐");
+    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>8} │ {:>8} │",
+        "Chunk", "Range", "Bytes", "Downloaded", "Time", "Speed");
+    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>10}┼{:─>10}┤",
+        "─", "─", "─", "─", "─", "─");
+
+    let mut total_dl_bytes: u64 = 0;
+    for m in &sorted_metrics {
+        let range_start = format!("{:.1}", m.start_byte as f64 / 1_048_576.0);
+        let range_end = format!("{:.1}", m.end_byte as f64 / 1_048_576.0);
+        let range = format!("{}–{} MB", range_start, range_end);
+        let size_s = format_bytes(m.size());
+        let dl_s = format_bytes(m.bytes_downloaded);
+        total_dl_bytes += m.bytes_downloaded;
+        eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.1}s │ {:>5.1} MB/s│",
+            m.piece_idx,
+            range,
+            size_s,
+            dl_s,
+            m.duration_secs,
+            m.speed_mbps()
+        );
+    }
+
+    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>10}┼{:─>10}┤",
+        "─", "─", "─", "─", "─", "─");
+
+    let total_speed_mbps = if avg_mbps > 0.0 { avg_mbps } else {
+        total_dl_bytes as f64 / 1_048_576.0 / elapsed.max(0.001)
+    };
+    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.1}s │ {:>5.1} MB/s│",
+        "Σ",
+        format!("0–{:.1} MB", total_size as f64 / 1_048_576.0),
+        format_bytes(total_size),
+        format_bytes(total_dl_bytes),
+        elapsed,
+        total_speed_mbps
+    );
+    eprintln!("   └{:─>7}┴{:─>20}┴{:─>11}┴{:─>12}┴{:─>10}┴{:─>10}┘",
+        "─", "─", "─", "─", "─", "─");
+
     eprintln!("   📦 Downloaded: {} / {} bytes", final_dl, total_size);
-    eprintln!("   ⏱  Elapsed:    {:.1}s", elapsed);
     eprintln!("   ⚡ Avg speed:  {:.1} MB/s", avg_mbps);
+    eprintln!("   ⏱  Stages:     init {}.{:02}s + discover {}.{:02}s + prep {}.{:02}s + download {:.1}s",
+        t_init.as_secs(), t_init.subsec_millis() / 10,
+        (t_discover - t_init).as_secs(), (t_discover - t_init).subsec_millis() / 10,
+        (t_prep - t_discover).as_secs(), (t_prep - t_discover).subsec_millis() / 10,
+        t_download.as_secs_f64()
+    );
 
     println!(
         "{}",

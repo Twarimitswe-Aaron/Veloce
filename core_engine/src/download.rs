@@ -5,16 +5,41 @@ use crate::discover::retry_after_secs;
 use crate::file_io::SharedOutput;
 use crate::rate_limit::RateLimiter;
 use anyhow::Context;
+use crossbeam_queue::SegQueue;
 use futures::StreamExt;
 use indicatif::ProgressBar;
 use reqwest::header::RANGE;
 use reqwest::Client;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
 
 #[cfg(target_os = "linux")]
 use crate::io_uring_writer::IoUringEngine;
+
+/// Per-piece metrics collected at download completion.
+#[derive(Clone, Debug)]
+pub struct PieceMetrics {
+    pub piece_idx: usize,
+    pub worker: usize,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub bytes_downloaded: u64,
+    pub duration_secs: f64,
+}
+
+impl PieceMetrics {
+    pub fn size(&self) -> u64 {
+        self.end_byte - self.start_byte + 1
+    }
+    pub fn speed_mbps(&self) -> f64 {
+        if self.duration_secs > 0.0 {
+            self.bytes_downloaded as f64 / 1_048_576.0 / self.duration_secs
+        } else {
+            0.0
+        }
+    }
+}
 
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PIECE_RETRIES: usize = 10;
@@ -34,11 +59,14 @@ pub async fn download_piece(
     start: u64,
     end: u64,
     expect_partial: bool,
+    piece_idx: usize,
+    worker_id: usize,
     worker_partial: &AtomicU64,
     bar: &ProgressBar,
     idle_timeout: Duration,
     limiter: &RateLimiter,
     read_buffer_bytes: usize,
+    metrics: Option<&SegQueue<PieceMetrics>>,
     #[cfg(target_os = "linux")] mut uring: Option<&mut IoUringEngine>,
 ) -> anyhow::Result<()> {
     worker_partial.store(0, Ordering::Relaxed);
@@ -46,6 +74,7 @@ pub async fn download_piece(
     bar.set_length(piece_len);
     bar.set_position(0);
 
+    let piece_start = Instant::now();
     let range_str = format!("bytes={}-{}", start, end);
     eprintln!("   🧩 Piece [{:.1} MB - {:.1} MB] ({:.1} MB)",
         start as f64 / 1_048_576.0,
@@ -151,16 +180,31 @@ pub async fn download_piece(
         engine.flush()?;
     }
 
-    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({})",
+    let duration = piece_start.elapsed();
+    let bytes_dl = piece_done;
+    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — {:3.1}s — {:5.1} MB/s",
         start as f64 / 1_048_576.0,
         end as f64 / 1_048_576.0,
-        format_bytes(piece_len)
+        format_bytes(piece_len),
+        duration.as_secs_f64(),
+        bytes_dl as f64 / 1_048_576.0 / duration.as_secs_f64().max(0.001)
     );
+
+    if let Some(q) = metrics {
+        q.push(PieceMetrics {
+            piece_idx,
+            worker: worker_id,
+            start_byte: start,
+            end_byte: end,
+            bytes_downloaded: bytes_dl,
+            duration_secs: duration.as_secs_f64(),
+        });
+    }
 
     Ok(())
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else if bytes >= 1024 {
