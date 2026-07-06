@@ -18,6 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 
 use crate::config::Config;
 use crate::download::{self, StartDownloadRequest};
+use crate::playlist;
 use crate::state::AppState;
 
 /// Thread-safe registry of connected WebSocket clients.
@@ -115,6 +116,30 @@ impl WsClients {
         let msg = serde_json::json!({
             "type": "DOWNLOAD_REMOVED",
             "downloadId": download_id,
+        })
+        .to_string();
+        self.broadcast(&msg);
+    }
+
+    // ── Playlist broadcasts (backend parity) ───────────────────────────────
+
+    pub fn broadcast_playlist_queued(&self, playlist_id: &str, count: i64, total: i64, folder: &str, title: &str) {
+        let msg = serde_json::json!({
+            "type": "PLAYLIST_QUEUED",
+            "playlistId": playlist_id,
+            "count": count,
+            "total": total,
+            "folder": folder,
+            "title": title,
+        })
+        .to_string();
+        self.broadcast(&msg);
+    }
+
+    pub fn broadcast_playlist_removed(&self, playlist_id: &str) {
+        let msg = serde_json::json!({
+            "type": "PLAYLIST_REMOVED",
+            "playlistId": playlist_id,
         })
         .to_string();
         self.broadcast(&msg);
@@ -389,6 +414,7 @@ async fn handle_message(
                 .as_str()
                 .or_else(|| payload["pageUrl"].as_str())
                 .map(|s| s.to_string());
+            let is_playlist = payload["playlist"].as_bool().unwrap_or(false);
 
             if raw_url.is_empty() {
                 let _ = tx.send(
@@ -431,6 +457,56 @@ async fn handle_message(
                 }
             }
 
+            if is_playlist {
+                // ── Playlist download (backend parity) ─────────────────────
+                let app = state.app.clone();
+                let pl_url = url.clone();
+                let pl_file_name = file_name.to_string();
+                let pl_referer = referer.clone();
+                let pl_tx = tx.clone();
+                let threads = payload["threads"].as_u64().unwrap_or(8) as u32;
+
+                tokio::spawn(async move {
+                    match playlist::queue_playlist_download(
+                        &app, &pl_url,
+                        Some(&pl_file_name),
+                        pl_referer.as_deref(),
+                        threads,
+                    ).await {
+                        Ok((playlist_id, total, title, folder)) => {
+                            // Schedule the playlist, broadcast queued event.
+                            playlist::schedule_playlist_job(app.clone(), playlist_id.clone());
+                            app.ws_clients.broadcast_playlist_queued(
+                                &playlist_id, total, total, &folder, &title,
+                            );
+                            let _ = pl_tx.send(
+                                serde_json::json!({
+                                    "type": "PLAYLIST_QUEUED",
+                                    "playlistId": playlist_id,
+                                    "count": total,
+                                    "total": total,
+                                    "folder": folder,
+                                    "title": title,
+                                })
+                                .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = pl_tx.send(
+                                serde_json::json!({
+                                    "type": "DOWNLOAD_ERROR",
+                                    "downloadId": null,
+                                    "error": e,
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                });
+                return;
+            }
+
+            // ── Single download ───────────────────────────────────────────
             let download_id = uuid::Uuid::new_v4().to_string();
 
             let app_state = state.app.clone();
@@ -479,40 +555,66 @@ async fn handle_message(
         }
 
         "PAUSE_DOWNLOAD" => {
+            // Check playlist jobs first (backend parity).
             if let Some(id) = data["downloadId"].as_str() {
-                let _ = download::pause_download_job(&state.app, id).await;
+                if playlist::is_playlist_running(id) {
+                    playlist::pause_playlist_job(id);
+                } else {
+                    let _ = download::pause_download_job(&state.app, id).await;
+                }
             }
         }
 
         "RESUME_DOWNLOAD" => {
             if let Some(id) = data["downloadId"].as_str() {
-                let app = state.app.clone();
-                let id = id.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = download::resume_download_job(app, &id).await {
-                        log::error!("RESUME_DOWNLOAD failed: {}", e);
-                    }
-                });
+                // Check if it's a playlist job
+                if let Ok(Some(_)) = state.app.db.get_playlist_job(id) {
+                    let app = state.app.clone();
+                    let id = id.to_string();
+                    tokio::spawn(async move {
+                        playlist::resume_playlist_job(app, &id);
+                    });
+                } else {
+                    let app = state.app.clone();
+                    let id = id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = download::resume_download_job(app, &id).await {
+                            log::error!("RESUME_DOWNLOAD failed: {}", e);
+                        }
+                    });
+                }
             }
         }
 
         "CANCEL_DOWNLOAD" => {
-            // Kills the engine process, cleans up files, deletes DB row — backend parity.
+            // Check playlist jobs first (backend parity).
             if let Some(id) = data["downloadId"].as_str() {
-                let _ = download::cancel_download_job(&state.app, id).await;
+                if playlist::is_playlist_running(id) {
+                    playlist::cancel_playlist_job(&state.app, id);
+                } else {
+                    let _ = download::cancel_download_job(&state.app, id).await;
+                }
             }
         }
 
         "REMOVE_DOWNLOAD" => {
             // Remove from history only (keeps any completed file on disk) — backend parity.
             if let Some(id) = data["downloadId"].as_str() {
-                let is_running = {
-                    let engines = state.app.active_engines.lock().unwrap();
-                    engines.contains_key(id)
-                };
-                if !is_running {
-                    let _ = state.app.db.delete_download(id);
-                    state.app.ws_clients.broadcast_removed(id);
+                // Check playlist jobs first
+                if let Ok(Some(_)) = state.app.db.get_playlist_job(id) {
+                    if !playlist::is_playlist_running(id) {
+                        let _ = state.app.db.delete_playlist_job(id);
+                        state.app.ws_clients.broadcast_playlist_removed(id);
+                    }
+                } else {
+                    let is_running = {
+                        let engines = state.app.active_engines.lock().unwrap();
+                        engines.contains_key(id)
+                    };
+                    if !is_running {
+                        let _ = state.app.db.delete_download(id);
+                        state.app.ws_clients.broadcast_removed(id);
+                    }
                 }
             }
         }

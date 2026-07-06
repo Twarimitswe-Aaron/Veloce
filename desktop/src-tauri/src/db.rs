@@ -295,4 +295,136 @@ impl Database {
         let count: i64 = stmt.query_row(params![url], |row| row.get(0))?;
         Ok(count > 0)
     }
+
+    // ── Playlist Jobs ─────────────────────────────────────────────────────
+
+    pub fn insert_playlist_job(&self, row: &PlaylistJobRow) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO playlist_jobs (id, device_id, playlist_url, title, save_dir, status, current_index, total_tracks, completed_tracks, failed_tracks, entries, settings, referer, threads, current_track_title, error, failed_indices, downloaded_bytes, total_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                row.id, row.device_id, row.playlist_url, row.title, row.save_dir,
+                row.status, row.current_index, row.total_tracks, row.completed_tracks,
+                row.failed_tracks, row.entries, row.settings, row.referer, row.threads,
+                row.current_track_title, row.error, row.failed_indices,
+                row.downloaded_bytes, row.total_bytes, row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_playlist_job(&self, id: &str, patch: &serde_json::Value) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut sets = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(obj) = patch.as_object() {
+            for (key, value) in obj {
+                match key.as_str() {
+                    "status" | "current_track_title" | "error" | "failed_indices" => {
+                        if let Some(s) = value.as_str() {
+                            sets.push(format!("{} = ?{}", key, sets.len() + 1));
+                            params_vec.push(Box::new(s.to_string()));
+                        } else {
+                            sets.push(format!("{} = NULL", key));
+                        }
+                    }
+                    "current_index" | "completed_tracks" | "failed_tracks" | "downloaded_bytes" | "total_bytes" => {
+                        if let Some(n) = value.as_i64() {
+                            sets.push(format!("{} = ?{}", key, sets.len() + 1));
+                            params_vec.push(Box::new(n));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "UPDATE playlist_jobs SET {} WHERE id = ?{}",
+            sets.join(", "),
+            sets.len() + 1
+        );
+        params_vec.push(Box::new(id.to_string()));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, params_refs.as_slice())?;
+        Ok(())
+    }
+
+    pub fn get_playlist_job(&self, id: &str) -> Result<Option<PlaylistJobRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, playlist_url, title, save_dir, status, current_index, total_tracks, completed_tracks, failed_tracks, entries, settings, referer, threads, current_track_title, error, failed_indices, downloaded_bytes, total_bytes, created_at
+             FROM playlist_jobs WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(playlist_row_from_stmt(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_active_playlist_jobs(&self, device_id: &str) -> Result<Vec<PlaylistJobRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, playlist_url, title, save_dir, status, current_index, total_tracks, completed_tracks, failed_tracks, entries, settings, referer, threads, current_track_title, error, failed_indices, downloaded_bytes, total_bytes, created_at
+             FROM playlist_jobs WHERE device_id = ?1 AND status NOT IN ('completed', 'cancelled')
+             ORDER BY created_at DESC LIMIT 20"
+        )?;
+        let rows = stmt.query_map(params![device_id], |row| playlist_row_from_stmt(row))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_playlist_job(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM playlist_jobs WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn has_active_playlist_for_url(&self, device_id: &str, playlist_url: &str) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM playlist_jobs WHERE device_id = ?1 AND playlist_url = ?2 AND status IN ('queued', 'downloading', 'paused') LIMIT 1"
+        )?;
+        let mut rows = stmt.query(params![device_id, playlist_url])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+fn playlist_row_from_stmt(row: &rusqlite::Row) -> rusqlite::Result<PlaylistJobRow> {
+    Ok(PlaylistJobRow {
+        id: row.get(0)?,
+        device_id: row.get(1)?,
+        playlist_url: row.get(2)?,
+        title: row.get(3)?,
+        save_dir: row.get(4)?,
+        status: row.get(5)?,
+        current_index: row.get(6)?,
+        total_tracks: row.get(7)?,
+        completed_tracks: row.get(8)?,
+        failed_tracks: row.get(9)?,
+        entries: row.get(10)?,
+        settings: row.get(11)?,
+        referer: row.get(12)?,
+        threads: row.get(13)?,
+        current_track_title: row.get(14)?,
+        error: row.get(15)?,
+        failed_indices: row.get(16)?,
+        downloaded_bytes: row.get(17)?,
+        total_bytes: row.get(18)?,
+        created_at: row.get(19)?,
+    })
 }

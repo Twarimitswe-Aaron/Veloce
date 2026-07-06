@@ -3,6 +3,7 @@ pub mod db;
 pub mod download;
 pub mod engine;
 pub mod formats;
+pub mod playlist;
 pub mod scheduler;
 pub mod state;
 pub mod util;
