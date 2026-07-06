@@ -104,7 +104,8 @@ pub async fn queue_playlist_download(
 
     // Create save directory: base/playlists/<title>/
     let playlist_dir_name = util::sanitize_filename(&title);
-    let save_dir = config.base_directory().join("playlists").join(&playlist_dir_name);
+    let (base_dir, _, _) = state.get_runtime_settings();
+    let save_dir = base_dir.join("playlists").join(&playlist_dir_name);
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create playlist directory: {}", e))?;
 

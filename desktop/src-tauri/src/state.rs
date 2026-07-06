@@ -46,6 +46,15 @@ pub struct StatusEvent {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadAddedEvent {
+    pub id: String,
+    pub url: String,
+    pub file_name: String,
+    pub save_path: String,
+    pub status: String,
+}
+
 /// Playlist progress update payload emitted via Tauri events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistProgressEvent {
@@ -134,6 +143,30 @@ impl AppState {
             app_handle: Mutex::new(None),
             runtime_handle,
         }
+    }
+
+    pub fn get_runtime_settings(&self) -> (std::path::PathBuf, u32, u32) {
+        let config = crate::config::Config::from_env();
+        let mut save_dir = config.base_directory();
+        let mut default_threads = config.default_threads;
+        let mut max_concurrent = config.max_concurrent_downloads;
+
+        if let Ok(Some(s)) = self.db.get_device_settings("desktop") {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(dir) = json.get("base_dir").and_then(|v| v.as_str()) {
+                    if !dir.is_empty() {
+                        save_dir = std::path::PathBuf::from(dir);
+                    }
+                }
+                if let Some(t) = json.get("default_threads").and_then(|v| v.as_u64()) {
+                    default_threads = t as u32;
+                }
+                if let Some(c) = json.get("max_concurrent").and_then(|v| v.as_u64()) {
+                    max_concurrent = c as u32;
+                }
+            }
+        }
+        (save_dir, max_concurrent, default_threads)
     }
 
     pub fn set_app_handle(&self, handle: AppHandle) {
@@ -236,6 +269,19 @@ impl AppState {
             flags.remove(id);
         }
         self.scheduler.finish(id);
+    }
+
+    pub fn emit_download_added(&self, id: &str, url: &str, file_name: &str, save_path: &str, status: &str) {
+        if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
+            let event = DownloadAddedEvent {
+                id: id.to_string(),
+                url: url.to_string(),
+                file_name: file_name.to_string(),
+                save_path: save_path.to_string(),
+                status: status.to_string(),
+            };
+            let _ = app.emit("download-added", &event);
+        }
     }
 
     pub fn emit_playlist_update(&self, event: &PlaylistProgressEvent) {

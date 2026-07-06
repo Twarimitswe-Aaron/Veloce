@@ -101,6 +101,42 @@
   let baseDir = "";
   let maxConcurrent = 10;
   let defaultThreads = 8;
+  let settingsLoaded = false;
+
+  async function loadSettings() {
+    try {
+      const s: any = await invoke("get_settings");
+      if (s) {
+        baseDir = s.base_dir || "";
+        maxConcurrent = s.max_concurrent || 10;
+        defaultThreads = s.default_threads || 8;
+      }
+      settingsLoaded = true;
+    } catch (e) {
+      console.error("Failed to load settings", e);
+      settingsLoaded = true;
+    }
+  }
+
+  async function saveSettings() {
+    if (!settingsLoaded) return;
+    try {
+      await invoke("update_settings", {
+        settings: JSON.stringify({
+          base_dir: baseDir,
+          max_concurrent: maxConcurrent,
+          default_threads: defaultThreads,
+        })
+      });
+    } catch (e) {
+      console.error("Failed to save settings", e);
+    }
+  }
+
+  // Auto-save settings when they change
+  $effect(() => {
+    saveSettings();
+  });
 
   // Cached file stats per playlist (populated on completion).
   let playlistFileStats: Record<string, { fileCount: number; totalSize: number }> = {};
@@ -145,6 +181,25 @@
         eta_secs: 0,
         progress_pct: 0,
         error: s.error,
+      });
+      if (s.status === "completed" || s.status === "failed") {
+        loadHistory(false);
+      }
+    });
+
+    listen<any>("download-added", (event) => {
+      const d = event.payload;
+      upsertDownload({
+        id: d.id,
+        url: d.url,
+        file_name: d.file_name,
+        save_path: d.save_path,
+        status: d.status,
+        downloaded: 0,
+        total: 0,
+        speed_bps: 0,
+        eta_secs: 0,
+        progress_pct: 0,
       });
     });
 
@@ -210,14 +265,8 @@
       console.error("Failed to load statuses", e);
     }
 
-    try {
-      const config = await invoke<any>("get_config");
-      baseDir = config.base_dir || "";
-      maxConcurrent = config.max_concurrent_downloads || 10;
-      defaultThreads = config.default_threads || 8;
-    } catch (e) {
-      console.error("Failed to load config", e);
-    }
+    await loadSettings();
+
   });
 
   onDestroy(() => {
@@ -284,13 +333,30 @@
     }
   }
 
-  async function loadHistory() {
+  async function loadHistory(switchTab = true) {
     try {
       history = await invoke<any[]>("get_history");
-      activeTab = "history";
+      if (switchTab) activeTab = "history";
     } catch (e) {
       console.error("Failed to load history", e);
     }
+  }
+
+  async function openFolder(path: string) {
+    try {
+      const dir = path.substring(0, path.lastIndexOf('/')) || path.substring(0, path.lastIndexOf('\\'));
+      await open(dir);
+    } catch(e) { console.error(e); }
+  }
+
+  async function openFile(path: string) {
+    try {
+      await open(path);
+    } catch(e) { console.error(e); }
+  }
+
+  function clearDownload(id: string) {
+    downloads = downloads.filter(d => d.id !== id);
   }
 
   function closeFormatMenu() {
@@ -434,7 +500,7 @@
       <button
         class="tab"
         class:active={activeTab === "history"}
-        onclick={loadHistory}
+        onclick={() => loadHistory()}
       >History</button>
       <button
         class="tab"
@@ -539,6 +605,13 @@
                   <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
                 {:else if dl.status === "paused"}
                   <button onclick={() => startDownload(dl.url, null, dl.file_name)}>Resume</button>
+                {:else if dl.status === "completed"}
+                  <button onclick={() => openFile(dl.save_path)}>Open File</button>
+                  <button onclick={() => openFolder(dl.save_path)}>Open Folder</button>
+                  <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
+                {:else if dl.status === "failed"}
+                  <button onclick={() => startDownload(dl.url, null, dl.file_name)}>Retry</button>
+                  <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
                 {/if}
               </div>
               {#if dl.error}
@@ -667,6 +740,10 @@
               <span class="hist-status">{item.status}</span>
               <span class="hist-size">{formatBytes(item.total_bytes || 0)}</span>
               <span class="hist-path" title={item.save_path}>{item.save_path}</span>
+              <div class="hist-actions">
+                  <button onclick={() => openFile(item.save_path)}>Open File</button>
+                  <button onclick={() => openFolder(item.save_path)}>Open Folder</button>
+              </div>
             </div>
           {/each}
         </div>
@@ -680,10 +757,10 @@
       <div class="settings-group">
         <label>
           <span>Base Directory</span>
-          <input type="text" bind:value={baseDir} disabled placeholder="~/Downloads/Veloce" />
+          <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
         </label>
         <label>
-          <span>Max Concurrent Downloads</span>
+          <span>Max Concurrent Downloads (Queue)</span>
           <input type="number" bind:value={maxConcurrent} min="1" max="50" />
         </label>
         <label>
@@ -1158,8 +1235,11 @@
 
   .hist-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
   .hist-status { font-size: 10px; text-transform: uppercase; color: var(--veloce-muted); flex-shrink: 0; }
-  .hist-size { color: var(--veloce-muted); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .hist-size { color: var(--veloce-muted); width: 80px; text-align: right; }
   .hist-path { color: var(--veloce-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+  .hist-actions { display: flex; gap: 0.5rem; }
+  .hist-actions button { padding: 4px 8px; font-size: 10px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.1); background: rgba(0, 0, 0, 0.2); color: var(--veloce-text); cursor: pointer; }
+  .hist-actions button:hover { background: rgba(255, 255, 255, 0.1); }
 
   /* ── Playlist Items ──────────────────────────────────── */
 

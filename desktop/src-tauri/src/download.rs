@@ -286,7 +286,7 @@ pub async fn enqueue_download_job(
     let config = Config::from_env();
     let download_id = req.download_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     log::info!("[Step 2: Enqueue Job] ID: {}, URL: {}", download_id, req.url);
-    let save_dir = config.base_directory();
+    let (save_dir, _, _) = state.get_runtime_settings();
 
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create save directory: {}", e))?;
@@ -348,6 +348,14 @@ pub async fn enqueue_download_job(
             .insert_download(&row)
             .map_err(|e| format!("DB error: {}", e))?;
     }
+    
+    state.emit_download_added(
+        &download_id,
+        &req.url,
+        &safe_name,
+        &save_path_str,
+        "queued"
+    );
 
     let source = formats::detect_source(&req.url);
     let status = DownloadStatus {
@@ -437,11 +445,13 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         }
     };
 
+    let (_, _, default_threads) = state.get_runtime_settings();
+    
     match EngineProcess::spawn(
         download_id.clone(),
         &download_url,
         &save_path_str,
-        config.default_threads,
+        default_threads,
         config.max_rate_bytes,
         config.engine_quiet,
         config.engine_read_buffer_bytes,
