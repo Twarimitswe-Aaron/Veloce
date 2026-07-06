@@ -6,6 +6,13 @@ use veloce_desktop_lib::formats::{
 };
 use veloce_desktop_lib::ytdlp;
 
+/// Enable with VELOCE_LIVE_MF=1 cargo test live_mediafire -- --ignored --nocapture
+const LIVE_MF_VAR: &str = "VELOCE_LIVE_MF";
+
+fn live_mf_enabled() -> bool {
+    std::env::var(LIVE_MF_VAR).ok().as_deref() == Some("1")
+}
+
 /// Parity with backend/tests/extractor.test.ts and formatSources.test.ts.
 #[test]
 fn backend_parity_direct_file_detection() {
