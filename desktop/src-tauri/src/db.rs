@@ -296,6 +296,44 @@ impl Database {
         Ok(count > 0)
     }
 
+    pub fn get_download_by_url(&self, url: &str, direct_url: Option<&str>) -> Result<Option<DownloadRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        // Exact match on url, or if direct_url is provided, match that too.
+        let mut stmt = if direct_url.is_some() {
+            conn.prepare(
+                "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
+                 FROM downloads WHERE url = ?1 AND direct_url = ?2 ORDER BY rowid DESC LIMIT 1"
+            )?
+        } else {
+            conn.prepare(
+                "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
+                 FROM downloads WHERE url = ?1 ORDER BY rowid DESC LIMIT 1"
+            )?
+        };
+
+        let mut rows = if let Some(du) = direct_url {
+            stmt.query(params![url, du])?
+        } else {
+            stmt.query(params![url])?
+        };
+
+        match rows.next()? {
+            Some(row) => Ok(Some(DownloadRow {
+                id: row.get(0)?,
+                device_id: row.get(1)?,
+                url: row.get(2)?,
+                direct_url: row.get(3)?,
+                referer: row.get(4)?,
+                file_name: row.get(5)?,
+                save_path: row.get(6)?,
+                status: row.get(7)?,
+                total_bytes: row.get(8)?,
+                downloaded_bytes: row.get(9)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
     // ── Playlist Jobs ─────────────────────────────────────────────────────
 
     pub fn insert_playlist_job(&self, row: &PlaylistJobRow) -> Result<(), rusqlite::Error> {

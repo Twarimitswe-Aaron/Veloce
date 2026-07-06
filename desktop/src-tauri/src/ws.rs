@@ -152,6 +152,33 @@ pub struct WsState {
 }
 
 pub async fn start_ws_server(app: Arc<AppState>, clients: Arc<WsClients>, port: u16) {
+    // Startup reconciliation (backend parity)
+    if let Ok(interrupted) = app.db.list_interrupted_downloads() {
+        for row in interrupted {
+            log::info!("Reconciling interrupted download on startup: {}", row.id);
+            let _ = app.db.update_download_status(&row.id, "queued");
+            
+            let job = crate::scheduler::JobState {
+                id: row.id.clone(),
+                url: row.url.clone(),
+                direct_url: row.direct_url.clone(),
+                file_name: row.file_name.clone(),
+                save_path: row.save_path.clone(),
+                status: "queued".to_string(),
+                downloaded: row.downloaded_bytes.unwrap_or(0) as u64,
+                total: row.total_bytes.unwrap_or(0) as u64,
+                speed_bps: 0,
+                eta_secs: 0,
+                is_playlist: false,
+                error: None,
+            };
+            app.scheduler.enqueue(job);
+        }
+        if app.scheduler.queue_depth() > 0 {
+            crate::download::pump_scheduler(app.clone());
+        }
+    }
+
     let ws_state = Arc::new(WsState {
         app,
         clients: clients.clone(),
@@ -260,6 +287,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 }
 
 fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
+    // Register the extension device so foreign-key constraints don't fail on download inserts.
+    let _ = app.db.upsert_device("extension");
+
     let config = Config::from_env();
     let _ = tx.send(
         serde_json::json!({
@@ -520,7 +550,29 @@ async fn handle_message(
             }
 
             // ── Single download ───────────────────────────────────────────
-            let download_id = uuid::Uuid::new_v4().to_string();
+            let mut download_id = uuid::Uuid::new_v4().to_string();
+
+            // Deduplication & Resume (backend parity)
+            if let Ok(Some(existing)) = state.app.db.get_download_by_url(&url, direct_url.as_deref()) {
+                let status = existing.status.as_str();
+                if ["queued", "downloading", "completed"].contains(&status) {
+                    log::info!("NEW_DOWNLOAD deduplicated (status {}): {}", status, existing.id);
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "DOWNLOAD_ACK",
+                            "downloadId": existing.id,
+                            "fileName": existing.file_name,
+                            "status": status,
+                        })
+                        .to_string(),
+                    );
+                    return;
+                } else {
+                    // paused, error, cancelled, failed -> resume
+                    log::info!("NEW_DOWNLOAD resuming existing download: {}", existing.id);
+                    download_id = existing.id.clone();
+                }
+            }
 
             let app_state = state.app.clone();
             let req = StartDownloadRequest {
@@ -533,9 +585,25 @@ async fn handle_message(
                 save_path: None,
             };
 
+            // Clone tx so the spawned task can send responses back to this client.
+            let task_tx = tx.clone();
+
             tokio::spawn(async move {
-                if let Err(e) = download::start_download_job(app_state, req).await {
-                    log::error!("NEW_DOWNLOAD failed: {}", e);
+                match download::enqueue_download_job(app_state, req).await {
+                    Ok(id) => {
+                        log::info!("NEW_DOWNLOAD enqueued: {}", id);
+                    }
+                    Err(e) => {
+                        log::error!("NEW_DOWNLOAD failed: {}", e);
+                        let _ = task_tx.send(
+                            serde_json::json!({
+                                "type": "DOWNLOAD_ERROR",
+                                "downloadId": null,
+                                "error": e,
+                            })
+                            .to_string(),
+                        );
+                    }
                 }
             });
         }

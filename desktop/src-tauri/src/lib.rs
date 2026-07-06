@@ -36,7 +36,7 @@ async fn start_download(
     referer: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    download::start_download_job(
+    download::enqueue_download_job(
         state.inner().clone(),
         StartDownloadRequest {
             url,

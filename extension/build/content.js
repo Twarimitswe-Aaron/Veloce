@@ -468,7 +468,14 @@
 			box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
 		}
 		.badge:hover { background: #002a55; }
-		.badge-loading { opacity: 0.7; }
+		.badge-loading {
+			opacity: 0.7;
+			animation: veloce-pulse 1.2s ease-in-out infinite;
+		}
+		@keyframes veloce-pulse {
+			0%, 100% { opacity: 0.7; box-shadow: 0 2px 8px rgba(0,0,0,0.45); }
+			50% { opacity: 1; box-shadow: 0 2px 14px rgba(0, 255, 157, 0.25); }
+		}
 		.badge-ready { opacity: 1; }
 		.badge-ready::after {
 			content: '';
@@ -1201,6 +1208,10 @@
 				interceptLog('prefetch failed (background)', { url: msg.url, prefetch: msg.prefetch });
 				prefetchStarted.delete(normalizeBadgeKey(msg.url));
 			}
+			if (msg.type === 'VELOCE_DOWNLOAD_CANCELLED') {
+				interceptLog('download cancelled', { fileName: msg.fileName });
+				showVeloceToast(`Veloce: cancelled ${msg.fileName || 'download'}`, true);
+			}
 		});
 	}
 
@@ -1226,7 +1237,8 @@
 	}
 
 	function clickTargetsVeloceUi(e) {
-		return e.composedPath().some((n) => {
+		const path = e.composedPath();
+		const result = path.some((n) => {
 			if (!n?.classList) return false;
 			return n.classList.contains('menu')
 				|| n.classList.contains('menu-close')
@@ -1234,6 +1246,16 @@
 				|| n.classList.contains('badge')
 				|| n.classList.contains('badge-close');
 		});
+		// Debug: log when click is on a menu-item but we fail to detect it
+		const target = path[0];
+		if (target?.classList?.contains?.('menu-item') && !result) {
+			console.log('[Veloce DEBUG] clickTargetsVeloceUi FALSE for menu-item!', {
+				classes: [...target.classList],
+				pathLen: path.length,
+				pathTypes: path.map(n => n?.nodeName || typeof n)
+			});
+		}
+		return result;
 	}
 
 	function dismissBadge(key, anchor) {
@@ -1292,6 +1314,12 @@
 	document.addEventListener('click', (e) => {
 		if (!openMenu) return;
 		if (clickTargetsVeloceUi(e)) return;
+		const isVeloce = e.composedPath().some(n => n?.id === 'veloce-host' || n?.classList?.contains?.('veloce'));
+		console.log('[Veloce DEBUG] capture-phase closing menu', {
+			target: e.target?.className || e.target?.nodeName,
+			pathLen: e.composedPath().length,
+			isVeloce
+		});
 		closeMenu({ resume: !!pendingLinkIntercept });
 		e.preventDefault();
 		e.stopImmediatePropagation();
@@ -1558,60 +1586,65 @@
 			if (fmt.id === 'best') btn.classList.add('menu-item-recommended');
 			btn.textContent = fmt.label;
 			btn.addEventListener('click', (e) => {
-				e.stopPropagation();
-				menuDownloadChosen = true;
-				closeMenu({ resume: false });
-				const stem = fmt.label.split(' — ')[0] || 'download';
-				const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
-				const pageUrl = location.href.split('#')[0];
-				const sourceUrl = url && url !== fmt.url ? url : pageUrl;
-				const manifest = isManifestFormat(fmt);
-				const useDirect = fmt.url && fmt.id !== 'best' && !manifest;
-				if (!extensionAlive()) {
-					showVeloceToast('Veloce was updated — refresh this page (F5)', true);
-					return;
-				}
-				interceptLog('step I: format picked → NEW_DOWNLOAD', {
-					fileName,
-					sourceUrl,
-					directUrl: useDirect ? fmt.url : undefined,
-					formatId: fmt.id,
-					manifest
-				});
 				try {
-					chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
-						if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
-							markExtensionDead(chrome.runtime.lastError);
-							showVeloceToast('Veloce was updated — refresh this page (F5)', true);
-							return;
-						}
-						const payload = {
-							url: sourceUrl,
-							directUrl: useDirect ? fmt.url : undefined,
-							pageUrl,
-							referer: pageUrl,
-							fileName,
-							ext: fmt.ext,
-							baseDirectory: cfg.veloce_base_dir || undefined,
-							threads: 8
-						};
-						safeSendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
-							if (!resp?.ok) {
-								if (extensionDead) {
-									showVeloceToast('Veloce was updated — refresh this page (F5)', true);
-									return;
-								}
-								interceptLog('step 7: FAILED — coordinator not reached', { resp });
-								showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
+					e.stopPropagation();
+					menuDownloadChosen = true;
+					closeMenu({ resume: false });
+					const stem = fmt.label.split(' — ')[0] || 'download';
+					const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
+					const pageUrl = location.href.split('#')[0];
+					const sourceUrl = url && url !== fmt.url ? url : pageUrl;
+					const manifest = isManifestFormat(fmt);
+					const useDirect = fmt.url && fmt.id !== 'best' && !manifest;
+					if (!extensionAlive()) {
+						showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+						return;
+					}
+					interceptLog('step I: format picked → NEW_DOWNLOAD', {
+						fileName,
+						sourceUrl,
+						directUrl: useDirect ? fmt.url : undefined,
+						formatId: fmt.id,
+						manifest
+					});
+					try {
+						chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
+							if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
+								markExtensionDead(chrome.runtime.lastError);
+								showVeloceToast('Veloce was updated — refresh this page (F5)', true);
 								return;
 							}
-							interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
-							showVeloceToast(`Veloce: downloading ${fileName}`, false);
+							const payload = {
+								url: sourceUrl,
+								directUrl: useDirect ? fmt.url : undefined,
+								pageUrl,
+								referer: pageUrl,
+								fileName,
+								ext: fmt.ext,
+								baseDirectory: cfg.veloce_base_dir || undefined,
+								threads: 8
+							};
+							safeSendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
+								if (!resp?.ok) {
+									if (extensionDead) {
+										showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+										return;
+									}
+									interceptLog('step 7: FAILED — coordinator not reached', { resp });
+									showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
+									return;
+								}
+								interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
+								showVeloceToast(`Veloce: downloading ${fileName}`, false);
+							});
 						});
-					});
-				} catch (e) {
-					if (isExtensionInvalidatedError(e)) markExtensionDead(e);
-					showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+					} catch (e) {
+						if (isExtensionInvalidatedError(e)) markExtensionDead(e);
+						showVeloceToast('Veloce was updated — refresh this page (F5)', true);
+					}
+				} catch (clickErr) {
+					console.error('[Veloce] Format button click error:', clickErr);
+					showVeloceToast('Veloce: ' + (clickErr?.message || String(clickErr)), true);
 				}
 			});
 			menu.insertBefore(btn, closeBtn);

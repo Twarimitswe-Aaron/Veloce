@@ -356,6 +356,13 @@ function handleWsMessage(data) {
 		case 'DOWNLOAD_PAUSED':
 			upsertDownload(data.downloadId, { status: 'paused', speedBps: 0, etaSecs: 0 });
 			break;
+		case 'DOWNLOAD_CANCELLED': {
+			const name = downloads[data.downloadId]?.fileName ?? 'Download';
+			delete downloads[data.downloadId];
+			broadcastToExtension({ type: 'VELOCE_DOWNLOAD_CANCELLED', fileName: name });
+			broadcastToExtension({ type: 'VELOCE_DOWNLOAD_REMOVED', downloadId: data.downloadId });
+			break;
+		}
 		case 'DOWNLOAD_REMOVED':
 			delete downloads[data.downloadId];
 			broadcastToExtension({ type: 'VELOCE_DOWNLOAD_REMOVED', downloadId: data.downloadId });

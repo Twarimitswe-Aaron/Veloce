@@ -232,16 +232,23 @@ pub struct StartDownloadRequest {
 }
 
 /// Resolve the HTTP URL the engine should fetch.
-pub fn resolve_download_url(
+pub async fn resolve_download_url(
     state: &AppState,
     page_url: &str,
     direct_url: Option<&str>,
 ) -> Result<String, String> {
+    if formats::detect_source(page_url) == formats::MediaSource::MediaFire {
+        let info = formats::resolve_mediafire(page_url).await?;
+        return Ok(info.direct_url);
+    }
+
     if let Some(direct) = direct_url.filter(|u| !u.is_empty()) {
-        if !util::is_safe_download_url(direct) {
-            return Err("Blocked: direct URL points to a private or local network address".to_string());
+        if !formats::is_manifest_format_url(direct) {
+            if !util::is_safe_download_url(direct) {
+                return Err("Blocked: direct URL points to a private or local network address".to_string());
+            }
+            return Ok(direct.to_string());
         }
-        return Ok(direct.to_string());
     }
 
     if formats::is_direct_file_url(page_url) || formats::is_github_raw_url(page_url) {
@@ -257,13 +264,17 @@ pub fn resolve_download_url(
         return Ok(cached);
     }
 
-    let extracted = ytdlp::extract_best_url(&normalized)?;
+    let norm_clone = normalized.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        ytdlp::extract_best_url(&norm_clone)
+    }).await.map_err(|e| format!("yt-dlp task failed: {}", e))??;
+
     state.best_url_cache.set(&normalized, &extracted);
     Ok(extracted)
 }
 
-/// Start a download job (shared by Tauri IPC and WebSocket).
-pub async fn start_download_job(
+/// Enqueue a download job (shared by Tauri IPC and WebSocket).
+pub async fn enqueue_download_job(
     state: Arc<AppState>,
     req: StartDownloadRequest,
 ) -> Result<String, String> {
@@ -274,7 +285,25 @@ pub async fn start_download_job(
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create save directory: {}", e))?;
 
-    let safe_name = util::sanitize_filename(&req.file_name);
+    let download_url = resolve_download_url(&state, &req.url, req.direct_url.as_deref()).await?;
+
+    let mut safe_name = util::sanitize_filename(&req.file_name);
+    if (safe_name.starts_with("file") || safe_name.starts_with("download_file")) && req.direct_url.is_none() {
+        if let Ok(u) = url::Url::parse(&download_url) {
+            if let Some(segments) = u.path_segments() {
+                if let Some(last) = segments.last() {
+                    if last.contains('.') {
+                        let decoded = percent_encoding::percent_decode_str(last).decode_utf8_lossy();
+                        let new_name = decoded.replace('+', " ");
+                        if !new_name.is_empty() {
+                            safe_name = util::sanitize_filename(&new_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let save_path = if let Some(path) = req.save_path.as_ref() {
         std::path::PathBuf::from(path)
     } else {
@@ -293,10 +322,8 @@ pub async fn start_download_job(
         }
     }
 
-    let download_url = resolve_download_url(&state, &req.url, req.direct_url.as_deref())?;
-
-    if state.db.get_download(&download_id).ok().flatten().is_some() {
-        let _ = state.db.update_download_status(&download_id, "downloading");
+    if let Ok(Some(_)) = state.db.get_download(&download_id) {
+        let _ = state.db.update_download_status(&download_id, "queued");
     } else {
         let row = db::DownloadRow {
             id: download_id.clone(),
@@ -306,7 +333,7 @@ pub async fn start_download_job(
             referer: req.referer.clone(),
             file_name: safe_name.clone(),
             save_path: save_path_str.clone(),
-            status: "downloading".to_string(),
+            status: "queued".to_string(),
             total_bytes: None,
             downloaded_bytes: Some(0),
         };
@@ -322,7 +349,7 @@ pub async fn start_download_job(
         url: req.url.clone(),
         file_name: safe_name.clone(),
         save_path: save_path_str.clone(),
-        status: "downloading".to_string(),
+        status: "queued".to_string(),
         downloaded: 0,
         total: 0,
         speed_bps: 0,
@@ -334,7 +361,48 @@ pub async fn start_download_job(
     state.track_download(status).await;
     state
         .ws_clients
-        .broadcast_ack(&download_id, &safe_name, "downloading");
+        .broadcast_ack(&download_id, &safe_name, "queued");
+
+    let job_state = crate::scheduler::JobState {
+        id: download_id.clone(),
+        url: req.url.clone(),
+        direct_url: Some(download_url.clone()),
+        file_name: safe_name.clone(),
+        save_path: save_path_str.clone(),
+        status: "queued".to_string(),
+        downloaded: 0,
+        total: 0,
+        speed_bps: 0,
+        eta_secs: 0,
+        is_playlist: false,
+        error: None,
+    };
+
+    state.scheduler.enqueue(job_state);
+    pump_scheduler(state.clone());
+
+    Ok(download_id)
+}
+
+pub fn pump_scheduler(state: Arc<AppState>) {
+    while let Some(job) = state.scheduler.dequeue() {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let referer = state_clone.db.get_download(&job.id).ok().flatten().and_then(|r| r.referer);
+            if let Err(e) = start_engine_for_job(state_clone, job, referer).await {
+                log::error!("pump_scheduler engine spawn error: {}", e);
+            }
+        });
+    }
+}
+
+async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobState, referer: Option<String>) -> Result<(), String> {
+    let config = Config::from_env();
+    let download_id = job.id;
+    let download_url = job.direct_url.unwrap_or(job.url);
+    let save_path_str = job.save_path;
+
+    let _ = state.db.update_download_status(&download_id, "downloading");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -344,7 +412,6 @@ pub async fn start_download_job(
 
     let state_spawn = state.clone();
     let id_spawn = download_id.clone();
-    let referer = req.referer.clone();
 
     let on_progress = {
         let state_prog = state.clone();
@@ -416,20 +483,24 @@ pub async fn start_download_job(
                 let _ = state_mon.db.update_download_status(&id_mon, &exit_status);
 
                 runtime_handle.block_on(async {
+                    state_mon.scheduler.finish(&id_mon);
                     state_mon.emit_status(&id_mon, &exit_status, error.clone()).await;
                     state_mon.remove_active(&id_mon).await;
+                    pump_scheduler(state_mon.clone());
                 });
             });
 
-            Ok(download_id)
+            Ok(())
         }
         Err(e) => {
             {
                 let mut flags = state.cancellation_flags.lock().unwrap();
                 flags.remove(&download_id);
             }
+            state.scheduler.finish(&download_id);
             let _ = state.db.update_download_status(&download_id, "failed");
             state.emit_status(&download_id, "failed", Some(e.clone())).await;
+            pump_scheduler(state.clone());
             Err(format!("Failed to start engine: {}", e))
         }
     }
@@ -546,7 +617,7 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
 
     state.ws_clients.broadcast_ack(id, &row.file_name, "queued");
 
-    start_download_job(
+    enqueue_download_job(
         state,
         StartDownloadRequest {
             url: row.url.clone(),
@@ -670,6 +741,7 @@ mod tests {
             "https://www.youtube.com/watch?v=x",
             Some("https://cdn.example.com/direct.mp4"),
         )
+        .await
         .expect("direct");
         assert_eq!(url, "https://cdn.example.com/direct.mp4");
     }
@@ -682,6 +754,7 @@ mod tests {
             "https://cdn.example.com/file.mp4",
             None,
         )
+        .await
         .expect("page direct");
         assert_eq!(url, "https://cdn.example.com/file.mp4");
     }
@@ -694,6 +767,7 @@ mod tests {
             "https://example.com/x",
             Some("http://127.0.0.1/internal"),
         )
+        .await
         .unwrap_err();
         assert!(err.contains("Blocked"));
     }
