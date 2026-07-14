@@ -24,8 +24,8 @@ CLI args → safety checks (URL / threads / base-dir)
 | **File size** | Reject discoveries > 512 GiB or > 1M pieces |
 | **Piece overrun** | Stream writes stop at piece end (no neighbour corruption) |
 | **`--base-dir`** | `save_path` must resolve under this root (path traversal guard) |
-| **Sidecar** | `.veloce_done` only counted complete if file exists and size matches |
-| **Resume validators** | If server sends ETag/Last-Modified, state must match |
+| **Sidecar** | Hidden `{parent}/.veloce/{name}.done` (legacy `{save}.veloce_done` migrated); only complete if file size matches |
+| **Resume validators** | Soft: size + piece bitmap win; ETag/LM rotation alone does not wipe resume (tokenized CDNs) |
 
 Coordinators must still re-validate **post-extract** URLs (yt-dlp / MediaFire) before spawn — desktop and backend do this.
 

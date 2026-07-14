@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { open } from "@tauri-apps/plugin-shell";
+  // Note: open/reveal go through Rust commands (cross-platform, handles spaces).
   import "./app.css";
 
   interface MediaFormat {
@@ -210,18 +210,21 @@
 
     unlistenStatus = await listen<StatusEvent>("download-status", (event) => {
       const s = event.payload;
+      const prev = downloads.find((d) => d.id === s.id);
+      const clearError = ["queued", "downloading", "paused", "completed"].includes(s.status);
       upsertDownload({
         id: s.id,
-        url: "",
-        file_name: downloads.find((d) => d.id === s.id)?.file_name ?? "",
-        save_path: "",
+        url: prev?.url ?? "",
+        file_name: prev?.file_name ?? "",
+        save_path: prev?.save_path ?? "",
         status: s.status,
-        downloaded: 0,
-        total: 0,
+        // Never wipe byte counts on status-only events (pause/retry were resetting to 0%).
+        downloaded: prev?.downloaded ?? 0,
+        total: prev?.total ?? 0,
         speed_bps: 0,
         eta_secs: 0,
-        progress_pct: 0,
-        error: s.error,
+        progress_pct: prev?.progress_pct ?? 0,
+        error: clearError ? undefined : (s.error ?? prev?.error),
       });
       if (s.status === "completed" || s.status === "failed") {
         loadHistory(false);
@@ -230,17 +233,19 @@
 
     listen<any>("download-added", (event) => {
       const d = event.payload;
+      const prev = downloads.find((x) => x.id === d.id);
       upsertDownload({
         id: d.id,
-        url: d.url,
-        file_name: d.file_name,
-        save_path: d.save_path,
+        url: d.url || prev?.url || "",
+        file_name: d.file_name || prev?.file_name || "",
+        save_path: d.save_path || prev?.save_path || "",
         status: d.status,
-        downloaded: 0,
-        total: 0,
+        downloaded: prev?.downloaded ?? 0,
+        total: prev?.total ?? 0,
         speed_bps: 0,
         eta_secs: 0,
-        progress_pct: 0,
+        progress_pct: prev?.progress_pct ?? 0,
+        error: undefined,
       });
     });
 
@@ -429,16 +434,38 @@
   }
 
   async function openFolder(path: string) {
+    if (!path) return;
     try {
-      const dir = path.substring(0, path.lastIndexOf('/')) || path.substring(0, path.lastIndexOf('\\'));
-      await open(dir);
-    } catch(e) { console.error(e); }
+      await invoke("reveal_in_folder", { path });
+    } catch (e) {
+      console.error(e);
+      try {
+        const dir =
+          path.substring(0, path.lastIndexOf("/")) ||
+          path.substring(0, path.lastIndexOf("\\"));
+        if (dir) await invoke("open_path", { path: dir });
+      } catch (e2) {
+        console.error(e2);
+      }
+    }
+  }
+
+  async function openDir(path: string) {
+    if (!path) return;
+    try {
+      await invoke("open_path", { path });
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   async function openFile(path: string) {
+    if (!path) return;
     try {
-      await open(path);
-    } catch(e) { console.error(e); }
+      await invoke("open_path", { path });
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   function clearDownload(id: string) {
@@ -789,7 +816,7 @@
                   {:else}
                     <span class="pl-save-dir-summary">Scanning files…</span>
                   {/if}
-                  <button class="btn-open" onclick={() => open(pl.saveDir)}>Open folder</button>
+                  <button class="btn-open" onclick={() => openDir(pl.saveDir)}>Open folder</button>
                 </div>
               {/if}
               <div class="dl-actions">

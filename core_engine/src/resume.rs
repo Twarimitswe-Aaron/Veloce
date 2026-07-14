@@ -153,21 +153,85 @@ pub fn save_bitmap_atomic(
     fs::rename(tmp, path)
 }
 
+/// Soft CDN validators. Callers must already enforce `total_size` / `piece_size`.
+///
+/// Tokenized hosts (MediaFire, signed S3, etc.) rotate ETag / Last-Modified on
+/// every re-resolve. Hard-matching those would wipe valid piece bitmaps and
+/// restart from zero. We only reject when **both** validators are present on
+/// both sides and **both** differ (strong signal the object was replaced).
 pub fn validators_match(
     state: &ResumeState,
     etag: &Option<String>,
     last_modified: &Option<String>,
 ) -> bool {
-    // Stronger resume: if the server now provides a validator, the state must
-    // carry the same value (missing/mismatched → restart). Prevents silent
-    // resume against a replaced CDN object.
-    if etag.is_some() && state.etag.as_ref() != etag.as_ref() {
-        return false;
+    let etag_mismatch = matches!(
+        (&state.etag, etag),
+        (Some(a), Some(b)) if a != b
+    );
+    let lm_mismatch = matches!(
+        (&state.last_modified, last_modified),
+        (Some(a), Some(b)) if a != b
+    );
+    !(etag_mismatch && lm_mismatch)
+}
+
+/// Hidden resume dir next to the save file: `{parent}/.veloce/{filename}.state|.done`.
+/// Migrates legacy `{save}.veloce_state` / `{save}.veloce_done` on first touch.
+pub fn sidecar_paths(save_path: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let parent = save_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = save_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let dir = parent.join(".veloce");
+    let state = dir.join(format!("{name}.state"));
+    let done = dir.join(format!("{name}.done"));
+    (state, done)
+}
+
+pub fn ensure_sidecar_dir(save_path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let parent = save_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent.join(".veloce");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Resolve state path, migrating legacy adjacent sidecar if present.
+pub fn resolve_state_path(save_path: &Path) -> std::path::PathBuf {
+    let (state, _) = sidecar_paths(save_path);
+    if state.exists() {
+        return state;
     }
-    if last_modified.is_some() && state.last_modified.as_ref() != last_modified.as_ref() {
-        return false;
+    let legacy = Path::new(&format!("{}.veloce_state", save_path.display())).to_path_buf();
+    if legacy.exists() {
+        let _ = ensure_sidecar_dir(save_path);
+        if fs::rename(&legacy, &state).is_err() {
+            if let Ok(bytes) = fs::read(&legacy) {
+                let _ = fs::write(&state, bytes);
+                let _ = fs::remove_file(&legacy);
+            }
+        }
     }
-    true
+    state
+}
+
+/// Resolve done sidecar, migrating legacy if present.
+pub fn resolve_done_path(save_path: &Path) -> std::path::PathBuf {
+    let (_, done) = sidecar_paths(save_path);
+    if done.exists() {
+        return done;
+    }
+    let legacy = Path::new(&format!("{}.veloce_done", save_path.display())).to_path_buf();
+    if legacy.exists() {
+        let _ = ensure_sidecar_dir(save_path);
+        if fs::rename(&legacy, &done).is_err() {
+            if let Ok(bytes) = fs::read(&legacy) {
+                let _ = fs::write(&done, bytes);
+                let _ = fs::remove_file(&legacy);
+            }
+        }
+    }
+    done
 }
 
 #[cfg(test)]
@@ -250,21 +314,30 @@ mod tests {
     }
 
     #[test]
-    fn validators_mismatch_etag() {
+    fn validators_soft_etag_rotation() {
         let s = sample();
-        assert!(!validators_match(&s, &Some("other".into()), &None));
-        // Sample state etag is "\"abc\"" — same value must still match.
+        // ETag alone rotating (MediaFire CDN) must still resume.
+        assert!(validators_match(&s, &Some("other".into()), &None));
         assert!(validators_match(&s, &Some("\"abc\"".into()), &None));
     }
 
     #[test]
-    fn validators_require_server_etag_when_present() {
+    fn validators_reject_when_both_etag_and_lm_mismatch() {
+        let s = sample();
+        assert!(!validators_match(
+            &s,
+            &Some("other-etag".into()),
+            &Some("other-lm".into()),
+        ));
+        // Matching etags OK even if LM differs
+        assert!(validators_match(&s, &Some("\"abc\"".into()), &Some("Tue".into())));
+    }
+
+    #[test]
+    fn validators_allow_missing_state_etag() {
         let mut s = sample();
         s.etag = None;
-        // Server now has etag, state missing → restart
-        assert!(!validators_match(&s, &Some("\"new\"".into()), &None));
-        // Matching etags OK
-        s.etag = Some("\"new\"".into());
-        assert!(validators_match(&s, &Some("\"new\"".into()), &None));
+        s.last_modified = None;
+        assert!(validators_match(&s, &Some("\"new\"".into()), &Some("Mon".into())));
     }
 }

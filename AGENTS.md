@@ -333,7 +333,7 @@ Range downloader binary spawned by desktop + Node. Full notes: [`core_engine/REA
 | Size / pieces | Max **512 GiB**, max **1M** pieces |
 | Piece writes | Stream clamped to piece end (no neighbour overrun) |
 | `--base-dir` | Save path must resolve under download root |
-| Sidecar / resume | `.veloce_done` needs matching file size; ETag/LM must match when server sends them |
+| Sidecar / resume | Hidden `{parent}/.veloce/{name}.state|.done` (legacy adjacent files migrated); soft ETag/LM (tokenized CDNs); delete state on complete |
 | Quiet / origin | `--quiet` via `elog!`; `--origin` from referer (desktop + backend) |
 | Auto-tune | Sequential probe + early exit (TTFB); skip for MediaFire/Direct/GitHub at coordinator |
 

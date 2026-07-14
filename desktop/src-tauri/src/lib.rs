@@ -108,12 +108,14 @@ async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadSta
                 } else {
                     r.status.clone()
                 };
-                by_id.entry(r.id.clone()).or_insert_with(|| DownloadStatus {
+                let id = r.id.clone();
+                let save_path = r.save_path.clone();
+                by_id.entry(id.clone()).or_insert_with(|| DownloadStatus {
                     id: r.id,
                     url: r.url,
                     file_name: r.file_name,
-                    save_path: r.save_path,
-                    status,
+                    save_path: save_path.clone(),
+                    status: status.clone(),
                     downloaded,
                     total,
                     speed_bps: 0,
@@ -130,6 +132,30 @@ async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadSta
                     },
                     source: None,
                 });
+                if let Some(live) = by_id.get_mut(&id) {
+                    // DB is source of truth for terminal/retryable status when not actively downloading.
+                    if matches!(
+                        status.as_str(),
+                        "queued" | "paused" | "downloading" | "completed"
+                    ) {
+                        if live.status == "failed" || live.status == "error" {
+                            live.status = status.clone();
+                        }
+                        live.error = None;
+                    }
+                    if live.downloaded == 0 && downloaded > 0 {
+                        live.downloaded = downloaded;
+                        live.total = total;
+                        live.progress_pct = if total > 0 {
+                            (downloaded as f64 / total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                    }
+                    if live.save_path.is_empty() && !save_path.is_empty() {
+                        live.save_path = save_path;
+                    }
+                }
             }
         }
     }
@@ -180,6 +206,16 @@ async fn select_directory(state: State<'_, Arc<AppState>>) -> Result<String, Str
         .to_string(),
     );
     Ok(path)
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    util::open_path(&path)
+}
+
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<(), String> {
+    util::reveal_in_folder(&path)
 }
 
 #[tauri::command]
@@ -363,6 +399,8 @@ pub fn run() {
             get_settings,
             update_settings,
             select_directory,
+            open_path,
+            reveal_in_folder,
             queue_playlist,
             list_playlists,
             get_config,

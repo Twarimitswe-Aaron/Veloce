@@ -553,7 +553,21 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                         let code = code_opt;
-                        if cancel_mon.load(Ordering::SeqCst) {
+                        let db_status = state_mon
+                            .db
+                            .get_download(&id_mon)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.status)
+                            .unwrap_or_default();
+                        if db_status == "paused" {
+                            log::info!(
+                                "[Step 5: Engine Exit] {} paused (engine code {:?})",
+                                id_mon,
+                                code
+                            );
+                            ("paused".to_string(), None)
+                        } else if cancel_mon.load(Ordering::SeqCst) || db_status == "cancelled" {
                             log::info!("[Step 5: Engine Exit] {} was cancelled", id_mon);
                             ("cancelled".to_string(), None)
                         } else if code == Some(0) {
@@ -572,7 +586,16 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                     }
                     None => {
                         log::warn!("[Step 5: Engine Exit] Engine process lost for {}", id_mon);
-                        if cancel_mon.load(Ordering::SeqCst) {
+                        let db_status = state_mon
+                            .db
+                            .get_download(&id_mon)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.status)
+                            .unwrap_or_default();
+                        if db_status == "paused" {
+                            ("paused".to_string(), None)
+                        } else if cancel_mon.load(Ordering::SeqCst) || db_status == "cancelled" {
                             ("cancelled".to_string(), None)
                         } else {
                             ("failed".to_string(), Some("Engine process lost".to_string()))
@@ -588,17 +611,34 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                 let current_status = state_mon.db.get_download(&id_mon).ok().flatten().map(|r| r.status).unwrap_or_default();
 
                 runtime_handle.block_on(async {
-                    if current_status == "paused" {
+                    if current_status == "paused" || exit_status == "paused" {
                         log::info!("[Step 5: Engine Exit] {} is paused, keeping state", id_mon);
+                        // Keep last progress in memory so UI / get_statuses don't jump to 0.
+                        {
+                            let mut progress = state_mon.progress.lock().await;
+                            if let Some(entry) = progress.get_mut(&id_mon) {
+                                entry.status = "paused".to_string();
+                                entry.error = None;
+                                entry.speed_bps = 0;
+                                entry.eta_secs = 0;
+                            }
+                        }
                         state_mon.scheduler.finish(&id_mon);
-                        state_mon.remove_active(&id_mon).await;
+                        {
+                            let mut engines = state_mon.active_engines.lock().unwrap();
+                            engines.remove(&id_mon);
+                        }
+                        {
+                            let mut flags = state_mon.cancellation_flags.lock().unwrap();
+                            flags.remove(&id_mon);
+                        }
                         pump_scheduler(state_mon.clone());
                     } else if current_status == "cancelled" || exit_status == "cancelled" {
                         log::info!("[Step 5: Engine Exit] {} is cancelled, cleaning up files", id_mon);
                         if let Ok(Some(row)) = state_mon.db.get_download(&id_mon) {
-                            let _ = std::fs::remove_file(std::path::Path::new(&row.save_path));
-                            let _ = std::fs::remove_file(format!("{}.veloce_state", row.save_path));
-                            let _ = std::fs::remove_file(format!("{}.veloce_done", row.save_path));
+                            let save = std::path::Path::new(&row.save_path);
+                            let _ = std::fs::remove_file(save);
+                            util::remove_resume_sidecars(save);
                         }
                         if current_status != "cancelled" {
                             let _ = state_mon.db.update_download_status(&id_mon, "cancelled");
@@ -720,6 +760,16 @@ pub async fn pause_download_job(state: &AppState, id: &str) -> Result<(), String
         }
     }
     let _ = state.db.update_download_status(id, "paused");
+    // Clear sticky error; keep downloaded/total already in progress + DB.
+    {
+        let mut progress = state.progress.lock().await;
+        if let Some(entry) = progress.get_mut(id) {
+            entry.status = "paused".to_string();
+            entry.error = None;
+            entry.speed_bps = 0;
+            entry.eta_secs = 0;
+        }
+    }
     state.emit_status(id, "paused", None).await;
     Ok(())
 }
@@ -743,23 +793,55 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
         }
     }
 
-    // Drop stale in-memory failure so UI flips back to queued immediately.
+    let downloaded = row.downloaded_bytes.unwrap_or(0) as u64;
+    let total = row.total_bytes.unwrap_or(0) as u64;
+    let pct = if total > 0 {
+        (downloaded as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Drop sticky failure immediately and restore last known byte counts.
     {
         let mut progress = state.progress.lock().await;
         if let Some(entry) = progress.get_mut(id) {
             entry.status = "queued".to_string();
             entry.error = None;
+            entry.downloaded = downloaded;
+            entry.total = total;
+            entry.progress_pct = pct;
+            entry.speed_bps = 0;
+            entry.eta_secs = 0;
+        } else {
+            progress.insert(
+                id.to_string(),
+                DownloadStatus {
+                    id: id.to_string(),
+                    url: row.url.clone(),
+                    file_name: row.file_name.clone(),
+                    save_path: row.save_path.clone(),
+                    status: "queued".to_string(),
+                    downloaded,
+                    total,
+                    speed_bps: 0,
+                    eta_secs: 0,
+                    progress_pct: pct,
+                    error: None,
+                    source: None,
+                },
+            );
         }
     }
+    let _ = state.db.update_download_status(id, "queued");
     state.ws_clients.broadcast_ack(id, &row.file_name, "queued");
-    state
-        .emit_download_added(
-            id,
-            &row.url,
-            &row.file_name,
-            &row.save_path,
-            "queued",
-        );
+    state.emit_status(id, "queued", None).await;
+    state.emit_download_added(
+        id,
+        &row.url,
+        &row.file_name,
+        &row.save_path,
+        "queued",
+    );
 
     enqueue_download_job(
         state,

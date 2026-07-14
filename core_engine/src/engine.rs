@@ -12,7 +12,9 @@ use crate::piece::{adaptive_piece_size, piece_ranges};
 use crate::profiles::ProfileStore;
 use crate::probe::probe_optimal_threads;
 use crate::rate_limit::RateLimiter;
-use crate::resume::{validators_match, ResumeState};
+use crate::resume::{
+    ensure_sidecar_dir, resolve_done_path, resolve_state_path, validators_match, ResumeState,
+};
 use crossbeam_queue::SegQueue;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde_json::json;
@@ -98,8 +100,9 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     );
     let t_discover = start_time.elapsed();
 
-    let sidecar = format!("{}.veloce_done", args.save_path);
-    if Path::new(&sidecar).exists() {
+    // Resume / done markers live in `{parent}/.veloce/` (hidden), not beside the media file.
+    let sidecar = resolve_done_path(path);
+    if sidecar.exists() {
         // Integrity: sidecar alone is not enough — file must exist and match size.
         let complete = path.exists()
             && std::fs::metadata(path)
@@ -122,13 +125,15 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let _ = std::fs::remove_file(&sidecar);
     }
 
-    let state_file = format!("{}.veloce_state", args.save_path);
-    let state_path = Path::new(&state_file);
+    let state_path_buf = resolve_state_path(path);
+    let state_path = state_path_buf.as_path();
+    let _ = ensure_sidecar_dir(path);
 
     let resume_state: Option<ResumeState> = if path.exists() && state_path.exists() {
         ResumeState::load(state_path).filter(|s| {
             s.total_size == total_size
                 && s.piece_size > 0
+                && s.completed.len() == piece_ranges(total_size, s.piece_size).len()
                 && validators_match(s, &discovery.etag, &discovery.last_modified)
         })
     } else {
@@ -162,14 +167,27 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         eprintln!("   📐 Piece size: {} bytes ({:.1} MB)", piece_size, piece_size as f64 / 1_048_576.0);
     } else {
         eprintln!("   🆕 Fresh download — no resume state found");
-        if path.exists() {
+        let keep_partial = if path.exists() {
             let existing = std::fs::metadata(path)?.len();
-            eprintln!(
-                "   ⚠️  Partial file without valid state: {} / {} bytes. Restarting...",
-                existing, total_size
-            );
-            std::fs::remove_file(path)?;
-        }
+            if existing > total_size {
+                eprintln!(
+                    "   ⚠️  Partial file larger than remote ({} > {}) — removing",
+                    existing, total_size
+                );
+                std::fs::remove_file(path)?;
+                false
+            } else if existing > 0 {
+                eprintln!(
+                    "   ⚠️  Partial file without valid state: {} / {} bytes — keeping file, re-fetching pieces",
+                    existing, total_size
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let _ = std::fs::remove_file(state_path);
 
         eprintln!("   📐 Range requests: {}", if ranges_ok { "supported ✓" } else { "NOT supported — single connection only" });
@@ -206,9 +224,18 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             }
         }
 
-        output = SharedOutput::create_or_open(path, true)?;
-        output.preallocate(total_size)?;
-        eprintln!("   💾 File pre-allocated: {} bytes", total_size);
+        if keep_partial {
+            output = SharedOutput::open_existing(path)?;
+            let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if existing < total_size {
+                output.preallocate(total_size)?;
+            }
+            eprintln!("   💾 Resuming into existing partial file");
+        } else {
+            output = SharedOutput::create_or_open(path, true)?;
+            output.preallocate(total_size)?;
+            eprintln!("   💾 File pre-allocated: {} bytes", total_size);
+        }
         completed_init = vec![false; piece_ranges(total_size, piece_size).len()];
     }
 
@@ -700,6 +727,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         std::process::exit(1);
     }
 
+    let _ = ensure_sidecar_dir(path);
     std::fs::write(&sidecar, "done")?;
     let _ = std::fs::remove_file(state_path);
 

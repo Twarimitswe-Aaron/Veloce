@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -838,10 +837,21 @@ async fn handle_message(
                         );
                         return;
                     }
-                    if is_reveal {
-                        reveal_in_file_manager(&row.save_path);
+                    let result = if is_reveal {
+                        util::reveal_in_folder(&row.save_path)
                     } else {
-                        xdg_open(&row.save_path);
+                        util::open_path(&row.save_path)
+                    };
+                    if let Err(e) = result {
+                        log::error!("Open/reveal failed: {}", e);
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "DOWNLOAD_ERROR",
+                                "downloadId": id,
+                                "error": e
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             }
@@ -849,66 +859,6 @@ async fn handle_message(
 
         _ => {
             log::debug!("Unhandled WebSocket message type: {}", msg_type);
-        }
-    }
-}
-
-// ── File/directory utilities (backend parity) ─────────────────────────────
-
-/// Open a file or folder with the desktop's default handler (xdg-open).
-fn xdg_open(target: &str) {
-    let child = Command::new("xdg-open")
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match child {
-        Ok(mut c) => {
-            // Detach — don't wait for completion
-            std::thread::spawn(move || {
-                let _ = c.wait();
-            });
-        }
-        Err(e) => log::error!("xdg-open failed: {}", e),
-    }
-}
-
-/// Reveal a file in the file manager, highlighting it when DBus API is available.
-fn reveal_in_file_manager(file_path: &str) {
-    let child = Command::new("dbus-send")
-        .args([
-            "--session",
-            "--print-reply",
-            "--dest=org.freedesktop.FileManager1",
-            "--type=method_call",
-            "/org/freedesktop/FileManager1",
-            "org.freedesktop.FileManager1.ShowItems",
-            &format!("array:string:file://{}", file_path),
-            "string:",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match child {
-        Ok(mut c) => {
-            let path = file_path.to_string();
-            std::thread::spawn(move || {
-                let status = c.wait();
-                if status.map_or(true, |s| !s.success()) {
-                    // Fallback: open parent folder
-                    if let Some(parent) = Path::new(&path).parent() {
-                        xdg_open(parent.to_str().unwrap_or("."));
-                    }
-                }
-            });
-        }
-        Err(_) => {
-            // Fallback: open parent folder
-            if let Some(parent) = Path::new(file_path).parent() {
-                xdg_open(parent.to_str().unwrap_or("."));
-            }
         }
     }
 }

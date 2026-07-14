@@ -266,6 +266,157 @@ pub fn ytdlp_binary() -> Option<PathBuf> {
     }
 }
 
+/// Sidecar paths under `{parent}/.veloce/` (hidden dir; keeps Downloads tidy).
+/// Also recognizes legacy `{save}.veloce_state` / `{save}.veloce_done`.
+pub fn resume_sidecar_paths(save_path: &Path) -> (PathBuf, PathBuf) {
+    let parent = save_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = save_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let dir = parent.join(".veloce");
+    (dir.join(format!("{name}.state")), dir.join(format!("{name}.done")))
+}
+
+/// Remove resume sidecars (hidden `.veloce/` + legacy adjacent files).
+pub fn remove_resume_sidecars(save_path: &Path) {
+    let (state, done) = resume_sidecar_paths(save_path);
+    let _ = std::fs::remove_file(&state);
+    let _ = std::fs::remove_file(&done);
+    let legacy_state = PathBuf::from(format!("{}.veloce_state", save_path.display()));
+    let legacy_done = PathBuf::from(format!("{}.veloce_done", save_path.display()));
+    let _ = std::fs::remove_file(&legacy_state);
+    let _ = std::fs::remove_file(&legacy_done);
+}
+
+fn spawn_detached(mut cmd: std::process::Command) -> Result<(), String> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to open path: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn file_url(path: &Path) -> String {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    url::Url::from_file_path(&abs)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", abs.to_string_lossy()))
+}
+
+/// Open a file or folder with the OS default handler (cross-platform).
+pub fn open_path(target: &str) -> Result<(), String> {
+    use std::process::Command;
+    let path = Path::new(target);
+    if !path.exists() {
+        return Err(format!("Path does not exist: {target}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return spawn_detached({
+            let mut c = Command::new("open");
+            c.arg(target);
+            c
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return spawn_detached({
+            let mut c = Command::new("cmd");
+            c.args(["/C", "start", "", target]);
+            c
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux / BSD — try xdg-open, then gio
+        if spawn_detached({
+            let mut c = Command::new("xdg-open");
+            c.arg(target);
+            c
+        })
+        .is_ok()
+        {
+            return Ok(());
+        }
+        spawn_detached({
+            let mut c = Command::new("gio");
+            c.args(["open", target]);
+            c
+        })
+    }
+}
+
+/// Reveal a file in the file manager (highlight when supported).
+pub fn reveal_in_folder(file_path: &str) -> Result<(), String> {
+    use std::process::Command;
+    let path = Path::new(file_path);
+    if !path.exists() {
+        return Err(format!("Path does not exist: {file_path}"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "No parent folder".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    {
+        return spawn_detached({
+            let mut c = Command::new("open");
+            c.args(["-R", file_path]);
+            c
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return spawn_detached({
+            let mut c = Command::new("explorer");
+            c.arg(format!("/select,{file_path}"));
+            c
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let uri = file_url(path);
+        let dbus = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{uri}"),
+                "string:",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = dbus {
+            let parent_s = parent.to_string_lossy().into_owned();
+            std::thread::spawn(move || {
+                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                if !ok {
+                    let _ = open_path(&parent_s);
+                }
+            });
+            return Ok(());
+        }
+        open_path(&parent.to_string_lossy())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
