@@ -27,7 +27,8 @@ use tokio::time::{sleep, Duration};
 
 const SAFETY_MARGIN: u64 = 32 * 1024 * 1024;
 const RESUME_INTERVAL_MS: u64 = 2000;
-const STAGGER_MS: u64 = 75;
+/// Stagger first requests so CDN rate-limits don't trip; keep short so TTFB stays low.
+const STAGGER_MS: u64 = 25;
 
 pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Error>> {
     let args = args.normalize();
@@ -242,13 +243,32 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             output = SharedOutput::open_existing(path)?;
             let existing = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if existing < total_size {
+                let t_alloc = Instant::now();
+                eprintln!(
+                    "   💾 Reserving file size {} ({:.1} MB)…",
+                    total_size,
+                    total_size as f64 / 1_048_576.0
+                );
                 output.preallocate(total_size)?;
+                eprintln!(
+                    "   💾 Size reserved in {:.2}s (sparse)",
+                    t_alloc.elapsed().as_secs_f64()
+                );
             }
             eprintln!("   💾 Resuming into existing partial file");
         } else {
             output = SharedOutput::create_or_open(path, true)?;
+            let t_alloc = Instant::now();
+            eprintln!(
+                "   💾 Reserving file size {} ({:.1} MB)…",
+                total_size,
+                total_size as f64 / 1_048_576.0
+            );
             output.preallocate(total_size)?;
-            eprintln!("   💾 File pre-allocated: {} bytes", total_size);
+            eprintln!(
+                "   💾 Size reserved in {:.2}s (sparse) — ready to download",
+                t_alloc.elapsed().as_secs_f64()
+            );
         }
         completed_init = vec![false; piece_ranges(total_size, piece_size).len()];
     }

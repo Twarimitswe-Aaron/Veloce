@@ -920,13 +920,13 @@
               <span>Base Directory</span>
               <div class="dir-row">
                 <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce/media" />
-                <p class="hint" style="margin-top:6px;font-size:11px;color:var(--veloce-muted)">
-                  Videos go here. If this path is the Veloce source repo, the app uses a <code>media/</code> subfolder automatically.
-                </p>
                 <button type="button" class="btn-browse" onclick={browseDirectory} disabled={pickerBusy}>
                   {pickerBusy ? "…" : "Browse"}
                 </button>
               </div>
+              <p class="hint dir-hint">
+                Videos go here. If this path is the Veloce source repo, the app uses a <code>media/</code> subfolder automatically.
+              </p>
               {#if pickerError}
                 <span class="picker-error">{pickerError}</span>
               {/if}
@@ -1650,6 +1650,18 @@
 
   .dir-row input {
     flex: 1;
+  }
+
+  .dir-hint {
+    margin: 6px 0 0;
+    font-size: 11px;
+    color: var(--veloce-muted);
+    line-height: 1.4;
+  }
+
+  .dir-hint code {
+    font-size: 11px;
+    color: var(--veloce-white);
   }
 
   .btn-browse {

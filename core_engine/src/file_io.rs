@@ -73,33 +73,17 @@ fn write_at_once(file: &File, offset: u64, data: &[u8]) -> io::Result<usize> {
     f.write(data)
 }
 
+/// Reserve file size for ranged writes.
+///
+/// Uses `set_len` (sparse) so start is instant. `posix_fallocate` on FUSE/NTFS
+/// (e.g. `/media/newvolume`) can zero-write multi‑GB files for 30–60s before
+/// any network transfer — unacceptable for download UX. Free-space checks in
+/// the engine already guard against mid-download ENOSPC.
 pub fn preallocate_file(file: &File, len: u64) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
-        if ret == 0 {
-            return Ok(());
-        }
+    let current = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if current == len {
+        return Ok(());
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATECONTIG,
-            fst_posmode: libc::F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: len as i64,
-            fst_bytesalloc: 0,
-        };
-        let ret = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &store) };
-        if ret != -1 {
-            return file.set_len(len);
-        }
-    }
-
     file.set_len(len)
 }
 
