@@ -27,7 +27,8 @@ pub fn build_http_client(threads: usize, referer: Option<&str>, origin: Option<&
         .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(threads.max(1))
-        .connect_timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
         // Block redirects into private/loopback/metadata — coordinator SSRF defense
         // is not enough once Location headers are followed inside the engine.
         .redirect(crate::safety::safe_redirect_policy());
@@ -130,8 +131,35 @@ pub async fn discover_resume_quick(
     anyhow::bail!("resume quick-probe got HTTP {status}, need 206")
 }
 
-/// Discover size + validators. Performs a ranged GET warmup on the shared client pool.
+/// Discover size + validators. Retries transient connect/timeout failures.
 pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
+    let mut last_err = None;
+    for attempt in 1..=3u32 {
+        match discover_once(client, url).await {
+            Ok(d) => return Ok(d),
+            Err(e) => {
+                let msg = e.to_string();
+                let retryable = msg.contains("timed out")
+                    || msg.contains("timeout")
+                    || msg.contains("connection")
+                    || msg.contains("Connect")
+                    || msg.contains("reset")
+                    || msg.contains("temporarily");
+                eprintln!(
+                    "   ⚠️  Discovery attempt {attempt}/3 failed: {msg}"
+                );
+                last_err = Some(e);
+                if !retryable || attempt == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("discovery failed")))
+}
+
+async fn discover_once(client: &Client, url: &str) -> anyhow::Result<Discovery> {
     let _warmup_start = Instant::now();
 
     eprintln!(" 🔍 Discovering file metadata...");
@@ -232,26 +260,10 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
         }
     }
 
-    if status.is_success() {
-        if let Some(len) = parse_content_length(res.headers()) {
-            eprintln!("   ✓ File size from initial ranged GET");
-            eprintln!("   📦 Size:       {} bytes ({:.1} MB)", len, len as f64 / 1_048_576.0);
-            if let Some(ref e) = etag {
-                eprintln!("   🏷️  ETag:       {}", e);
-            }
-            if let Some(ref l) = lm {
-                eprintln!("   📅 Modified:   {}", l);
-            }
-            return Ok(Discovery {
-                total_size: len,
-                etag,
-                last_modified: lm,
-                ranges_hint: Some(false),
-                warmed_client: client.clone(),
-            });
-        }
-    }
-    anyhow::bail!("could not determine file size (status {status})");
+    anyhow::bail!(
+        "Could not discover file size (HTTP {})",
+        full_status.as_u16()
+    )
 }
 
 pub fn retry_after_secs(res: &reqwest::Response) -> u64 {

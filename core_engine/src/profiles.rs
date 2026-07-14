@@ -34,6 +34,21 @@ impl ProfileStore {
             },
         );
         hosts.insert(
+            "hakunaymatata.com".into(),
+            HostProfile {
+                // OmniSave / MovieBox CDN — saturates uplink; keep lean.
+                threads: Some(2),
+                piece_mb: Some(4),
+            },
+        );
+        hosts.insert(
+            "aoneroom.com".into(),
+            HostProfile {
+                threads: Some(2),
+                piece_mb: Some(4),
+            },
+        );
+        hosts.insert(
             "googlevideo.com".into(),
             HostProfile {
                 threads: Some(6),

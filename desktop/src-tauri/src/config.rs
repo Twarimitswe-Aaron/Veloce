@@ -21,11 +21,11 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             port: env_var("VELOCE_PORT", 14921),
-            max_concurrent_downloads: env_var("VELOCE_MAX_CONCURRENT_DOWNLOADS", 10),
+            max_concurrent_downloads: env_var("VELOCE_MAX_CONCURRENT_DOWNLOADS", 2),
             default_threads: env_var("VELOCE_DEFAULT_THREADS", 8),
             max_rate_bytes: env_var("VELOCE_MAX_RATE_BYTES", 0),
             min_free_disk_mb: env_var("VELOCE_MIN_FREE_DISK_MB", 500),
-            engine_quiet: env_bool("VELOCE_ENGINE_QUIET", false),
+            engine_quiet: env_bool("VELOCE_ENGINE_QUIET", true),
             engine_auto_tune: env_bool("VELOCE_ENGINE_AUTO_TUNE", true),
             engine_read_buffer_bytes: env_var("VELOCE_ENGINE_READ_BUFFER_BYTES", 262144),
             base_dir: env::var("VELOCE_BASE_DIR").ok().filter(|s| !s.is_empty()),

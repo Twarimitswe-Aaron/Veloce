@@ -24,8 +24,28 @@ pub struct JobState {
     pub threads: Option<u32>,
 }
 
-fn is_mediafire_url(url: &str) -> bool {
-    detect_source(url) == MediaSource::MediaFire
+/// CDNs that collapse when several multi-connection jobs share the uplink.
+fn is_exclusive_cdn_job(job: &JobState) -> bool {
+    let probe = job
+        .direct_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or(job.url.as_str());
+    is_exclusive_cdn_url(probe) || is_exclusive_cdn_url(&job.url)
+}
+
+fn is_exclusive_cdn_url(url: &str) -> bool {
+    if detect_source(url) == MediaSource::MediaFire {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    host.contains("mediafire.com")
+        || host.contains("hakunaymatata.com")
+        || host.contains("aoneroom.com")
+        || host.ends_with("googlevideo.com")
 }
 
 /// The download scheduler with a FIFO queue and concurrency cap.
@@ -35,8 +55,8 @@ pub struct Scheduler {
     /// Live concurrency cap (updated from Settings UI / extension SET_SETTINGS).
     max_concurrent: AtomicU32,
     queue: Mutex<VecDeque<JobState>>,
-    /// Active jobs: (id, is_mediafire). MediaFire CDN collapses when two
-    /// multi-connection downloads share a host — only one MF job at a time.
+    /// Active jobs: (id, exclusive_cdn). Exclusive CDNs run one-at-a-time so
+    /// MediaFire + OmniSave don't starve each other to ~KB/s.
     active: Mutex<Vec<(String, bool)>>,
 }
 
@@ -73,31 +93,31 @@ impl Scheduler {
     }
 
     /// Dequeue and mark as active. Returns None if queue is empty or cap reached.
-    /// Skips MediaFire jobs while another MediaFire download is already active
-    /// (non-MF jobs still start if slots remain).
+    /// Skips exclusive-CDN jobs while another exclusive CDN download is active
+    /// (other jobs may still start if slots remain).
     pub fn dequeue(&self) -> Option<JobState> {
         let mut active = self.active.lock().unwrap();
         if active.len() >= self.max_concurrent() as usize {
             return None;
         }
-        let mf_busy = active.iter().any(|(_, mf)| *mf);
+        let exclusive_busy = active.iter().any(|(_, ex)| *ex);
         let mut queue = self.queue.lock().unwrap();
         let idx = queue.iter().position(|j| {
-            if mf_busy && is_mediafire_url(&j.url) {
+            if exclusive_busy && is_exclusive_cdn_job(j) {
                 false
             } else {
                 true
             }
         })?;
         let job = queue.remove(idx).expect("index from position");
-        let mf = is_mediafire_url(&job.url);
-        if mf {
+        let exclusive = is_exclusive_cdn_job(&job);
+        if exclusive {
             log::info!(
-                "Dequeued MediaFire job {} (serialized: only one MF download at a time)",
+                "Dequeued exclusive-CDN job {} (serialized: one CDN-heavy download at a time)",
                 job.id
             );
         }
-        active.push((job.id.clone(), mf));
+        active.push((job.id.clone(), exclusive));
         Some(job)
     }
 
@@ -130,8 +150,6 @@ impl Scheduler {
         let queue = self.queue.lock().unwrap();
         let _active = self.active.lock().unwrap();
         let out: Vec<JobState> = queue.iter().cloned().collect();
-        // Active jobs are tracked by ID — we don't have the full state here
-        // The WebSocket handler maintains the full state map
         out
     }
 }

@@ -99,7 +99,7 @@
 
   // Settings
   let baseDir = "";
-  let maxConcurrent = 10;
+  let maxConcurrent = 2;
   let defaultThreads = 8;
   let maxRateMBps = 0;
   let engineQuiet = true;
@@ -118,7 +118,7 @@
       const s: any = await invoke("get_settings");
       if (s) {
         baseDir = s.base_dir || s.baseDirectory || "";
-        maxConcurrent = s.max_concurrent || s.maxConcurrentDownloads || 10;
+        maxConcurrent = s.max_concurrent || s.maxConcurrentDownloads || 2;
         defaultThreads = s.default_threads || s.defaultThreads || 8;
         maxRateMBps = Math.round(((s.max_rate_bytes || s.maxRateBytes || 0) as number) / (1024 * 1024));
         engineQuiet = s.engine_quiet ?? s.engineQuiet ?? true;
@@ -934,6 +934,9 @@
             <label>
               <span>Max Concurrent Downloads (Queue)</span>
               <input type="number" bind:value={maxConcurrent} min="1" max="64" />
+              <p class="hint dir-hint">
+                Jobs are separate processes, but they still share your internet link. Keep this at 1–2 on slow/CDN hosts (MediaFire, OmniSave) or speeds collapse to KB/s.
+              </p>
             </label>
             <label>
               <span>Default Threads Per Download</span>
