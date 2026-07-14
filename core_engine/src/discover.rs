@@ -27,7 +27,7 @@ pub fn build_http_client(threads: usize, referer: Option<&str>, origin: Option<&
         .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(threads.max(1))
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(8))
         // Block redirects into private/loopback/metadata — coordinator SSRF defense
         // is not enough once Location headers are followed inside the engine.
         .redirect(crate::safety::safe_redirect_policy());
@@ -85,6 +85,49 @@ pub async fn supports_ranges(client: &Client, url: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Fast path for resume: one ranged GET (often faster than HEAD on CDNs).
+/// Returns Ok when size matches `expected_size`.
+pub async fn discover_resume_quick(
+    client: &Client,
+    url: &str,
+    expected_size: u64,
+) -> anyhow::Result<Discovery> {
+    let t0 = Instant::now();
+    let res = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await
+        .context("resume quick ranged GET failed")?;
+    let status = res.status().as_u16();
+    let etag = header_string(res.headers(), ETAG);
+    let lm = header_string(res.headers(), LAST_MODIFIED);
+    if status == 206 {
+        if let Some(total) = parse_total_from_content_range(res.headers()) {
+            if total == expected_size {
+                eprintln!(
+                    "   ✓ Resume quick-probe OK in {:.2}s ({} bytes)",
+                    t0.elapsed().as_secs_f64(),
+                    total
+                );
+                return Ok(Discovery {
+                    total_size: total,
+                    etag,
+                    last_modified: lm,
+                    ranges_hint: Some(true),
+                    warmed_client: client.clone(),
+                });
+            }
+            anyhow::bail!(
+                "resume size mismatch: got {} expected {}",
+                total,
+                expected_size
+            );
+        }
+    }
+    anyhow::bail!("resume quick-probe got HTTP {status}, need 206")
 }
 
 /// Discover size + validators. Performs a ranged GET warmup on the shared client pool.

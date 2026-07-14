@@ -41,6 +41,47 @@ pub struct MediaFireInfo {
     pub size_bytes: Option<u64>,
 }
 
+struct MediaFireCacheEntry {
+    info: MediaFireInfo,
+    at: Instant,
+}
+
+/// Fresh CDN tokens are reusable briefly — avoids a second ~2–5s page scrape
+/// when enqueue already resolved (or resume re-queues within TTL).
+static MEDIAFIRE_CDN_CACHE: Lazy<Mutex<HashMap<String, MediaFireCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const MEDIAFIRE_CDN_TTL: Duration = Duration::from_secs(90);
+
+static MEDIAFIRE_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(6))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(4)
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .gzip(true)
+        .brotli(true)
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .build()
+        .expect("mediafire http client")
+});
+
+fn mediafire_cache_key(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|mut u| {
+            u.set_query(None);
+            u.set_fragment(None);
+            let mut s = u.to_string();
+            if s.ends_with('/') {
+                s.pop();
+            }
+            s
+        })
+        .unwrap_or_else(|_| url.trim_end_matches('/').to_string())
+}
+
 /// Cache entry for extracted best URLs.
 struct CacheEntry {
     url: String,
@@ -350,64 +391,62 @@ fn extract_youtube_id(url: &str) -> Option<String> {
 }
 
 pub async fn resolve_mediafire(url: &str) -> Result<MediaFireInfo, String> {
-    log::info!("[MediaFire] Step 1: Building HTTP client for URL: {}", url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .user_agent(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .gzip(true)
-        .brotli(true)
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .build()
-        .map_err(|e| {
-            log::error!("[MediaFire] Failed to build HTTP client: {}", e);
-            format!("Failed to build HTTP client: {}", e)
-        })?;
+    let key = mediafire_cache_key(url);
+    {
+        let cache = MEDIAFIRE_CDN_CACHE.lock().unwrap();
+        if let Some(entry) = cache.get(&key) {
+            if entry.at.elapsed() < MEDIAFIRE_CDN_TTL {
+                log::info!(
+                    "[MediaFire] CDN cache hit (age {}s) — skip page scrape",
+                    entry.at.elapsed().as_secs()
+                );
+                return Ok(entry.info.clone());
+            }
+        }
+    }
+
+    log::info!("[MediaFire] Fetching page HTML for {}", url);
+    let client = &*MEDIAFIRE_HTTP;
 
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        log::info!("[MediaFire] Step 2: Fetching page HTML (attempt {attempt}/3)");
-        match fetch_mediafire_html(&client, url).await {
+        log::info!("[MediaFire] Page fetch attempt {attempt}/3");
+        match fetch_mediafire_html(client, url).await {
             Ok(html) => {
                 log::info!(
-                    "[MediaFire] Step 3: Page fetched successfully ({} bytes). Extracting title...",
+                    "[MediaFire] Page fetched ({} bytes). Extracting CDN link...",
                     html.len()
                 );
 
                 let file_name = extract_meta_content(&html, "og:title")
                     .or_else(|| extract_title(&html))
-                    .unwrap_or_else(|| {
-                        log::warn!("[MediaFire] Could not extract title, using fallback");
-                        "mediafire_file".to_string()
-                    });
-
-                log::info!("[MediaFire] Step 4: Title extracted: {}", file_name);
-                log::info!("[MediaFire] Step 5: Extracting direct download URL");
+                    .unwrap_or_else(|| "mediafire_file".to_string());
 
                 let direct_url = extract_mediafire_download_url(&html).ok_or_else(|| {
-                    log::error!("[MediaFire] Failed to find direct CDN download URL in HTML");
                     "Could not find download link on MediaFire page".to_string()
                 })?;
 
-                log::info!("[MediaFire] Step 6: Extracted direct URL: {}", direct_url);
-                log::info!("[MediaFire] Step 7: Extracting file size");
-
                 let size_bytes = extract_mediafire_size(&html);
-                log::info!("[MediaFire] Step 8: File size extracted: {:?}", size_bytes);
-
-                return Ok(MediaFireInfo {
+                let info = MediaFireInfo {
                     file_name,
                     direct_url,
                     size_bytes,
-                });
+                };
+                MEDIAFIRE_CDN_CACHE.lock().unwrap().insert(
+                    key,
+                    MediaFireCacheEntry {
+                        info: info.clone(),
+                        at: Instant::now(),
+                    },
+                );
+                log::info!("[MediaFire] CDN URL ready (cached {}s)", MEDIAFIRE_CDN_TTL.as_secs());
+                return Ok(info);
             }
             Err(e) => {
                 last_err = e;
                 log::warn!("[MediaFire] Attempt {attempt} failed: {last_err}");
                 if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                 }
             }
         }

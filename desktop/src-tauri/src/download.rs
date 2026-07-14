@@ -588,6 +588,22 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
             if prog.msg_type == "done" || prog.msg_type == "already_exists" {
                 let total = prog.total.or(prog.downloaded).unwrap_or(0);
                 let downloaded = prog.downloaded.unwrap_or(total).max(total);
+                if prog.msg_type == "done" {
+                    log::info!(
+                        "[Engine Stats] id={} host={:?} session={}B baseline={}B session={:.2}MB/s peak={:.2}MB/s retries={:?} stalls={:?} busy={:?} workers={:?} elapsed={:.1}s",
+                        id_prog,
+                        prog.host,
+                        prog.session_bytes.unwrap_or(0),
+                        prog.baseline_bytes.unwrap_or(0),
+                        prog.avg_speed_mbps.unwrap_or(0.0),
+                        prog.peak_speed_mbps.unwrap_or(0.0),
+                        prog.retries,
+                        prog.stalls,
+                        prog.busy_responses,
+                        prog.workers,
+                        prog.elapsed_secs.unwrap_or(0.0),
+                    );
+                }
                 state_prog.emit_progress(&id_prog, downloaded, total.max(downloaded), 0, 0, 100.0);
                 return;
             }

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::config::Config;
+use crate::formats::{detect_source, MediaSource};
 
 /// State of a single download job.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -23,6 +24,10 @@ pub struct JobState {
     pub threads: Option<u32>,
 }
 
+fn is_mediafire_url(url: &str) -> bool {
+    detect_source(url) == MediaSource::MediaFire
+}
+
 /// The download scheduler with a FIFO queue and concurrency cap.
 #[allow(dead_code)]
 pub struct Scheduler {
@@ -30,8 +35,9 @@ pub struct Scheduler {
     /// Live concurrency cap (updated from Settings UI / extension SET_SETTINGS).
     max_concurrent: AtomicU32,
     queue: Mutex<VecDeque<JobState>>,
-    // Track active downloads by ID
-    active: Mutex<Vec<String>>,
+    /// Active jobs: (id, is_mediafire). MediaFire CDN collapses when two
+    /// multi-connection downloads share a host — only one MF job at a time.
+    active: Mutex<Vec<(String, bool)>>,
 }
 
 #[allow(dead_code)]
@@ -67,23 +73,38 @@ impl Scheduler {
     }
 
     /// Dequeue and mark as active. Returns None if queue is empty or cap reached.
+    /// Skips MediaFire jobs while another MediaFire download is already active
+    /// (non-MF jobs still start if slots remain).
     pub fn dequeue(&self) -> Option<JobState> {
         let mut active = self.active.lock().unwrap();
         if active.len() >= self.max_concurrent() as usize {
             return None;
         }
+        let mf_busy = active.iter().any(|(_, mf)| *mf);
         let mut queue = self.queue.lock().unwrap();
-        if let Some(job) = queue.pop_front() {
-            active.push(job.id.clone());
-            return Some(job);
+        let idx = queue.iter().position(|j| {
+            if mf_busy && is_mediafire_url(&j.url) {
+                false
+            } else {
+                true
+            }
+        })?;
+        let job = queue.remove(idx).expect("index from position");
+        let mf = is_mediafire_url(&job.url);
+        if mf {
+            log::info!(
+                "Dequeued MediaFire job {} (serialized: only one MF download at a time)",
+                job.id
+            );
         }
-        None
+        active.push((job.id.clone(), mf));
+        Some(job)
     }
 
     /// Mark a download as completed/removed from active.
     pub fn finish(&self, id: &str) {
         let mut active = self.active.lock().unwrap();
-        active.retain(|a| a != id);
+        active.retain(|(a, _)| a != id);
     }
 
     /// Remove a queued job by ID. Returns true if it was in the queue.
@@ -242,6 +263,69 @@ mod tests {
         sched.enqueue(make_job("job1"));
         sched.dequeue();
         assert_eq!(sched.active_count(), 1);
+    }
+
+    #[test]
+    fn test_mediafire_serialized() {
+        let sched = new_scheduler(4);
+        {
+            let mut q = sched.queue.lock().unwrap();
+            q.push_back(JobState {
+                id: "mf1".into(),
+                url: "https://www.mediafire.com/file/aaa/a.mp4/file".into(),
+                direct_url: None,
+                file_name: "a.mp4".into(),
+                save_path: "/tmp/a.mp4".into(),
+                status: "queued".into(),
+                downloaded: 0,
+                total: 0,
+                speed_bps: 0,
+                eta_secs: 0,
+                is_playlist: false,
+                error: None,
+                threads: None,
+            });
+            q.push_back(JobState {
+                id: "mf2".into(),
+                url: "https://www.mediafire.com/file/bbb/b.mp4/file".into(),
+                direct_url: None,
+                file_name: "b.mp4".into(),
+                save_path: "/tmp/b.mp4".into(),
+                status: "queued".into(),
+                downloaded: 0,
+                total: 0,
+                speed_bps: 0,
+                eta_secs: 0,
+                is_playlist: false,
+                error: None,
+                threads: None,
+            });
+            q.push_back(JobState {
+                id: "yt".into(),
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                direct_url: None,
+                file_name: "yt.mp4".into(),
+                save_path: "/tmp/yt.mp4".into(),
+                status: "queued".into(),
+                downloaded: 0,
+                total: 0,
+                speed_bps: 0,
+                eta_secs: 0,
+                is_playlist: false,
+                error: None,
+                threads: None,
+            });
+        }
+
+        let j1 = sched.dequeue().expect("mf1");
+        assert_eq!(j1.id, "mf1");
+        // Second MediaFire blocked while mf1 active, but YouTube can start
+        let j2 = sched.dequeue().expect("yt while mf busy");
+        assert_eq!(j2.id, "yt");
+        assert!(sched.dequeue().is_none(), "mf2 must wait");
+        sched.finish("mf1");
+        let j3 = sched.dequeue().expect("mf2 after mf1 done");
+        assert_eq!(j3.id, "mf2");
     }
 
     #[test]

@@ -116,11 +116,17 @@ async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadSta
                     file_name: r.file_name,
                     save_path: save_path.clone(),
                     status: status.clone(),
-                    downloaded,
+                    downloaded: if status == "completed" && total > 0 {
+                        total.max(downloaded)
+                    } else {
+                        downloaded
+                    },
                     total,
                     speed_bps: 0,
                     eta_secs: 0,
-                    progress_pct: if total > 0 {
+                    progress_pct: if status == "completed" {
+                        100.0
+                    } else if total > 0 {
                         (downloaded as f64 / total as f64) * 100.0
                     } else {
                         0.0
@@ -143,7 +149,15 @@ async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadSta
                         }
                         live.error = None;
                     }
-                    if live.downloaded == 0 && downloaded > 0 {
+                    if status == "completed" {
+                        live.status = "completed".into();
+                        let tot = total.max(downloaded).max(live.total).max(live.downloaded);
+                        if tot > 0 {
+                            live.downloaded = tot;
+                            live.total = tot;
+                            live.progress_pct = 100.0;
+                        }
+                    } else if live.downloaded == 0 && downloaded > 0 {
                         live.downloaded = downloaded;
                         live.total = total;
                         live.progress_pct = if total > 0 {

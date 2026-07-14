@@ -27,7 +27,9 @@ impl ProfileStore {
         hosts.insert(
             "mediafire.com".into(),
             HostProfile {
-                threads: Some(4),
+                // MediaFire CDN throttles multi-connection / multi-job hard.
+                // 2 keeps throughput steadier than 4–8 (avoids stall → 0 B/s).
+                threads: Some(2),
                 piece_mb: Some(8),
             },
         );
@@ -96,7 +98,7 @@ mod tests {
     fn matches_subdomain() {
         let store = ProfileStore::builtin();
         let p = store.match_host("https://download123.mediafire.com/x/y");
-        assert_eq!(p.threads, Some(4));
+        assert_eq!(p.threads, Some(2));
     }
 
     #[test]

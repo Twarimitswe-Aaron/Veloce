@@ -24,7 +24,11 @@ pub struct PieceMetrics {
     pub worker: usize,
     pub start_byte: u64,
     pub end_byte: u64,
+    /// New bytes transferred in this (final successful) attempt.
     pub bytes_downloaded: u64,
+    /// Bytes already on disk when this attempt started (piece-level resume).
+    pub resumed_from: u64,
+    pub attempt: u8,
     pub duration_secs: f64,
     /// Time from request start to first body byte (includes any DNS, TCP, TLS, and server processing).
     pub ttfb_secs: f64,
@@ -47,7 +51,7 @@ impl PieceMetrics {
     }
 }
 
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
 pub const MAX_PIECE_RETRIES: usize = 10;
 
 pub fn failure_kind_from_status(code: u16) -> FailureKind {
@@ -67,25 +71,46 @@ pub async fn download_piece(
     expect_partial: bool,
     piece_idx: usize,
     worker_id: usize,
+    already_done: u64,
+    // Bytes already flushed for this piece (survives stall retries).
+    piece_written: &AtomicU64,
     worker_partial: &AtomicU64,
     bar: &ProgressBar,
     idle_timeout: Duration,
     limiter: &RateLimiter,
     read_buffer_bytes: usize,
     metrics: Option<&SegQueue<PieceMetrics>>,
+    attempt: u8,
     #[cfg(target_os = "linux")] mut uring: Option<&mut IoUringEngine>,
 ) -> anyhow::Result<()> {
-    worker_partial.store(0, Ordering::Relaxed);
     let piece_len = end - start + 1;
+    let already_done = already_done.min(piece_len);
+    worker_partial.store(already_done, Ordering::Relaxed);
+    piece_written.store(already_done, Ordering::Relaxed);
     bar.set_length(piece_len);
-    bar.set_position(0);
+    bar.set_position(already_done);
 
-    let range_str = format!("bytes={}-{}", start, end);
-    eprintln!("   🧩 Piece [{:.1} MB - {:.1} MB] ({:.1} MB)",
-        start as f64 / 1_048_576.0,
-        end as f64 / 1_048_576.0,
-        piece_len as f64 / 1_048_576.0
-    );
+    if already_done >= piece_len {
+        return Ok(());
+    }
+
+    let range_start = start + already_done;
+    let range_str = format!("bytes={}-{}", range_start, end);
+    if already_done > 0 {
+        eprintln!(
+            "   🧩 Piece [{:.1} MB - {:.1} MB] resume +{:.1} MB ({:.1} MB left)",
+            start as f64 / 1_048_576.0,
+            end as f64 / 1_048_576.0,
+            already_done as f64 / 1_048_576.0,
+            (piece_len - already_done) as f64 / 1_048_576.0
+        );
+    } else {
+        eprintln!("   🧩 Piece [{:.1} MB - {:.1} MB] ({:.1} MB)",
+            start as f64 / 1_048_576.0,
+            end as f64 / 1_048_576.0,
+            piece_len as f64 / 1_048_576.0
+        );
+    }
 
     let t_req = Instant::now();
     let res = client
@@ -117,11 +142,11 @@ pub async fn download_piece(
 
     let mut stream = res.bytes_stream();
     let mut t_first_byte: Option<Instant> = None;
-    let mut file_offset = start;
+    let mut file_offset = range_start;
     let mut buf: Vec<u8> = Vec::with_capacity(read_buffer_bytes);
-    let mut piece_done: u64 = 0;
+    let mut piece_done: u64 = already_done;
     let next_milestone = piece_len / 4; // log at 25%, 50%, 75%
-    let mut next_milestone_at = next_milestone;
+    let mut next_milestone_at = ((already_done / next_milestone.max(1)) + 1) * next_milestone.max(1);
     let mut milestone_printed = false;
 
     loop {
@@ -155,9 +180,10 @@ pub async fn download_piece(
                     file_offset += wrote;
                 }
 
-                worker_partial.fetch_add(n, Ordering::Relaxed);
                 piece_done += n;
-                bar.inc(n);
+                worker_partial.store(piece_done, Ordering::Relaxed);
+                piece_written.store(piece_done, Ordering::Relaxed);
+                bar.set_position(piece_done);
 
                 while piece_done >= next_milestone_at && next_milestone > 0 {
                     let pct = (piece_done as f64 / piece_len as f64) * 100.0;
@@ -210,7 +236,7 @@ pub async fn download_piece(
         .unwrap_or(duration_secs);
     let transfer_secs = duration_secs - ttfb_secs;
 
-    let bytes_dl = piece_done;
+    let bytes_dl = piece_done.saturating_sub(already_done);
     let xfer_speed = bytes_dl as f64 / 1_048_576.0 / transfer_secs.max(0.001);
     crate::elog!(
         "   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — TTFB {:5.2}s — Xfer {:5.2}s — {:5.1} MB/s",
@@ -232,6 +258,8 @@ pub async fn download_piece(
             start_byte: start,
             end_byte: end,
             bytes_downloaded: bytes_dl,
+            resumed_from: already_done,
+            attempt,
             duration_secs,
             ttfb_secs,
             transfer_secs,

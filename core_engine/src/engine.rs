@@ -5,7 +5,7 @@ use crate::io_uring_writer::IoUringEngine;
 
 use crate::adaptive::{AdaptiveController, FailureKind};
 use crate::args::EngineArgs;
-use crate::discover::{build_http_client, discover, supports_ranges};
+use crate::discover::{build_http_client, discover, discover_resume_quick, supports_ranges};
 use crate::download::{download_piece, format_bytes, PieceMetrics, IDLE_TIMEOUT, MAX_PIECE_RETRIES};
 use crate::file_io::{available_space, SharedOutput};
 use crate::piece::{adaptive_piece_size, piece_ranges};
@@ -80,7 +80,27 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         t_init.as_secs(),
         t_init.subsec_millis() / 10
     );
-    let discovery = discover(&client, &args.url).await?;
+
+    // Peek resume state before discovery — prefer a fast ranged probe over HEAD.
+    let state_path_buf = resolve_state_path(path);
+    let _ = ensure_sidecar_dir(path);
+    let peeked_resume = if path.exists() && state_path_buf.exists() {
+        ResumeState::load(&state_path_buf).filter(|s| s.total_size > 0 && s.piece_size > 0)
+    } else {
+        None
+    };
+
+    let discovery = if let Some(ref peeked) = peeked_resume {
+        match discover_resume_quick(&client, &args.url, peeked.total_size).await {
+            Ok(d) => d,
+            Err(e) => {
+                crate::elog!("   ⚠️  Resume quick-probe failed ({e}); full discovery…");
+                discover(&client, &args.url).await?
+            }
+        }
+    } else {
+        discover(&client, &args.url).await?
+    };
     let total_size = discovery.total_size;
     if total_size == 0 {
         return Err("Discovered file size is zero".into());
@@ -125,20 +145,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let _ = std::fs::remove_file(&sidecar);
     }
 
-    let state_path_buf = resolve_state_path(path);
     let state_path = state_path_buf.as_path();
-    let _ = ensure_sidecar_dir(path);
 
-    let resume_state: Option<ResumeState> = if path.exists() && state_path.exists() {
-        ResumeState::load(state_path).filter(|s| {
-            s.total_size == total_size
-                && s.piece_size > 0
-                && s.completed.len() == piece_ranges(total_size, s.piece_size).len()
-                && validators_match(s, &discovery.etag, &discovery.last_modified)
-        })
-    } else {
-        None
-    };
+    let resume_state: Option<ResumeState> = peeked_resume.filter(|s| {
+        s.total_size == total_size
+            && s.piece_size > 0
+            && s.completed.len() == piece_ranges(total_size, s.piece_size).len()
+            && validators_match(s, &discovery.etag, &discovery.last_modified)
+    });
 
     eprintln!("");
     eprintln!("━━━ [3/5] Preparing download ──────────────────── +{}.{:02}s",
@@ -285,8 +299,15 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let completed_count = Arc::new(AtomicU64::new((pieces.len() - remaining_count) as u64));
     let had_failure = Arc::new(AtomicBool::new(false));
     let failed_count = Arc::new(AtomicU64::new(0));
+    let retry_count = Arc::new(AtomicU64::new(0));
+    let stall_count = Arc::new(AtomicU64::new(0));
+    let busy_count = Arc::new(AtomicU64::new(0)); // 429/503
+    let peak_speed_bps = Arc::new(AtomicU64::new(0));
     let worker_partial: Arc<Vec<AtomicU64>> =
         Arc::new((0..effective_ceiling).map(|_| AtomicU64::new(0)).collect());
+    // Survives stall retries so we don't re-fetch already-written piece bytes.
+    let piece_written: Arc<Vec<AtomicU64>> =
+        Arc::new((0..pieces.len()).map(|_| AtomicU64::new(0)).collect());
     let limiter = Arc::new(RateLimiter::new(args.max_rate));
     let output = Arc::new(output);
 
@@ -363,7 +384,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let adaptive = Arc::clone(&adaptive);
         let had_failure = Arc::clone(&had_failure);
         let failed_count = Arc::clone(&failed_count);
+        let retry_count = Arc::clone(&retry_count);
+        let stall_count = Arc::clone(&stall_count);
+        let busy_count = Arc::clone(&busy_count);
         let worker_partial = Arc::clone(&worker_partial);
+        let piece_written = Arc::clone(&piece_written);
         let conn_bars = Arc::clone(&conn_bars);
         let limiter = Arc::clone(&limiter);
         let notify = Arc::clone(&notify);
@@ -414,6 +439,8 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 bar.set_message(""); // clear timing from previous piece
                 let expect_partial = piece_len < total_size;
 
+                let already = piece_written[idx].load(Ordering::Relaxed);
+                let attempt_n = attempts[idx].load(Ordering::Relaxed).saturating_add(1);
                 let res = download_piece(
                     &client,
                     &url,
@@ -423,12 +450,15 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     expect_partial,
                     idx,
                     w,
+                    already,
+                    &piece_written[idx],
                     &worker_partial[w],
                     bar,
                     IDLE_TIMEOUT,
                     &limiter,
                     read_buf,
                     Some(&piece_metrics),
+                    attempt_n,
                     #[cfg(target_os = "linux")]
                     uring.as_mut(),
                 )
@@ -437,11 +467,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 adaptive.release_slot();
                 slot_notify.notify_one();
 
-                let full = res.is_ok() && worker_partial[w].load(Ordering::Relaxed) == piece_len;
+                let written = piece_written[idx].load(Ordering::Relaxed);
+                let full = res.is_ok() && written == piece_len;
                 worker_partial[w].store(0, Ordering::Relaxed);
 
                 if full {
                     completed[idx].store(true, Ordering::Relaxed);
+                    // Move bytes from in-piece progress into completed_bytes.
+                    piece_written[idx].store(0, Ordering::Relaxed);
                     completed_bytes.fetch_add(piece_len, Ordering::Relaxed);
                     if remaining.fetch_sub(1, Ordering::Release) == 1 {
                         notify.notify_waiters();
@@ -450,18 +483,19 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     adaptive.on_success();
                 } else {
                     let n = attempts[idx].fetch_add(1, Ordering::Relaxed) as usize + 1;
-                    let kind = res
-                        .as_ref()
-                        .err()
-                        .and_then(|e| {
-                            let s = e.to_string();
-                            if s.contains("403") || s.contains("416") {
-                                Some(FailureKind::Permanent)
-                            } else {
-                                Some(FailureKind::Transient)
-                            }
-                        })
-                        .unwrap_or(FailureKind::Transient);
+                    retry_count.fetch_add(1, Ordering::Relaxed);
+                    let err_s = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+                    if err_s.contains("stalled") {
+                        stall_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if err_s.contains("429") || err_s.contains("503") || err_s.contains("server busy") {
+                        busy_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let kind = if err_s.contains("403") || err_s.contains("416") {
+                        FailureKind::Permanent
+                    } else {
+                        FailureKind::Transient
+                    };
 
                     if let Err(e) = &res {
                         eprintln!("[C{w}] piece {idx} failed (attempt {n}/{MAX_PIECE_RETRIES}): {e}");
@@ -490,11 +524,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
     let reporter = {
         let completed_bytes = Arc::clone(&completed_bytes);
-        let worker_partial = Arc::clone(&worker_partial);
+        let piece_written = Arc::clone(&piece_written);
         let remaining = Arc::clone(&remaining);
         let completed = Arc::clone(&completed);
         let completed_count = Arc::clone(&completed_count);
         let failed_count = Arc::clone(&failed_count);
+        let peak_speed_bps = Arc::clone(&peak_speed_bps);
         let adaptive = Arc::clone(&adaptive);
         let header_bar = header_bar.clone();
         let state_path = state_path.to_path_buf();
@@ -508,7 +543,12 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             let mut last_tick = Instant::now();
             let mut last_save = Instant::now();
             let mut smoothed_speed: f64 = 0.0;
-            
+            // High-water: piece retries / partial resets must not drop displayed bytes
+            // or invent fake 0 B/s / GiB/s spikes.
+            let mut high_water = baseline_bytes;
+            let mut calibrate_ticks: u8 = 0;
+            let mut stall_ticks: u8 = 0;
+
             let mut last_tune = Instant::now();
             let mut last_tune_speed: f64 = 0.0;
             let mut probing_up = false;
@@ -517,41 +557,78 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 ticker.tick().await;
 
                 let mut current = completed_bytes.load(Ordering::Relaxed);
-                for p in worker_partial.iter() {
+                for p in piece_written.iter() {
                     current += p.load(Ordering::Relaxed);
                 }
                 current = std::cmp::min(current, total_size);
-
-                let tick_secs = last_tick.elapsed().as_secs_f64();
-                let current_speed = (current.saturating_sub(last_bytes) as f64) / tick_secs.max(0.001);
-                
-                if smoothed_speed == 0.0 && current_speed > 0.0 {
-                    smoothed_speed = current_speed;
-                } else {
-                    // Exponential Moving Average (alpha = 0.2 for smoothing over ~2.5 seconds)
-                    smoothed_speed = (smoothed_speed * 0.8) + (current_speed * 0.2);
+                if current > high_water {
+                    high_water = current;
                 }
-                
-                // If speed drops extremely low, snap it to 0
-                if smoothed_speed < 1.0 {
-                    smoothed_speed = 0.0;
+
+                let tick_secs = last_tick.elapsed().as_secs_f64().max(0.001);
+                // Skip first ticks after resume so loading baseline ≠ GiB/s spike.
+                if calibrate_ticks < 2 {
+                    calibrate_ticks += 1;
+                    last_bytes = high_water;
+                    last_tick = Instant::now();
+                    header_bar.set_position(high_water);
+                    let done_count = completed_count.load(Ordering::Relaxed) as usize;
+                    header_bar.set_message(format!("{}/{} pieces", done_count, total_pieces));
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "progress",
+                            "downloaded": high_water,
+                            "total": total_size,
+                            "speed_bps": 0,
+                            "elapsed_secs": start_time.elapsed().as_secs_f64(),
+                            "eta_secs": 0,
+                            "connections": adaptive.current_limit(),
+                            "threads": []
+                        })
+                    );
+                    continue;
+                }
+
+                let delta = high_water.saturating_sub(last_bytes);
+                let instant = delta as f64 / tick_secs;
+                if delta == 0 {
+                    // Hold last speed ~2s (4 × 500ms) before decaying — CDN idle
+                    // gaps are common and must not report as 0 B/s instantly.
+                    stall_ticks = stall_ticks.saturating_add(1);
+                    if stall_ticks > 4 {
+                        smoothed_speed *= 0.88;
+                        if smoothed_speed < 1024.0 {
+                            smoothed_speed = 0.0;
+                        }
+                    }
+                } else {
+                    stall_ticks = 0;
+                    if smoothed_speed <= 0.0 {
+                        smoothed_speed = instant;
+                    } else {
+                        smoothed_speed = smoothed_speed * 0.70 + instant * 0.30;
+                    }
                 }
 
                 let speed_bps = smoothed_speed as u64;
+                let prev_peak = peak_speed_bps.load(Ordering::Relaxed);
+                if speed_bps > prev_peak {
+                    peak_speed_bps.store(speed_bps, Ordering::Relaxed);
+                }
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let eta_secs = if speed_bps > 0 {
-                    (total_size.saturating_sub(current) as f64 / speed_bps as f64) as u64
+                let eta_secs = if speed_bps > 1024 {
+                    (total_size.saturating_sub(high_water) as f64 / speed_bps as f64) as u64
                 } else {
                     0
                 };
-                
-                // Adaptive Tuning every 5 seconds
-                if auto_tune && last_tune.elapsed().as_secs() >= 5 {
+
+                // Adaptive tuning every 2 seconds (was 5s — too slow to recover).
+                if auto_tune && last_tune.elapsed().as_secs() >= 2 {
                     let limit = adaptive.current_limit();
                     let ceiling = adaptive.ceiling();
-                    
+
                     if probing_up {
-                        // We probed up last time. Did speed increase by at least 5%?
                         if smoothed_speed > (last_tune_speed * 1.05) && last_tune_speed > 1024.0 {
                             if limit < ceiling {
                                 adaptive.set_limit(limit + 1);
@@ -559,30 +636,26 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                                 eprintln!("   📈 Auto-tune: Speed increased to {:.1} MB/s. Probing {} -> {} connections.", smoothed_speed / 1_048_576.0, limit, limit + 1);
                             }
                         } else {
-                            // No speed increase, we hit the bottleneck. Step back.
                             if limit > 1 {
                                 adaptive.set_limit(limit - 1);
                             }
                             probing_up = false;
                             eprintln!("   🛑 Auto-tune: Bandwidth ceiling reached at {:.1} MB/s. Stepping back to {} connections.", smoothed_speed / 1_048_576.0, limit.saturating_sub(1).max(1));
                         }
-                    } else {
-                        // We weren't probing. Start a probe to see if more bandwidth freed up.
-                        if limit < ceiling {
-                            probing_up = true;
-                            adaptive.set_limit(limit + 1);
-                            slot_notify.notify_waiters();
-                            eprintln!("   🔍 Auto-tune: Probing for more bandwidth ({} -> {} connections).", limit, limit + 1);
-                        }
+                    } else if limit < ceiling {
+                        probing_up = true;
+                        adaptive.set_limit(limit + 1);
+                        slot_notify.notify_waiters();
+                        eprintln!("   🔍 Auto-tune: Probing for more bandwidth ({} -> {} connections).", limit, limit + 1);
                     }
-                    
+
                     last_tune = Instant::now();
                     last_tune_speed = smoothed_speed;
                 }
 
-                last_bytes = current;
+                last_bytes = high_water;
                 last_tick = Instant::now();
-                header_bar.set_position(current);
+                header_bar.set_position(high_water);
 
                 let done_count = completed_count.load(Ordering::Relaxed) as usize;
                 let fail = failed_count.load(Ordering::Relaxed);
@@ -611,7 +684,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     "{}",
                     json!({
                         "type": "progress",
-                        "downloaded": current,
+                        "downloaded": high_water,
                         "total": total_size,
                         "speed_bps": speed_bps,
                         "elapsed_secs": elapsed,
@@ -621,7 +694,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     })
                 );
 
-                if current >= total_size || remaining.load(Ordering::Acquire) == 0 {
+                if high_water >= total_size || remaining.load(Ordering::Acquire) == 0 {
                     break;
                 }
             }
@@ -637,9 +710,17 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
     let final_dl = completed_bytes.load(Ordering::SeqCst);
     let elapsed = start_time.elapsed().as_secs_f64();
-    let avg_mbps = (final_dl as f64 / 1_048_576.0) / elapsed;
-
     let t_download = start_time.elapsed() - t_prep;
+    let session_bytes = final_dl.saturating_sub(baseline_bytes);
+    let download_secs = t_download.as_secs_f64().max(0.001);
+    let session_mbps = (session_bytes as f64 / 1_048_576.0) / download_secs;
+    // Wall average over full file size is misleading on resume — keep for compat only.
+    let wall_mbps = (final_dl as f64 / 1_048_576.0) / elapsed.max(0.001);
+    let peak_mbps = peak_speed_bps.load(Ordering::Relaxed) as f64 / 1_048_576.0;
+    let retries = retry_count.load(Ordering::Relaxed);
+    let stalls = stall_count.load(Ordering::Relaxed);
+    let busy = busy_count.load(Ordering::Relaxed);
+    let fails = failed_count.load(Ordering::Relaxed);
 
     // Collect and sort piece metrics for the summary table
     let mut sorted_metrics: Vec<PieceMetrics> = Vec::with_capacity(num_pieces);
@@ -648,61 +729,166 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     }
     sorted_metrics.sort_by_key(|m| m.piece_idx);
 
+    let host = url::Url::parse(&args.url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "unknown".into());
+
     eprintln!("");
     eprintln!("━━━ [5/5] Complete ─────────────────────────────── +{:.1}s", elapsed);
 
-    // Chunk summary table with timing breakdown
-    eprintln!("   ┌──── Chunk Download Summary ─────────────────────────────────────────────────────────────────────────────┐");
-    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>6} │ {:>6} │ {:>8} │",
-        "Chunk", "Range", "Bytes", "Downloaded", "TTFB", "Xfer", "Speed");
-    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>8}┼{:─>8}┼{:─>10}┤",
-        "─", "─", "─", "─", "─", "─", "─");
+    // Diagnostic block — the useful signals for CDN / resume / throttle analysis.
+    eprintln!("   ┌──── Session diagnostics ──────────────────────────────────────────────────────────┐");
+    eprintln!(
+        "   │ Host: {:<62} │",
+        truncate_str(&host, 62)
+    );
+    eprintln!(
+        "   │ Workers: {}  |  piece: {} MB  |  auto-tune: {:<5}  |  ranges: {:<5} │",
+        effective_ceiling,
+        piece_size / (1024 * 1024),
+        if auto_tune { "on" } else { "off" },
+        if ranges_ok { "yes" } else { "no" }
+    );
+    eprintln!(
+        "   │ Resume baseline: {} ({:.1}%)  |  session transfer: {}  │",
+        format_bytes(baseline_bytes),
+        if total_size > 0 {
+            baseline_bytes as f64 / total_size as f64 * 100.0
+        } else {
+            0.0
+        },
+        format_bytes(session_bytes)
+    );
+    eprintln!(
+        "   │ Speed: session {:.2} MB/s  |  peak {:.2} MB/s  |  wall {:.2} MB/s (full file/time) │",
+        session_mbps, peak_mbps, wall_mbps
+    );
+    eprintln!(
+        "   │ Health: retries={}  stalls={}  busy(429/503)={}  permanent_fail={}  │",
+        retries, stalls, busy, fails
+    );
 
-    let mut total_dl_bytes: u64 = 0;
-    for m in &sorted_metrics {
-        let range_start = format!("{:.1}", m.start_byte as f64 / 1_048_576.0);
-        let range_end = format!("{:.1}", m.end_byte as f64 / 1_048_576.0);
-        let range = format!("{}–{} MB", range_start, range_end);
-        let size_s = format_bytes(m.size());
-        let dl_s = format_bytes(m.bytes_downloaded);
-        total_dl_bytes += m.bytes_downloaded;
-        eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>5.2}s │ {:>5.2}s │ {:>5.1} MB/s│",
-            m.piece_idx,
-            range,
-            size_s,
-            dl_s,
-            m.ttfb_secs,
-            m.transfer_secs,
-            m.speed_mbps()
+    if !sorted_metrics.is_empty() {
+        let mut ttfbs: Vec<f64> = sorted_metrics.iter().map(|m| m.ttfb_secs).collect();
+        let mut xfers: Vec<f64> = sorted_metrics.iter().map(|m| m.transfer_secs).collect();
+        ttfbs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        xfers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p = |v: &[f64], q: f64| -> f64 {
+            if v.is_empty() {
+                return 0.0;
+            }
+            let i = ((v.len() as f64 - 1.0) * q).round() as usize;
+            v[i.min(v.len() - 1)]
+        };
+        let slow = sorted_metrics
+            .iter()
+            .filter(|m| m.transfer_secs >= 60.0 || m.ttfb_secs >= 10.0)
+            .count();
+        let resumed_pieces = sorted_metrics.iter().filter(|m| m.resumed_from > 0).count();
+        let multi_attempt = sorted_metrics.iter().filter(|m| m.attempt > 1).count();
+        eprintln!(
+            "   │ TTFB p50/p95: {:.2}s / {:.2}s  |  Xfer p50/p95: {:.1}s / {:.1}s  │",
+            p(&ttfbs, 0.50),
+            p(&ttfbs, 0.95),
+            p(&xfers, 0.50),
+            p(&xfers, 0.95)
+        );
+        eprintln!(
+            "   │ Pieces this session: {}  |  slow (TTFB≥10s or Xfer≥60s): {}  │",
+            sorted_metrics.len(),
+            slow
+        );
+        eprintln!(
+            "   │ Piece-resume hits: {}  |  finished after retry: {}  │",
+            resumed_pieces, multi_attempt
         );
     }
+    eprintln!(
+        "   │ Stages: init {:.2}s + discover {:.2}s + prep {:.2}s + download {:.1}s  │",
+        t_init.as_secs_f64(),
+        (t_discover - t_init).as_secs_f64(),
+        (t_prep - t_discover).as_secs_f64(),
+        download_secs
+    );
+    eprintln!("   └──────────────────────────────────────────────────────────────────────────────────┘");
 
-    eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>12}┼{:─>8}┼{:─>8}┼{:─>10}┤",
-        "─", "─", "─", "─", "─", "─", "─");
-
-    let total_speed_mbps = if avg_mbps > 0.0 { avg_mbps } else {
-        total_dl_bytes as f64 / 1_048_576.0 / elapsed.max(0.001)
+    // Chunk table: full when small; otherwise only the slowest outliers.
+    let show_all = sorted_metrics.len() <= 24;
+    let table_rows: Vec<&PieceMetrics> = if show_all {
+        sorted_metrics.iter().collect()
+    } else {
+        let mut slowest: Vec<&PieceMetrics> = sorted_metrics.iter().collect();
+        slowest.sort_by(|a, b| {
+            b.transfer_secs
+                .partial_cmp(&a.transfer_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        slowest.truncate(12);
+        slowest.sort_by_key(|m| m.piece_idx);
+        slowest
     };
-    eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>10} │ {:>6} │ {:>5.2}s │ {:>5.1} MB/s│",
-        "Σ",
-        format!("0–{:.1} MB", total_size as f64 / 1_048_576.0),
-        format_bytes(total_size),
-        format_bytes(total_dl_bytes),
-        "—",
-        elapsed,
-        total_speed_mbps
-    );
-    eprintln!("   └{:─>7}┴{:─>20}┴{:─>11}┴{:─>12}┴{:─>8}┴{:─>8}┴{:─>10}┘",
-        "─", "─", "─", "─", "─", "─", "─");
 
-    eprintln!("   📦 Downloaded: {} / {} bytes", final_dl, total_size);
-    eprintln!("   ⚡ Avg speed:  {:.1} MB/s", avg_mbps);
-    eprintln!("   ⏱  Stages:     init {}.{:02}s + discover {}.{:02}s + prep {}.{:02}s + download {:.1}s",
-        t_init.as_secs(), t_init.subsec_millis() / 10,
-        (t_discover - t_init).as_secs(), (t_discover - t_init).subsec_millis() / 10,
-        (t_prep - t_discover).as_secs(), (t_prep - t_discover).subsec_millis() / 10,
-        t_download.as_secs_f64()
-    );
+    if !table_rows.is_empty() {
+        eprintln!("   ┌──── Chunk detail {}──────────────────────────────────────────────────────────────────┐",
+            if show_all { "" } else { "(slowest 12) " }
+        );
+        eprintln!("   │ {:>5} │ {:>18} │ {:>9} │ {:>8} │ {:>6} │ {:>6} │ {:>7} │ {:>3} │",
+            "Chunk", "Range", "New bytes", "Resume+", "TTFB", "Xfer", "MB/s", "Try");
+        eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>10}┼{:─>8}┼{:─>8}┼{:─>9}┼{:─>5}┤",
+            "─", "─", "─", "─", "─", "─", "─", "─");
+
+        let mut total_dl_bytes: u64 = 0;
+        for m in &sorted_metrics {
+            total_dl_bytes += m.bytes_downloaded;
+        }
+        for m in &table_rows {
+            let range = format!(
+                "{:.1}–{:.1} MB",
+                m.start_byte as f64 / 1_048_576.0,
+                m.end_byte as f64 / 1_048_576.0
+            );
+            eprintln!(
+                "   │ {:>5} │ {:>18} │ {:>9} │ {:>8} │ {:>5.2}s │ {:>5.1}s │ {:>5.2} │ {:>3} │",
+                m.piece_idx,
+                range,
+                format_bytes(m.bytes_downloaded),
+                if m.resumed_from > 0 {
+                    format_bytes(m.resumed_from)
+                } else {
+                    "—".into()
+                },
+                m.ttfb_secs,
+                m.transfer_secs,
+                m.speed_mbps(),
+                m.attempt
+            );
+        }
+
+        eprintln!("   ├{:─>7}┼{:─>20}┼{:─>11}┼{:─>10}┼{:─>8}┼{:─>8}┼{:─>9}┼{:─>5}┤",
+            "─", "─", "─", "─", "─", "─", "─", "─");
+        eprintln!(
+            "   │ {:>5} │ {:>18} │ {:>9} │ {:>8} │ {:>6} │ {:>5.1}s │ {:>5.2} │ {:>3} │",
+            "Σ",
+            format!("session pieces"),
+            format_bytes(total_dl_bytes),
+            "—",
+            "—",
+            download_secs,
+            session_mbps,
+            "—"
+        );
+        if !show_all {
+            eprintln!(
+                "   │ … {} other pieces omitted (see diagnostics for p50/p95)                              │",
+                sorted_metrics.len().saturating_sub(table_rows.len())
+            );
+        }
+        eprintln!("   └──────────────────────────────────────────────────────────────────────────────────────┘");
+    }
+
+    eprintln!("   📦 File: {} / {}  |  session {}", format_bytes(final_dl), format_bytes(total_size), format_bytes(session_bytes));
+    eprintln!("   ⚡ Session {:.2} MB/s (peak {:.2}) — use this, not wall {:.2} on resumes", session_mbps, peak_mbps, wall_mbps);
 
     println!(
         "{}",
@@ -737,9 +923,25 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
             "type": "done",
             "total": total_size,
             "elapsed_secs": elapsed,
-            "avg_speed_mbps": avg_mbps
+            "avg_speed_mbps": session_mbps,
+            "session_bytes": session_bytes,
+            "baseline_bytes": baseline_bytes,
+            "peak_speed_mbps": peak_mbps,
+            "retries": retries,
+            "stalls": stalls,
+            "busy_responses": busy,
+            "workers": effective_ceiling,
+            "host": host,
         })
     );
 
     Ok(())
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
 }

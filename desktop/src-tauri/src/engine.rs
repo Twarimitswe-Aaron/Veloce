@@ -73,6 +73,25 @@ pub struct EngineProgress {
     pub eta_secs: Option<u64>,
     pub elapsed_secs: Option<f64>,
     pub error: Option<String>,
+    /// Session throughput (excludes resume baseline) — present on `done`.
+    #[serde(default)]
+    pub avg_speed_mbps: Option<f64>,
+    #[serde(default)]
+    pub session_bytes: Option<u64>,
+    #[serde(default)]
+    pub baseline_bytes: Option<u64>,
+    #[serde(default)]
+    pub peak_speed_mbps: Option<f64>,
+    #[serde(default)]
+    pub retries: Option<u64>,
+    #[serde(default)]
+    pub stalls: Option<u64>,
+    #[serde(default)]
+    pub busy_responses: Option<u64>,
+    #[serde(default)]
+    pub workers: Option<u64>,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 impl EngineProcess {
@@ -330,6 +349,15 @@ mod tests {
             eta_secs: Some(30),
             elapsed_secs: Some(10.0),
             error: None,
+            avg_speed_mbps: None,
+            session_bytes: None,
+            baseline_bytes: None,
+            peak_speed_mbps: None,
+            retries: None,
+            stalls: None,
+            busy_responses: None,
+            workers: None,
+            host: None,
         };
         let json = serde_json::to_string(&p).expect("should serialize");
         let back: EngineProgress = serde_json::from_str(&json).expect("should deserialize");

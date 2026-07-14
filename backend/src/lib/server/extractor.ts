@@ -709,6 +709,21 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 
 const MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+/** Short TTL cache so enqueue + engine-start don't double-scrape (~5s → ~0 on hit). */
+const mediafireCdnCache = new Map<string, { url: string; at: number }>();
+const MEDIAFIRE_CDN_TTL_MS = 90_000;
+
+function mediafireCacheKey(url: string): string {
+	try {
+		const u = new URL(url);
+		u.search = '';
+		u.hash = '';
+		return u.toString().replace(/\/$/, '');
+	} catch {
+		return url.replace(/\/$/, '');
+	}
+}
+
 function isMediafireCdnHost(hostname: string): boolean {
 	return /^download\d+\.mediafire\.com$/i.test(hostname);
 }
@@ -788,21 +803,33 @@ async function parseMediafirePage(url: string): Promise<string | null> {
 }
 
 async function resolveMediafireDownload(url: string): Promise<string | null> {
+	const key = mediafireCacheKey(url);
+	const hit = mediafireCdnCache.get(key);
+	if (hit && Date.now() - hit.at < MEDIAFIRE_CDN_TTL_MS) {
+		return hit.url;
+	}
+
+	let resolved: string | null = null;
 	if (isMediafireFilePage(url)) {
-		return parseMediafirePage(url);
-	}
-	if (isMediafireCdnHost(new URL(url).hostname)) {
+		resolved = await parseMediafirePage(url);
+	} else if (isMediafireCdnHost(new URL(url).hostname)) {
 		const live = await probeMediafireCdn(url);
-		if (live) return live;
-		const filePage = mediafireFilePageFromCdn(url);
-		if (filePage) {
-			return parseMediafirePage(filePage);
+		if (live) {
+			resolved = live;
+		} else {
+			const filePage = mediafireFilePageFromCdn(url);
+			if (filePage) {
+				resolved = await parseMediafirePage(filePage);
+			}
 		}
+	} else if (url.includes('mediafire.com')) {
+		resolved = await parseMediafirePage(url);
 	}
-	if (url.includes('mediafire.com')) {
-		return parseMediafirePage(url);
+
+	if (resolved) {
+		mediafireCdnCache.set(key, { url: resolved, at: Date.now() });
 	}
-	return null;
+	return resolved;
 }
 
 function dedupeFormats(out: MediaFormat[]): MediaFormat[] {

@@ -453,16 +453,22 @@ fn file_url(path: &Path) -> String {
 /// Open a file or folder with the OS default handler (cross-platform).
 pub fn open_path(target: &str) -> Result<(), String> {
     use std::process::Command;
-    let path = Path::new(target);
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("Empty path".into());
+    }
+    let path = Path::new(trimmed);
     if !path.exists() {
-        return Err(format!("Path does not exist: {target}"));
+        return Err(format!(
+            "File not found:\n{trimmed}\n\nIt may have been moved or deleted. Check Settings → download folder."
+        ));
     }
 
     #[cfg(target_os = "macos")]
     {
         return spawn_detached({
             let mut c = Command::new("open");
-            c.arg(target);
+            c.arg(trimmed);
             c
         });
     }
@@ -470,16 +476,20 @@ pub fn open_path(target: &str) -> Result<(), String> {
     {
         return spawn_detached({
             let mut c = Command::new("cmd");
-            c.args(["/C", "start", "", target]);
+            c.args(["/C", "start", "", trimmed]);
             c
         });
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        // Linux / BSD — try xdg-open, then gio
+        // Prefer absolute path — xdg-open is unreliable with relative / spaces otherwise.
+        let abs = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
         if spawn_detached({
             let mut c = Command::new("xdg-open");
-            c.arg(target);
+            c.arg(&abs);
             c
         })
         .is_ok()
@@ -488,7 +498,7 @@ pub fn open_path(target: &str) -> Result<(), String> {
         }
         spawn_detached({
             let mut c = Command::new("gio");
-            c.args(["open", target]);
+            c.args(["open", &abs]);
             c
         })
     }
@@ -497,9 +507,19 @@ pub fn open_path(target: &str) -> Result<(), String> {
 /// Reveal a file in the file manager (highlight when supported).
 pub fn reveal_in_folder(file_path: &str) -> Result<(), String> {
     use std::process::Command;
-    let path = Path::new(file_path);
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("Empty path".into());
+    }
+    let path = Path::new(trimmed);
     if !path.exists() {
-        return Err(format!("Path does not exist: {file_path}"));
+        // Still open parent if the file vanished but folder exists.
+        if let Some(parent) = path.parent().filter(|p| p.exists()) {
+            return open_path(&parent.to_string_lossy());
+        }
+        return Err(format!(
+            "File not found:\n{trimmed}\n\nIt may have been moved or deleted."
+        ));
     }
     let parent = path
         .parent()
@@ -509,7 +529,7 @@ pub fn reveal_in_folder(file_path: &str) -> Result<(), String> {
     {
         return spawn_detached({
             let mut c = Command::new("open");
-            c.args(["-R", file_path]);
+            c.args(["-R", trimmed]);
             c
         });
     }
@@ -517,7 +537,7 @@ pub fn reveal_in_folder(file_path: &str) -> Result<(), String> {
     {
         return spawn_detached({
             let mut c = Command::new("explorer");
-            c.arg(format!("/select,{file_path}"));
+            c.arg(format!("/select,{trimmed}"));
             c
         });
     }

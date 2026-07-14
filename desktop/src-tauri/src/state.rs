@@ -160,7 +160,7 @@ impl AppState {
                         .or_else(|| json.get("baseDirectory"))
                         .and_then(|v| v.as_str());
                     if let Some(d) = dir.filter(|d| !d.is_empty()) {
-                        save_dir = std::path::PathBuf::from(d);
+                        save_dir = crate::config::ensure_media_download_dir(std::path::PathBuf::from(d));
                     }
                     if let Some(t) = json
                         .get("default_threads")
@@ -209,8 +209,10 @@ impl AppState {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                 {
-                    obj.insert("base_dir".into(), serde_json::json!(d));
-                    obj.insert("baseDirectory".into(), serde_json::json!(d));
+                    let safe = crate::config::ensure_media_download_dir(std::path::PathBuf::from(d));
+                    let s = safe.to_string_lossy().to_string();
+                    obj.insert("base_dir".into(), serde_json::json!(s));
+                    obj.insert("baseDirectory".into(), serde_json::json!(s));
                 }
                 if let Some(t) = obj
                     .get("default_threads")
@@ -335,17 +337,30 @@ impl AppState {
             progress_pct,
         };
 
-        let _ = self.runtime_handle.block_on(async {
+        let skip = self.runtime_handle.block_on(async {
             let mut progress = self.progress.lock().await;
             if let Some(entry) = progress.get_mut(id) {
+                // Ignore late ticks after the job finished — they flip UI back to "loading".
+                if matches!(
+                    entry.status.as_str(),
+                    "completed" | "failed" | "cancelled" | "error"
+                ) {
+                    return true;
+                }
                 entry.downloaded = downloaded;
                 entry.total = total;
                 entry.speed_bps = speed_bps;
                 entry.eta_secs = eta_secs;
                 entry.progress_pct = progress_pct;
-                entry.status = "downloading".to_string();
+                if entry.status != "paused" {
+                    entry.status = "downloading".to_string();
+                }
             }
+            false
         });
+        if skip {
+            return;
+        }
 
         let _ = self.db.update_download_progress(
             id,

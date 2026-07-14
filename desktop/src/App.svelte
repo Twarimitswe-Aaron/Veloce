@@ -194,17 +194,23 @@
   onMount(async () => {
     unlistenProgress = await listen<ProgressEvent>("download-progress", (event) => {
       const p = event.payload;
+      const prev = downloads.find((d) => d.id === p.id);
+      // Never let late progress ticks reopen a finished/paused job or wipe paths.
+      if (prev && ["completed", "failed", "cancelled", "error"].includes(prev.status)) {
+        return;
+      }
       upsertDownload({
         id: p.id,
-        url: "",
-        file_name: downloads.find((d) => d.id === p.id)?.file_name ?? "",
-        save_path: "",
-        status: "downloading",
+        url: prev?.url ?? "",
+        file_name: prev?.file_name ?? "",
+        save_path: prev?.save_path ?? "",
+        status: prev?.status === "paused" ? "paused" : "downloading",
         downloaded: p.downloaded,
         total: p.total,
         speed_bps: p.speed_bps,
         eta_secs: p.eta_secs,
         progress_pct: p.progress_pct,
+        error: undefined,
       });
     });
 
@@ -442,37 +448,50 @@
   }
 
   async function openFolder(path: string) {
-    if (!path) return;
+    const target = path?.trim();
+    if (!target) {
+      alert("No file path saved for this download. Re-download or check History.");
+      return;
+    }
     try {
-      await invoke("reveal_in_folder", { path });
+      await invoke("reveal_in_folder", { path: target });
     } catch (e) {
       console.error(e);
       try {
         const dir =
-          path.substring(0, path.lastIndexOf("/")) ||
-          path.substring(0, path.lastIndexOf("\\"));
+          target.substring(0, target.lastIndexOf("/")) ||
+          target.substring(0, target.lastIndexOf("\\"));
         if (dir) await invoke("open_path", { path: dir });
+        else alert(String(e));
       } catch (e2) {
         console.error(e2);
+        alert(String(e2));
       }
     }
   }
 
   async function openDir(path: string) {
-    if (!path) return;
+    const target = path?.trim();
+    if (!target) return;
     try {
-      await invoke("open_path", { path });
+      await invoke("open_path", { path: target });
     } catch (e) {
       console.error(e);
+      alert(String(e));
     }
   }
 
   async function openFile(path: string) {
-    if (!path) return;
+    const target = path?.trim();
+    if (!target) {
+      alert("No file path saved for this download. Try History → Open File, or check Settings → download folder.");
+      return;
+    }
     try {
-      await invoke("open_path", { path });
+      await invoke("open_path", { path: target });
     } catch (e) {
       console.error(e);
+      alert(String(e));
     }
   }
 
@@ -541,7 +560,15 @@
   function upsertDownload(dl: DownloadStatus) {
     const idx = downloads.findIndex((d) => d.id === dl.id);
     if (idx >= 0) {
-      downloads[idx] = { ...downloads[idx], ...dl };
+      const prev = downloads[idx];
+      downloads[idx] = {
+        ...prev,
+        ...dl,
+        // Never clobber known path/name with empty progress payloads.
+        save_path: dl.save_path || prev.save_path || "",
+        file_name: dl.file_name || prev.file_name || "",
+        url: dl.url || prev.url || "",
+      };
       downloads = downloads;
     } else {
       downloads = [...downloads, dl];
@@ -711,7 +738,8 @@
                 <div class="progress-bar">
                   <div
                     class="progress-fill"
-                    style="width: {dl.progress_pct}%"
+                    class:done={dl.status === "completed"}
+                    style="width: {dl.status === 'completed' ? 100 : dl.progress_pct}%"
                   ></div>
                 </div>
                 <span class="dl-size">
@@ -891,7 +919,10 @@
             <label>
               <span>Base Directory</span>
               <div class="dir-row">
-                <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
+                <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce/media" />
+                <p class="hint" style="margin-top:6px;font-size:11px;color:var(--veloce-muted)">
+                  Videos go here. If this path is the Veloce source repo, the app uses a <code>media/</code> subfolder automatically.
+                </p>
                 <button type="button" class="btn-browse" onclick={browseDirectory} disabled={pickerBusy}>
                   {pickerBusy ? "…" : "Browse"}
                 </button>
@@ -1293,6 +1324,16 @@
     background: var(--veloce-green);
     border-radius: 2px;
     transition: width 0.3s ease;
+  }
+
+  /* Completed: solid success tone, no “still downloading” neon look */
+  .progress-fill.done {
+    background: var(--veloce-success);
+    transition: none;
+  }
+
+  .download-item.status-completed .progress-bar {
+    opacity: 0.85;
   }
 
   .dl-size {

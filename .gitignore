@@ -35,9 +35,9 @@ vite.config.ts.timestamp-*
 # !**/target/release/veloce-desktop
 # !**/target/release/bundle/
 
-# ── macOS ────────────────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
+# ── Local download media (if someone points base_dir at the repo) ─────────────
+/media/
+**/Downloads/Veloce/media/
 
 # ── Environment ──────────────────────────────────────────────────────────────
 .env

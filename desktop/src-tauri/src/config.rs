@@ -51,14 +51,39 @@ impl Config {
 
     pub fn base_directory(&self) -> PathBuf {
         if let Some(dir) = &self.base_dir {
-            PathBuf::from(dir)
-        } else {
+            return ensure_media_download_dir(PathBuf::from(dir));
+        }
+        ensure_media_download_dir(
             dirs::home_dir()
                 .unwrap_or(PathBuf::from("."))
                 .join("Downloads")
-                .join("Veloce")
-        }
+                .join("Veloce"),
+        )
     }
+}
+
+/// If `dir` looks like the Veloce source tree (AGENTS.md + core_engine / .git),
+/// store downloads under `dir/media` so videos never mix with source.
+pub fn ensure_media_download_dir(dir: PathBuf) -> PathBuf {
+    if looks_like_veloce_source_tree(&dir) {
+        let media = dir.join("media");
+        let _ = std::fs::create_dir_all(&media);
+        log::warn!(
+            "[Config] Download folder looks like the Veloce source tree ({}); using {} instead",
+            dir.display(),
+            media.display()
+        );
+        return media;
+    }
+    dir
+}
+
+fn looks_like_veloce_source_tree(dir: &std::path::Path) -> bool {
+    let agents = dir.join("AGENTS.md").is_file();
+    let engine = dir.join("core_engine").is_dir();
+    let desktop = dir.join("desktop").is_dir();
+    let git = dir.join(".git").exists();
+    (agents && (engine || desktop)) || (git && engine && desktop)
 }
 
 fn env_var<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -69,5 +94,29 @@ fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
         Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn source_tree_redirects_to_media() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "x").unwrap();
+        fs::create_dir(dir.path().join("core_engine")).unwrap();
+        fs::create_dir(dir.path().join("desktop")).unwrap();
+        let out = ensure_media_download_dir(dir.path().to_path_buf());
+        assert_eq!(out, dir.path().join("media"));
+        assert!(out.is_dir());
+    }
+
+    #[test]
+    fn plain_folder_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = ensure_media_download_dir(dir.path().to_path_buf());
+        assert_eq!(out, dir.path());
     }
 }
