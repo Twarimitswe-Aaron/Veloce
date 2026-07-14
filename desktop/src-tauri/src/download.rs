@@ -255,6 +255,15 @@ pub async fn resolve_download_url(
         return Ok(resolved);
     }
 
+    // OmniSave / MovieBox: formats come from the site API (extension intercept), not yt-dlp.
+    // Without a CDN direct_url, extraction on the catalog page hangs and never yields a file.
+    if formats::is_intercept_catalog_url(page_url) {
+        return Err(
+            "This site needs the in-page download link (open Download Options on the player, then use the Veloce badge). Resume keeps the CDN URL from the original job."
+                .to_string(),
+        );
+    }
+
     let normalized = formats::normalize_url(page_url);
     if let Some(cached) = state.best_url_cache.get(&normalized) {
         log::info!(" -> Using cached extraction for {}", normalized);
@@ -975,6 +984,9 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
             );
         }
     }
+    // Drop a stale queue entry so we don't double-start the same id.
+    let _ = state.scheduler.remove_queued(id);
+
     let _ = state.db.update_download_status(id, "queued");
     state.ws_clients.broadcast_ack(id, &row.file_name, "queued");
     state.emit_status(id, "queued", None).await;
@@ -986,12 +998,20 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
         "queued",
     );
 
-    enqueue_download_job(
-        state,
+    // MediaFire tokens expire — clear so resolve/engine start re-scrapes.
+    // OmniSave / intercept CDNs must keep the stored direct_url (page URL is not downloadable).
+    let page_source = formats::detect_source(&row.url);
+    let direct_url = if page_source == formats::MediaSource::MediaFire {
+        None
+    } else {
+        row.direct_url.clone().filter(|u| !u.is_empty())
+    };
+
+    if let Err(e) = enqueue_download_job(
+        state.clone(),
         StartDownloadRequest {
             url: row.url.clone(),
-            // Clear stale CDN tokens — MediaFire / signed URLs are re-resolved in resolve + engine start.
-            direct_url: None,
+            direct_url,
             file_name: row.file_name.clone(),
             referer: row.referer.clone(),
             device_id: row.device_id.clone(),
@@ -1001,7 +1021,14 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
             threads: None,
         },
     )
-    .await?;
+    .await
+    {
+        let _ = state.db.update_download_status(id, "failed");
+        state
+            .emit_status(id, "failed", Some(e.clone()))
+            .await;
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -1144,6 +1171,36 @@ mod tests {
         .await
         .expect("direct");
         assert_eq!(url, "https://cdn.example.com/direct.mp4");
+    }
+
+    #[tokio::test]
+    async fn resolve_omnisave_page_without_direct_fails_fast() {
+        let state = test_state();
+        let err = resolve_download_url(
+            &state,
+            "https://videodownloader.site/?q=Absolutely%20Anything",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("in-page download") || err.contains("CDN"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_omnisave_keeps_cdn_direct_url() {
+        let state = test_state();
+        let cdn = "https://bcdnxw.hakunaymatata.com/tran-audio/x.mp4?token=1";
+        let url = resolve_download_url(
+            &state,
+            "https://videodownloader.site/?q=Absolutely%20Anything",
+            Some(cdn),
+        )
+        .await
+        .expect("cdn direct");
+        assert_eq!(url, cdn);
     }
 
     /// Listing must seed best_url_cache so a Best-style resolve without directUrl

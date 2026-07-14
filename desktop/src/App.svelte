@@ -754,11 +754,16 @@
                 {#if dl.status === "downloading"}
                   <span class="dl-speed">{formatSpeed(dl.speed_bps)}</span>
                   <span class="dl-eta">ETA: {dl.eta_secs > 0 ? formatEta(dl.eta_secs) : '--'}</span>
+                {:else if dl.status === "queued"}
+                  <span class="dl-eta">Waiting in queue…</span>
                 {/if}
               </div>
               <div class="dl-actions">
-                {#if dl.status === "downloading" || dl.status === "queued"}
+                {#if dl.status === "downloading"}
                   <button onclick={() => pauseDownload(dl.id)}>Pause</button>
+                  <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
+                {:else if dl.status === "queued"}
+                  <button onclick={() => resumeDownload(dl.id)}>Start</button>
                   <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
                 {:else if dl.status === "paused"}
                   <button onclick={() => resumeDownload(dl.id)}>Resume</button>

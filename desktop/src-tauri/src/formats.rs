@@ -272,6 +272,18 @@ pub fn is_manifest_format_url(url: &str) -> bool {
         || lower.contains("format=m3u8")
 }
 
+/// OmniSave / MovieBox / netfilm catalog pages — media URLs come from site API intercept only.
+pub fn is_intercept_catalog_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    host.contains("videodownloader.site")
+        || host.contains("moviebox.")
+        || host.contains("netfilm.")
+        || host.contains("aoneroom.com")
+}
+
 /// Redirect/API/graphql trap URLs — backend parity.
 pub fn is_trap_download_url(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -612,6 +624,18 @@ mod tests {
     #[test]
     fn test_detect_source_mediafire() {
         assert_eq!(detect_source("https://www.mediafire.com/file/abc/file.zip/file"), MediaSource::MediaFire);
+    }
+
+    #[test]
+    fn test_is_intercept_catalog_url() {
+        assert!(is_intercept_catalog_url(
+            "https://videodownloader.site/?q=Absolutely%20Anything"
+        ));
+        assert!(is_intercept_catalog_url("https://www.moviebox.ph/moviedetail/x"));
+        assert!(!is_intercept_catalog_url(
+            "https://bcdnxw.hakunaymatata.com/file.mp4"
+        ));
+        assert!(!is_intercept_catalog_url("https://www.youtube.com/watch?v=x"));
     }
 
     #[test]
