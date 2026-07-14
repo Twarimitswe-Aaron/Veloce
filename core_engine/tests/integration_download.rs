@@ -15,6 +15,11 @@ use tokio::sync::oneshot;
 
 const BODY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+fn allow_loopback_for_tests() {
+    // Engine blocks private/loopback by default; local fixture servers need an opt-in.
+    std::env::set_var("VELOCE_ALLOW_LOCAL_URLS", "1");
+}
+
 async fn range_handler(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = req.uri().path();
     if path != "/file.bin" {
@@ -67,6 +72,7 @@ async fn range_handler(req: Request<hyper::body::Incoming>) -> Result<Response<F
 
 #[tokio::test]
 async fn integration_download_with_ranges() {
+    allow_loopback_for_tests();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -108,6 +114,7 @@ async fn integration_download_with_ranges() {
         no_auto_tune: false,
         no_stagger: true,
         profiles_path: None,
+        base_dir: None,
     };
 
     run_download(args).await.unwrap();
@@ -120,6 +127,7 @@ async fn integration_download_with_ranges() {
 
 #[tokio::test]
 async fn integration_auto_tune_and_stagger() {
+    allow_loopback_for_tests();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -152,6 +160,7 @@ async fn integration_auto_tune_and_stagger() {
         no_auto_tune: false,
         no_stagger: false,
         profiles_path: None,
+        base_dir: None,
     };
 
     run_download(args).await.unwrap();

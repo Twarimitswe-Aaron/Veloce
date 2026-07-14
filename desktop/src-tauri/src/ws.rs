@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::download::{self, StartDownloadRequest};
 use crate::playlist;
 use crate::state::AppState;
+use crate::util;
 
 /// Thread-safe registry of connected WebSocket clients.
 pub struct WsClients {
@@ -171,6 +172,7 @@ pub async fn start_ws_server(app: Arc<AppState>, clients: Arc<WsClients>, port: 
                 eta_secs: 0,
                 is_playlist: false,
                 error: None,
+                threads: None,
             };
             app.scheduler.enqueue(job);
         }
@@ -289,12 +291,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
     // Register the extension device so foreign-key constraints don't fail on download inserts.
     let _ = app.db.upsert_device("extension");
+    let _ = app.db.upsert_device("desktop");
 
-    let config = Config::from_env();
+    let settings = app.get_ui_settings();
+    let path = settings
+        .get("baseDirectory")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
     let _ = tx.send(
         serde_json::json!({
             "type": "DIRECTORY_SELECTED",
-            "payload": { "path": config.base_directory().to_string_lossy() }
+            "payload": { "path": path }
         })
         .to_string(),
     );
@@ -302,11 +310,12 @@ fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<St
         serde_json::json!({
             "type": "SETTINGS",
             "settings": {
-                "maxConcurrentDownloads": config.max_concurrent_downloads,
-                "defaultThreads": config.default_threads,
-                "maxRateBytes": config.max_rate_bytes,
-                "baseDirectory": config.base_directory().to_string_lossy().to_string(),
-                "engineQuiet": config.engine_quiet,
+                "maxConcurrentDownloads": settings.get("maxConcurrentDownloads"),
+                "defaultThreads": settings.get("defaultThreads"),
+                "maxRateBytes": settings.get("maxRateBytes"),
+                "baseDirectory": path,
+                "engineQuiet": settings.get("engineQuiet"),
+                "playlistFormats": settings.get("playlistFormats"),
             }
         })
         .to_string(),
@@ -579,6 +588,11 @@ async fn handle_message(
             }
 
             let app_state = state.app.clone();
+            let base_directory = payload["baseDirectory"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let threads = payload["threads"].as_u64().map(|t| t as u32);
             let req = StartDownloadRequest {
                 url,
                 direct_url,
@@ -587,6 +601,8 @@ async fn handle_message(
                 device_id: "extension".to_string(),
                 download_id: Some(download_id.clone()),
                 save_path: None,
+                base_directory,
+                threads,
             };
 
             // Clone tx so the spawned task can send responses back to this client.
@@ -613,30 +629,33 @@ async fn handle_message(
         }
 
         "SAVE_BLOB" => {
-            let payload = &data["payload"];
-            let base64 = payload["base64"].as_str().unwrap_or("");
-            let file_name = payload["fileName"].as_str().unwrap_or("download");
-            let mime = payload["mime"].as_str();
-            let source_url = payload["sourceUrl"]
-                .as_str()
-                .or_else(|| payload["pageUrl"].as_str())
-                .unwrap_or("blob:browser");
+            // Spawn so large base64 decode + disk write cannot stall the WS read loop.
+            let payload = data["payload"].clone();
+            let app = state.app.clone();
+            let task_tx = tx.clone();
+            tokio::spawn(async move {
+                let base64 = payload["base64"].as_str().unwrap_or("");
+                let file_name = payload["fileName"].as_str().unwrap_or("download");
+                let mime = payload["mime"].as_str();
+                let source_url = payload["sourceUrl"]
+                    .as_str()
+                    .or_else(|| payload["pageUrl"].as_str())
+                    .unwrap_or("blob:browser");
 
-            match download::save_blob_download(&state.app, base64, file_name, mime, source_url)
-                .await
-            {
-                Ok(id) => log::info!("SAVE_BLOB completed: {}", id),
-                Err(e) => {
-                    let _ = tx.send(
-                        serde_json::json!({
-                            "type": "DOWNLOAD_ERROR",
-                            "downloadId": null,
-                            "error": e,
-                        })
-                        .to_string(),
-                    );
+                match download::save_blob_download(&app, base64, file_name, mime, source_url).await {
+                    Ok(id) => log::info!("SAVE_BLOB completed: {}", id),
+                    Err(e) => {
+                        let _ = task_tx.send(
+                            serde_json::json!({
+                                "type": "DOWNLOAD_ERROR",
+                                "downloadId": null,
+                                "error": e,
+                            })
+                            .to_string(),
+                        );
+                    }
                 }
-            }
+            });
         }
 
         "PAUSE_DOWNLOAD" => {
@@ -705,16 +724,18 @@ async fn handle_message(
         }
 
         "GET_SETTINGS" => {
-            let config = Config::from_env();
+            // Return merged runtime settings (desktop + extension devices).
+            let settings = state.app.get_ui_settings();
             let _ = tx.send(
                 serde_json::json!({
                     "type": "SETTINGS",
                     "settings": {
-                        "maxConcurrentDownloads": config.max_concurrent_downloads,
-                        "defaultThreads": config.default_threads,
-                        "maxRateBytes": config.max_rate_bytes,
-                        "baseDirectory": config.base_directory().to_string_lossy().to_string(),
-                        "engineQuiet": config.engine_quiet,
+                        "maxConcurrentDownloads": settings.get("maxConcurrentDownloads"),
+                        "defaultThreads": settings.get("defaultThreads"),
+                        "maxRateBytes": settings.get("maxRateBytes"),
+                        "baseDirectory": settings.get("baseDirectory"),
+                        "engineQuiet": settings.get("engineQuiet"),
+                        "playlistFormats": settings.get("playlistFormats"),
                     }
                 })
                 .to_string(),
@@ -722,31 +743,22 @@ async fn handle_message(
         }
 
         "SET_SETTINGS" => {
-            // Persist settings via DB and broadcast to all clients — backend parity.
+            // Persist on both devices so Tauri UI + extension popup stay in sync.
             if let Some(payload) = data["payload"].as_object() {
-                let settings_json = serde_json::to_string(payload).unwrap_or_default();
-                let _ = state
-                    .app
-                    .db
-                    .update_device_settings("extension", &settings_json);
-
-                let config = Config::from_env();
-                let mut merged = serde_json::json!({
-                    "maxConcurrentDownloads": config.max_concurrent_downloads,
-                    "defaultThreads": config.default_threads,
-                    "maxRateBytes": config.max_rate_bytes,
-                    "baseDirectory": config.base_directory().to_string_lossy().to_string(),
-                    "engineQuiet": config.engine_quiet,
-                });
-                if let Some(obj) = merged.as_object_mut() {
-                    for (k, v) in payload {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
+                let patch = serde_json::Value::Object(payload.clone());
+                state.app.apply_settings_patch(&patch);
+                let merged = state.app.get_ui_settings();
                 state.app.ws_clients.broadcast(
                     &serde_json::json!({
                         "type": "SETTINGS",
-                        "settings": merged,
+                        "settings": {
+                            "maxConcurrentDownloads": merged.get("maxConcurrentDownloads"),
+                            "defaultThreads": merged.get("defaultThreads"),
+                            "maxRateBytes": merged.get("maxRateBytes"),
+                            "baseDirectory": merged.get("baseDirectory"),
+                            "engineQuiet": merged.get("engineQuiet"),
+                            "playlistFormats": merged.get("playlistFormats"),
+                        }
                     })
                     .to_string(),
                 );
@@ -755,13 +767,12 @@ async fn handle_message(
 
         "REQUEST_DIRECTORY_PICKER" => {
             // Open graphical folder picker (zenity/kdialog) — backend parity.
-            let result = pick_directory();
+            let result = util::pick_directory();
             if let Some(path) = result {
-                let settings = serde_json::json!({"baseDirectory": &path});
-                let _ = state
-                    .app
-                    .db
-                    .update_device_settings("extension", &settings.to_string());
+                state.app.apply_settings_patch(&serde_json::json!({
+                    "baseDirectory": &path,
+                    "base_dir": &path,
+                }));
 
                 let _ = tx.send(
                     serde_json::json!({
@@ -870,62 +881,6 @@ fn reveal_in_file_manager(file_path: &str) {
             }
         }
     }
-}
-
-/// Open a graphical folder picker via zenity or kdialog.
-fn pick_directory() -> Option<String> {
-    // Try zenity first
-    let zenity = Command::new("zenity")
-        .args(["--file-selection", "--directory"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut child) = zenity {
-        use std::io::Read;
-        let mut output = String::new();
-        if child
-            .stdout
-            .take()
-            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
-        {
-            let trimmed = output.trim().to_string();
-            if !trimmed.is_empty() {
-                if child.wait().map_or(false, |s| s.success()) {
-                    return Some(trimmed);
-                }
-                return None; // user cancelled
-            }
-        }
-    }
-
-    // Fallback to kdialog
-    let kdialog = Command::new("kdialog")
-        .args(["--getexistingdirectory", "$HOME"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut child) = kdialog {
-        use std::io::Read;
-        let mut output = String::new();
-        if child
-            .stdout
-            .take()
-            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
-        {
-            let trimmed = output.trim().to_string();
-            if !trimmed.is_empty() {
-                if child.wait().map_or(false, |s| s.success()) {
-                    return Some(trimmed);
-                }
-                return None; // user cancelled
-            }
-        }
-    }
-
-    log::warn!("No graphical folder picker available (tried zenity, kdialog).");
-    None
 }
 
 #[cfg(test)]

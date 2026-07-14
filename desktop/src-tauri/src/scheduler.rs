@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::config::Config;
 
@@ -17,12 +18,17 @@ pub struct JobState {
     pub eta_secs: u64,
     pub is_playlist: bool,
     pub error: Option<String>,
+    /// Engine worker threads for this job (from payload or runtime settings).
+    #[serde(default)]
+    pub threads: Option<u32>,
 }
 
 /// The download scheduler with a FIFO queue and concurrency cap.
 #[allow(dead_code)]
 pub struct Scheduler {
     config: Config,
+    /// Live concurrency cap (updated from Settings UI / extension SET_SETTINGS).
+    max_concurrent: AtomicU32,
     queue: Mutex<VecDeque<JobState>>,
     // Track active downloads by ID
     active: Mutex<Vec<String>>,
@@ -31,15 +37,22 @@ pub struct Scheduler {
 #[allow(dead_code)]
 impl Scheduler {
     pub fn new(config: Config) -> Self {
+        let max = config.max_concurrent_downloads.max(1);
         Self {
             config,
+            max_concurrent: AtomicU32::new(max),
             queue: Mutex::new(VecDeque::new()),
             active: Mutex::new(Vec::new()),
         }
     }
 
     pub fn max_concurrent(&self) -> u32 {
-        self.config.max_concurrent_downloads
+        self.max_concurrent.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_max_concurrent(&self, n: u32) {
+        self.max_concurrent
+            .store(n.clamp(1, 64), Ordering::Relaxed);
     }
 
     /// Enqueue a new download job. Returns the job ID.
@@ -56,7 +69,7 @@ impl Scheduler {
     /// Dequeue and mark as active. Returns None if queue is empty or cap reached.
     pub fn dequeue(&self) -> Option<JobState> {
         let mut active = self.active.lock().unwrap();
-        if active.len() >= self.config.max_concurrent_downloads as usize {
+        if active.len() >= self.max_concurrent() as usize {
             return None;
         }
         let mut queue = self.queue.lock().unwrap();
@@ -121,6 +134,7 @@ mod tests {
             eta_secs: 0,
             is_playlist: false,
             error: None,
+            threads: None,
         }
     }
 

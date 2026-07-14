@@ -19,6 +19,8 @@ pub struct YtAttempt {
     pub extra_args: Vec<String>,
     pub timeout_secs: u64,
     pub label: String,
+    /// Instagram carousels need playlist expansion; YouTube listings stay single-video.
+    pub allow_playlist: bool,
 }
 
 fn ytdlp_missing_err() -> String {
@@ -96,13 +98,18 @@ fn build_args(url: &str, attempt: &YtAttempt) -> Vec<String> {
     let mut args = vec![
         "--no-warnings".into(),
         "--no-progress".into(),
-        "--no-playlist".into(),
+    ];
+    // Instagram carousels arrive as yt-dlp playlists — omit --no-playlist so entries expand.
+    if !attempt.allow_playlist {
+        args.push("--no-playlist".into());
+    }
+    args.extend([
         "--socket-timeout".into(),
         "15".into(),
         "--retries".into(),
         "1".into(),
         "-J".into(),
-    ];
+    ]);
     args.extend(
         ytdlp_shared_args()
             .into_iter()
@@ -215,6 +222,7 @@ fn youtube_attempts(force: bool) -> Vec<YtAttempt> {
             extra_args: vec![],
             timeout_secs: timeout,
             label: format!("youtube/{browser}"),
+            allow_playlist: false,
         });
     }
 
@@ -227,6 +235,7 @@ fn youtube_attempts(force: bool) -> Vec<YtAttempt> {
             ],
             timeout_secs: if force { 24 } else { 14 },
             label: format!("youtube/chrome/{client}"),
+            allow_playlist: false,
         });
     }
 
@@ -235,6 +244,7 @@ fn youtube_attempts(force: bool) -> Vec<YtAttempt> {
         extra_args: vec![],
         timeout_secs: 10,
         label: "youtube/no-cookies".into(),
+        allow_playlist: false,
     });
 
     out
@@ -248,18 +258,21 @@ fn generic_attempts(force: bool) -> Vec<YtAttempt> {
             extra_args: vec![],
             timeout_secs: timeout,
             label: "generic/chrome".into(),
+            allow_playlist: false,
         },
         YtAttempt {
             cookie_args: vec!["--cookies-from-browser".into(), "chromium".into()],
             extra_args: vec![],
             timeout_secs: timeout,
             label: "generic/chromium".into(),
+            allow_playlist: false,
         },
         YtAttempt {
             cookie_args: vec![],
             extra_args: vec![],
             timeout_secs: 12,
             label: "generic/no-cookies".into(),
+            allow_playlist: false,
         },
     ]
 }
@@ -287,36 +300,36 @@ pub fn run_attempts(url: &str, attempts: &[YtAttempt], force: bool) -> Result<Ve
     Err("No formats found".to_string())
 }
 
-/// Parallel fallback race — mirrors backend `raceYoutubeFormats` fast path + parallel fallbacks.
-fn race_formats(url: &str, attempts: Vec<YtAttempt>, force: bool) -> (Vec<MediaFormat>, String) {
-    if attempts.is_empty() {
+/// Race yt-dlp attempts: try the primary once, then race up to 4 fallbacks in parallel.
+///
+/// `force` used to walk attempts **sequentially** (worst case ~28s × N). That made badge
+/// clicks slower than background prefetch. Now force only affects attempt lists/timeouts
+/// (via `youtube_attempts` / `generic_attempts`); the race strategy is always parallel.
+fn race_formats(url: &str, attempts: Vec<YtAttempt>, _force: bool) -> (Vec<MediaFormat>, String) {
+    let jobs: Vec<(String, YtAttempt)> = attempts
+        .into_iter()
+        .map(|a| (url.to_string(), a))
+        .collect();
+    race_url_attempts(jobs)
+}
+
+/// Primary attempt, then parallel fallbacks (each job may use a different page URL —
+/// used by Instagram /p/ vs /reel/ variants).
+fn race_url_attempts(jobs: Vec<(String, YtAttempt)>) -> (Vec<MediaFormat>, String) {
+    if jobs.is_empty() {
         return (vec![], String::new());
     }
 
     let mut last_err = String::new();
+    let (primary_url, primary) = &jobs[0];
 
-    if force {
-        for attempt in &attempts {
-            match try_attempt(url, attempt, None) {
-                Ok(formats) if !formats.is_empty() => return (formats, String::new()),
-                Ok(_) => {}
-                Err(e) => {
-                    log::debug!("yt-dlp {} failed: {}", attempt.label, e);
-                    last_err = e;
-                }
-            }
-        }
-        return (vec![], last_err);
-    }
-
-    // Fast path: primary browser attempt (~7s when cookies + node work).
-    match try_attempt(url, &attempts[0], None) {
+    match try_attempt(primary_url, primary, None) {
         Ok(formats) if !formats.is_empty() => return (formats, String::new()),
         Ok(_) => {}
         Err(e) => last_err = e,
     }
 
-    let fallbacks: Vec<YtAttempt> = attempts.into_iter().skip(1).take(4).collect();
+    let fallbacks: Vec<(String, YtAttempt)> = jobs.into_iter().skip(1).take(4).collect();
     if fallbacks.is_empty() {
         return (vec![], last_err);
     }
@@ -326,8 +339,7 @@ fn race_formats(url: &str, attempts: Vec<YtAttempt>, force: bool) -> (Vec<MediaF
     let err_out: Arc<Mutex<String>> = Arc::new(Mutex::new(last_err));
 
     std::thread::scope(|scope| {
-        for attempt in fallbacks {
-            let url = url.to_string();
+        for (url, attempt) in fallbacks {
             let resolved = Arc::clone(&resolved);
             let result = Arc::clone(&result);
             let err_out = Arc::clone(&err_out);
@@ -360,7 +372,50 @@ fn race_formats(url: &str, attempts: Vec<YtAttempt>, force: bool) -> (Vec<MediaF
     (formats, err)
 }
 
+/// Instagram: try /p/ + /reel/ variants across cookie browsers with a parallel race
+/// (same strategy as YouTube). `allow_playlist` expands carousel entries.
+pub fn list_instagram_formats(url: &str, force: bool) -> Result<Vec<MediaFormat>, String> {
+    let variants = crate::formats::instagram_url_variants(url);
+    let browsers: &[&str] = if force {
+        &["chrome", "chromium", "brave", "firefox"]
+    } else {
+        &["chrome", "chromium"]
+    };
+    let timeout_secs = if force { 24 } else { 14 };
+
+    let mut jobs: Vec<(String, YtAttempt)> = Vec::new();
+    for variant in &variants {
+        for browser in browsers {
+            jobs.push((
+                variant.clone(),
+                YtAttempt {
+                    cookie_args: vec!["--cookies-from-browser".into(), (*browser).into()],
+                    extra_args: vec![],
+                    timeout_secs,
+                    label: format!("instagram/{browser}"),
+                    allow_playlist: true,
+                },
+            ));
+        }
+    }
+
+    let (formats, err) = race_url_attempts(jobs);
+    if formats.is_empty() {
+        return Err(if err.is_empty() {
+            "Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry."
+                .to_string()
+        } else {
+            err
+        });
+    }
+    Ok(formats)
+}
+
 /// YouTube picker: hide silent video-only DASH; add merged "Best" row (backend parity).
+///
+/// Best used to ship with an empty `url`, which forced a second yt-dlp (`-f b -g`)
+/// on download. We seed Best with the top progressive video+audio URL from the same
+/// `-J` pass so the extension can pass `directUrl` and skip that second extract.
 pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
     let mut combined: Vec<MediaFormat> = formats
         .into_iter()
@@ -378,12 +433,23 @@ pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
         .map(|f| f.label.split(" — ").next().unwrap_or("video").to_string())
         .unwrap_or_else(|| "video".to_string());
 
+    // Highest progressive row after sort — same quality the menu would offer first.
+    let best_url = combined
+        .first()
+        .map(|f| f.url.clone())
+        .unwrap_or_default();
+    let best_ext = combined
+        .first()
+        .map(|f| f.ext.clone())
+        .unwrap_or_else(|| ".mp4".to_string());
+    let best_size = combined.first().and_then(|f| f.filesize);
+
     let best = MediaFormat {
         id: "best".to_string(),
         label: format!("{title_stem} — Best (video + audio)"),
-        url: String::new(),
-        ext: ".mp4".to_string(),
-        filesize: None,
+        url: best_url,
+        ext: best_ext,
+        filesize: best_size,
         source: Some("youtube".to_string()),
         kind: Some("progressive".to_string()),
     };
@@ -433,12 +499,19 @@ pub fn list_formats(url: &str, force: bool) -> Result<Vec<MediaFormat>, String> 
 
 /// Extract the best direct media URL using yt-dlp -f b -g.
 pub fn extract_best_url(url: &str) -> Result<String, String> {
+    extract_url_with_format(url, "b")
+}
+
+/// Extract a direct media URL with an explicit yt-dlp `-f` selector (playlist format ladder).
+pub fn extract_url_with_format(url: &str, format: &str) -> Result<String, String> {
     let cookie_strategies: [&[&str]; 4] = [
         &["--cookies-from-browser", "chrome"],
         &["--cookies-from-browser", "chromium"],
         &["--cookies-from-browser", "firefox"],
         &[],
     ];
+
+    let format = if format.trim().is_empty() { "b" } else { format };
 
     for cookies in &cookie_strategies {
         let mut args: Vec<String> = vec![
@@ -450,7 +523,7 @@ pub fn extract_best_url(url: &str) -> Result<String, String> {
             "--retries".into(),
             "1".into(),
             "-f".into(),
-            "b".into(),
+            format.to_string(),
             "-g".into(),
         ];
         args.extend(
@@ -472,7 +545,7 @@ pub fn extract_best_url(url: &str) -> Result<String, String> {
                 }
             }
             Err(e) => {
-                log::debug!("yt-dlp extract_best_url failed: {}", e);
+                log::debug!("yt-dlp extract_url_with_format({format}) failed: {}", e);
             }
         }
     }
@@ -524,6 +597,47 @@ fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, 
     let info: serde_json::Value = serde_json::from_str(output)
         .map_err(|e| format!("Failed to parse yt-dlp JSON: {e}"))?;
 
+    // Instagram carousels (and similar) arrive as playlists — expand each entry
+    // into labeled format rows so the menu can offer every slide.
+    if info["_type"] == "playlist" {
+        if let Some(entries) = info["entries"].as_array() {
+            let base_title = info["title"].as_str().unwrap_or("post");
+            let safe_base: String = base_title
+                .chars()
+                .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+                .take(100)
+                .collect();
+            let total = entries.len();
+            let mut merged = Vec::new();
+            for (i, entry) in entries.iter().enumerate() {
+                let suffix = if total > 1 {
+                    format!(" [{}/{}]", i + 1, total)
+                } else {
+                    String::new()
+                };
+                let titled = format!("{safe_base}{suffix}");
+                let mut entry_json = entry.clone();
+                if entry_json.get("title").and_then(|t| t.as_str()).unwrap_or("").is_empty() {
+                    entry_json["title"] = serde_json::Value::String(titled.clone());
+                } else {
+                    // Prefer carousel slide label for the menu stem.
+                    entry_json["title"] = serde_json::Value::String(titled);
+                }
+                if let Ok(part) = parse_formats_single(&entry_json) {
+                    merged.extend(part);
+                }
+            }
+            if !merged.is_empty() {
+                merged.truncate(40);
+                return Ok(merged);
+            }
+        }
+    }
+
+    parse_formats_single(&info)
+}
+
+fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, String> {
     let title = info["title"].as_str().unwrap_or("video");
     let safe_title: String = title
         .chars()
@@ -736,6 +850,8 @@ mod tests {
         ];
         let out = finalize_youtube_picker(raw);
         assert_eq!(out[0].id, "best");
+        // Best must carry the top progressive URL so download skips a second yt-dlp.
+        assert_eq!(out[0].url, "https://v.example/p");
         assert!(out.iter().any(|f| f.id == "18"));
         assert!(!out.iter().any(|f| f.id == "137"));
         assert!(!out.iter().any(|f| f.id == "140"));
@@ -756,6 +872,16 @@ mod tests {
     }
 
     #[test]
+    fn force_attempts_keep_longer_timeouts_than_prefetch() {
+        // force still means "harder / longer tries" — only the race strategy was unified.
+        let forced = youtube_attempts(true);
+        let soft = youtube_attempts(false);
+        assert!(forced.len() >= soft.len());
+        assert!(forced[0].timeout_secs >= soft[0].timeout_secs);
+        assert!(forced[0].timeout_secs >= 24);
+    }
+
+    #[test]
     fn ytdlp_shared_args_includes_node_runtime() {
         let args = ytdlp_shared_args();
         assert_eq!(args, vec!["--js-runtimes", "node"]);
@@ -768,6 +894,7 @@ mod tests {
             extra_args: vec![],
             timeout_secs: 18,
             label: "test".into(),
+            allow_playlist: false,
         };
         let args = build_args("https://www.youtube.com/watch?v=x", &attempt);
         assert!(args.contains(&"--no-playlist".to_string()));
@@ -779,6 +906,31 @@ mod tests {
         let args_non_yt = build_args("https://www.instagram.com/reel/x", &attempt);
         assert!(args_non_yt.contains(&"--js-runtimes".to_string()));
         assert!(args_non_yt.contains(&"node".to_string()));
+    }
+
+    #[test]
+    fn build_args_omits_no_playlist_when_carousel_allowed() {
+        let attempt = YtAttempt {
+            cookie_args: vec!["--cookies-from-browser".into(), "chrome".into()],
+            extra_args: vec![],
+            timeout_secs: 14,
+            label: "instagram/chrome".into(),
+            allow_playlist: true,
+        };
+        let args = build_args("https://www.instagram.com/p/abc/", &attempt);
+        assert!(!args.contains(&"--no-playlist".to_string()));
+    }
+
+    #[test]
+    fn parse_formats_expands_instagram_carousel_playlist() {
+        const CAROUSEL: &str = include_str!("../tests/fixtures/instagram_carousel.json");
+        let formats = parse_formats(CAROUSEL, "https://www.instagram.com/p/abc/").unwrap();
+        assert_eq!(formats.len(), 2);
+        // Slash in slide marks is sanitized (same as filename-safe stem) → [1_2].
+        assert!(formats.iter().any(|f| f.label.contains("[1_2]")));
+        assert!(formats.iter().any(|f| f.label.contains("[2_2]")));
+        assert!(formats.iter().any(|f| f.url.contains("slide1")));
+        assert!(formats.iter().any(|f| f.url.contains("slide2")));
     }
 
     #[test]

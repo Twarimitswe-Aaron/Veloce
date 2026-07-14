@@ -289,7 +289,9 @@ desktop/
 | `pause_download` | Kill child (state preserved for resume) |
 | `get_statuses` | Snapshot of all active downloads |
 | `get_history` | Last 50 completed/failed downloads |
-| `get_settings` / `update_settings` | Device settings CRUD |
+| `get_settings` / `update_settings` | Device settings CRUD (merged desktop+extension; folder picker via `select_directory`) |
+| `select_directory` | Native zenity/kdialog folder picker; syncs Save-to for extension |
+| `queue_playlist` / `list_playlists` | Start playlist from desktop UI; hydrate playlist panel |
 | `get_config` | Runtime config (port, threads, etc.) |
 
 **Events:** `download-progress` (id, downloaded, total, speed, eta, pct), `download-status` (id, status, error?)
@@ -319,8 +321,30 @@ desktop/
 
 ---
 
+## Core engine (`core_engine/`)
+
+Range downloader binary spawned by desktop + Node. Full notes: [`core_engine/README.md`](core_engine/README.md).
+
+| Guard / feature | Detail |
+|-----------------|--------|
+| Redirect SSRF | `safety::safe_redirect_policy` — no private/loopback/metadata hosts |
+| URL check | `safety::is_safe_download_url` on CLI URL; coordinators re-check **post-extract** (yt-dlp / MediaFire) |
+| Threads | Clamped **1..=64** in engine `normalize()` and desktop/backend spawn |
+| Size / pieces | Max **512 GiB**, max **1M** pieces |
+| Piece writes | Stream clamped to piece end (no neighbour overrun) |
+| `--base-dir` | Save path must resolve under download root |
+| Sidecar / resume | `.veloce_done` needs matching file size; ETag/LM must match when server sends them |
+| Quiet / origin | `--quiet` via `elog!`; `--origin` from referer (desktop + backend) |
+| Auto-tune | Sequential probe + early exit (TTFB); skip for MediaFire/Direct/GitHub at coordinator |
+
+**Key modules:** `safety.rs`, `logutil.rs`, `discover.rs`, `probe.rs`, `download.rs`, `resume.rs`, `io_uring_writer.rs`
+
+---
+
 ## Version
 
 Extension manifest version and notable behavior changes should be noted in commit messages. Current format-handling architecture: **v1.4.7+** (platform signatures in `formatSources.ts`).
 
 Desktop native app (Phase 3): **v0.1.0** (Tauri 2 + Rust coordinator rewrite).
+
+Core engine hardening: **redirect SSRF, thread clamp, base-dir, size caps, quieter logs** (see `core_engine/README.md`).

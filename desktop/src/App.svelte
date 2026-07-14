@@ -101,15 +101,31 @@
   let baseDir = "";
   let maxConcurrent = 10;
   let defaultThreads = 8;
+  let maxRateMBps = 0;
+  let engineQuiet = true;
+  let plMediaType = "audio";
+  let plVideoQuality = "720";
+  let plAudioFallback = "video";
   let settingsLoaded = false;
+  let pickerBusy = false;
+  let pickerError = "";
+
+  // New download form
+  let treatAsPlaylist = false;
 
   async function loadSettings() {
     try {
       const s: any = await invoke("get_settings");
       if (s) {
-        baseDir = s.base_dir || "";
-        maxConcurrent = s.max_concurrent || 10;
-        defaultThreads = s.default_threads || 8;
+        baseDir = s.base_dir || s.baseDirectory || "";
+        maxConcurrent = s.max_concurrent || s.maxConcurrentDownloads || 10;
+        defaultThreads = s.default_threads || s.defaultThreads || 8;
+        maxRateMBps = Math.round(((s.max_rate_bytes || s.maxRateBytes || 0) as number) / (1024 * 1024));
+        engineQuiet = s.engine_quiet ?? s.engineQuiet ?? true;
+        const pf = s.playlistFormats || {};
+        plMediaType = pf.mediaType || "audio";
+        plVideoQuality = pf.videoQuality || "720";
+        plAudioFallback = pf.audioMissingFallback || "video";
       }
       settingsLoaded = true;
     } catch (e) {
@@ -118,15 +134,27 @@
     }
   }
 
-  async function saveSettings(dir: string, max: number, threads: number) {
+  async function saveSettings() {
     if (!settingsLoaded) return;
     try {
       await invoke("update_settings", {
         settings: JSON.stringify({
-          base_dir: dir,
-          max_concurrent: max,
-          default_threads: threads,
-        })
+          base_dir: baseDir,
+          baseDirectory: baseDir,
+          max_concurrent: maxConcurrent,
+          maxConcurrentDownloads: maxConcurrent,
+          default_threads: defaultThreads,
+          defaultThreads: defaultThreads,
+          max_rate_bytes: Math.max(0, maxRateMBps) * 1024 * 1024,
+          maxRateBytes: Math.max(0, maxRateMBps) * 1024 * 1024,
+          engine_quiet: engineQuiet,
+          engineQuiet: engineQuiet,
+          playlistFormats: {
+            mediaType: plMediaType,
+            videoQuality: plVideoQuality,
+            audioMissingFallback: plAudioFallback,
+          },
+        }),
       });
     } catch (e) {
       console.error("Failed to save settings", e);
@@ -135,7 +163,20 @@
 
   // Auto-save settings when they change
   $: if (settingsLoaded) {
-    saveSettings(baseDir, maxConcurrent, defaultThreads);
+    void saveSettings();
+  }
+
+  async function browseDirectory() {
+    pickerBusy = true;
+    pickerError = "";
+    try {
+      const path = await invoke<string>("select_directory");
+      if (path) baseDir = path;
+    } catch (e: any) {
+      pickerError = typeof e === "string" ? e : e?.message || "Folder picker failed";
+    } finally {
+      pickerBusy = false;
+    }
   }
 
   // Cached file stats per playlist (populated on completion).
@@ -265,6 +306,13 @@
       console.error("Failed to load statuses", e);
     }
 
+    try {
+      const pls = await invoke<PlaylistStatus[]>("list_playlists");
+      if (Array.isArray(pls)) playlists = pls;
+    } catch (e) {
+      console.error("Failed to load playlists", e);
+    }
+
     await loadSettings();
 
   });
@@ -311,9 +359,47 @@
       showFormatMenu = false;
       newUrl = "";
       newFileName = "";
+      treatAsPlaylist = false;
     } catch (e: any) {
       const msg = typeof e === "string" ? e : (e.message || "Download failed");
       alert(`Download failed: ${msg}`);
+    }
+  }
+
+  async function startPlaylist() {
+    if (!newUrl.trim()) return;
+    listingFormats = true;
+    formatError = "";
+    try {
+      await invoke("queue_playlist", {
+        url: newUrl.trim(),
+        fileName: newFileName.trim() || null,
+      });
+      newUrl = "";
+      newFileName = "";
+      treatAsPlaylist = false;
+      activeTab = "downloads";
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : (e.message || "Playlist failed");
+      alert(`Playlist failed: ${msg}`);
+    } finally {
+      listingFormats = false;
+    }
+  }
+
+  async function submitUrl() {
+    if (treatAsPlaylist) {
+      await startPlaylist();
+    } else {
+      await listFormats();
+    }
+  }
+
+  async function resumeDownload(id: string) {
+    try {
+      await invoke("resume_download", { id });
+    } catch (e) {
+      console.error("Resume failed", e);
     }
   }
 
@@ -481,7 +567,7 @@
           startDownload(formatUrl, f.url, newFileName || fileNameNoExt(f.label) || "download", f.kind);
         }
       } else {
-        listFormats();
+        submitUrl();
       }
     }
   }
@@ -531,10 +617,14 @@
           onkeydown={handleKeydown}
           disabled={listingFormats}
         />
-        <button onclick={listFormats} disabled={listingFormats || !newUrl.trim()}>
-          {listingFormats ? "Loading..." : "List Formats"}
+        <button onclick={submitUrl} disabled={listingFormats || !newUrl.trim()}>
+          {listingFormats ? "Loading..." : treatAsPlaylist ? "Queue Playlist" : "List Formats"}
         </button>
       </div>
+      <label class="playlist-toggle">
+        <input type="checkbox" bind:checked={treatAsPlaylist} />
+        Treat URL as a playlist (format rules from Settings)
+      </label>
     </section>
 
     <!-- Format Menu -->
@@ -604,13 +694,14 @@
                   <button onclick={() => pauseDownload(dl.id)}>Pause</button>
                   <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
                 {:else if dl.status === "paused"}
-                  <button onclick={() => startDownload(dl.url, null, dl.file_name)}>Resume</button>
+                  <button onclick={() => resumeDownload(dl.id)}>Resume</button>
+                  <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
                 {:else if dl.status === "completed"}
                   <button onclick={() => openFile(dl.save_path)}>Open File</button>
                   <button onclick={() => openFolder(dl.save_path)}>Open Folder</button>
                   <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
                 {:else if dl.status === "failed"}
-                  <button onclick={() => startDownload(dl.url, null, dl.file_name)}>Retry</button>
+                  <button onclick={() => resumeDownload(dl.id)}>Retry</button>
                   <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
                 {/if}
               </div>
@@ -757,18 +848,61 @@
       <div class="settings-group">
         <label>
           <span>Base Directory</span>
-          <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
+          <div class="dir-row">
+            <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
+            <button type="button" class="btn-browse" onclick={browseDirectory} disabled={pickerBusy}>
+              {pickerBusy ? "…" : "Browse"}
+            </button>
+          </div>
+          {#if pickerError}
+            <span class="picker-error">{pickerError}</span>
+          {/if}
         </label>
         <label>
           <span>Max Concurrent Downloads (Queue)</span>
-          <input type="number" bind:value={maxConcurrent} min="1" max="50" />
+          <input type="number" bind:value={maxConcurrent} min="1" max="64" />
         </label>
         <label>
           <span>Default Threads Per Download</span>
-          <input type="number" bind:value={defaultThreads} min="1" max="32" />
+          <input type="number" bind:value={defaultThreads} min="1" max="64" />
+        </label>
+        <label>
+          <span>Speed cap (MB/s, 0 = unlimited)</span>
+          <input type="number" bind:value={maxRateMBps} min="0" max="1000" />
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={engineQuiet} />
+          Quiet engine (less diagnostic output)
         </label>
       </div>
-      <p class="settings-note">Settings are persisted automatically. Restart to apply changes to running downloads.</p>
+      <h3>Playlist downloads</h3>
+      <div class="settings-group">
+        <label>
+          <span>Media type</span>
+          <select bind:value={plMediaType}>
+            <option value="audio">Audio</option>
+            <option value="video">Video</option>
+          </select>
+        </label>
+        <label>
+          <span>Video quality (when video / audio fallback)</span>
+          <select bind:value={plVideoQuality}>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+            <option value="360">360p</option>
+            <option value="best">Best</option>
+          </select>
+        </label>
+        <label>
+          <span>If audio missing</span>
+          <select bind:value={plAudioFallback}>
+            <option value="video">Fall back to video</option>
+            <option value="skip">Skip track</option>
+          </select>
+        </label>
+      </div>
+      <p class="settings-note">Settings sync to the extension popup. New downloads use the folder immediately; concurrency applies to the next queued jobs.</p>
     </section>
   {/if}
 </div>
@@ -854,6 +988,21 @@
   .form-row {
     display: flex;
     gap: 8px;
+  }
+
+  .playlist-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--veloce-muted);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .playlist-toggle input {
+    accent-color: var(--veloce-green);
   }
 
   .form-row input {
@@ -1369,6 +1518,68 @@
 
   .settings-group input:focus {
     border-color: var(--veloce-green);
+  }
+
+  .settings-group select {
+    padding: 7px 10px;
+    background: #000d1f;
+    border: 1px solid var(--veloce-border);
+    color: var(--veloce-white);
+    font-size: 13px;
+    border-radius: 4px;
+    outline: none;
+  }
+
+  .dir-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .dir-row input {
+    flex: 1;
+  }
+
+  .btn-browse {
+    padding: 7px 12px;
+    background: var(--veloce-navy-light);
+    border: 1px solid var(--veloce-border);
+    color: var(--veloce-white);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .btn-browse:hover:not(:disabled) {
+    border-color: var(--veloce-green);
+    color: var(--veloce-green);
+  }
+
+  .btn-browse:disabled {
+    opacity: 0.5;
+    cursor: wait;
+  }
+
+  .picker-error {
+    font-size: 11px;
+    color: var(--veloce-error);
+  }
+
+  .checkbox-label {
+    flex-direction: row !important;
+    align-items: center;
+    gap: 8px !important;
+    font-size: 13px;
+    color: var(--veloce-white);
+  }
+
+  .settings-tab h3 {
+    margin: 18px 0 8px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--veloce-muted);
   }
 
   .settings-note {

@@ -76,14 +76,23 @@ function ytdlpSharedArgs(): string[] {
 const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
- * Cache for direct URLs extracted by extractMediaUrl().
- * When listFormats() runs yt-dlp with -J, a follow-up call to extractMediaUrl()
- * from runDownloadJob() re-runs yt-dlp with -f b -g to get the best URL.
- * This cache skips that second yt-dlp invocation.
+ * Cache for direct URLs used by extractMediaUrl().
+ * Prefer seeding from listFormats() (Best / first progressive URL) so download
+ * after a format list does not spawn a second yt-dlp. Still filled by -f b -g
+ * when the caller omitted directUrl and no seed exists.
  */
 const BEST_URL_CACHE_TTL_MS = 10 * 60 * 1000; // same as format cache
 const IG_DIRECT_URL_CACHE_TTL_MS = 5 * 60 * 1000; // Instagram URLs expire faster
 const bestUrlCache = new Map<string, { url: string; ts: number }>();
+
+/** Prefer Best row; else first format with a usable URL. */
+function seedBestUrlFromFormats(cacheKey: string, formats: MediaFormat[]): void {
+	const seed =
+		formats.find((f) => f.id === 'best' && f.url) || formats.find((f) => !!f.url);
+	if (seed?.url) {
+		bestUrlCache.set(cacheKey, { url: seed.url, ts: Date.now() });
+	}
+}
 
 /** Export for tests — clear cached direct URLs. */
 export function clearBestUrlCache(): void {
@@ -119,7 +128,8 @@ export function normalizeFormatUrl(url: string): string {
 		}
 		if (/instagram\.com/i.test(u.hostname)) {
 			u.search = '';
-			u.pathname = u.pathname.replace(/\/+$/, '');
+			// Match extension: /reels/ID and /reel/ID share one cache key.
+			u.pathname = u.pathname.replace(/\/reels\//i, '/reel/').replace(/\/+$/, '');
 		}
 		return u.href;
 	} catch {
@@ -207,6 +217,8 @@ function setCached(url: string, formats: MediaFormat[]) {
  */
 export async function listFormats(url: string, opts?: { force?: boolean }): Promise<MediaFormat[]> {
 	const key = normalizePageUrl(url);
+	// Warm success cache always wins. force only bypasses the fail cache below so a
+	// badge click does not re-run yt-dlp when prefetch already filled the menu.
 	const cached = getCached(key);
 	if (cached) return cached;
 
@@ -300,6 +312,7 @@ async function listFormatsUncached(
 	const pickerFormats = finalizeFormatsForPicker(formats, source);
 	if (pickerFormats.length > 0) {
 		setCached(cacheKey, pickerFormats);
+		seedBestUrlFromFormats(cacheKey, pickerFormats);
 	} else {
 		failCache.set(cacheKey, {
 			reason: failReasonForSource(source, lastErr),
@@ -337,26 +350,69 @@ async function listFormatsBySource(
 
 async function raceInstagramFormats(url: string, force: boolean): Promise<FormatListResult> {
 	const urls = instagramUrlVariants(url);
-	// Chrome first — most users log in there; Chromium-only misses cookies on Linux.
 	const browsers = force
 		? (['chrome', 'chromium', 'brave', 'firefox'] as const)
 		: (['chrome', 'chromium'] as const);
 	const timeoutMs = force ? 24_000 : 14_000;
-	let lastErr = '';
 
+	// Flatten variant×browser into jobs, then primary + parallel fallbacks (same as YouTube).
+	// Serial nested loops used to wait for chrome+/p then chromium+/p then … before /reel/.
+	const jobs: { pageUrl: string; browser: string }[] = [];
 	for (const pageUrl of urls) {
 		for (const browser of browsers) {
-			const run = runYtDlpJson(pageUrl, ['--cookies-from-browser', browser], timeoutMs, {
-				allowPlaylist: true,
-				label: `instagram/${browser}`
-			});
-			const formats = tagFormats(await run.promise, 'instagram');
-			run.kill();
-			if (formats.length) return { formats, lastErr: '' };
-			lastErr = run.getError() || lastErr;
+			jobs.push({ pageUrl, browser });
 		}
 	}
-	return { formats: [], lastErr };
+	if (!jobs.length) return { formats: [], lastErr: '' };
+
+	let lastErr = '';
+	const primary = jobs[0];
+	{
+		const run = runYtDlpJson(primary.pageUrl, ['--cookies-from-browser', primary.browser], timeoutMs, {
+			allowPlaylist: true,
+			label: `instagram/${primary.browser}`
+		});
+		const formats = tagFormats(await run.promise, 'instagram');
+		run.kill();
+		if (formats.length) return { formats, lastErr: '' };
+		lastErr = run.getError() || lastErr;
+	}
+
+	const fallbacks = jobs.slice(1, 5);
+	if (!fallbacks.length) return { formats: [], lastErr };
+
+	const runners = fallbacks.map((job) =>
+		runYtDlpJson(job.pageUrl, ['--cookies-from-browser', job.browser], timeoutMs, {
+			allowPlaylist: true,
+			label: `instagram/${job.browser}`
+		})
+	);
+
+	return new Promise((resolve) => {
+		let finished = 0;
+		let resolved = false;
+		let bestErr = lastErr;
+
+		const finishAll = (formats: MediaFormat[]) => {
+			if (!resolved) {
+				resolved = true;
+				for (const r of runners) r.kill();
+				resolve({ formats: tagFormats(formats, 'instagram'), lastErr: bestErr });
+			}
+		};
+
+		for (const r of runners) {
+			r.promise.then((formats) => {
+				if (!resolved && formats.length > 0) {
+					finishAll(formats);
+					return;
+				}
+				bestErr = r.getError() || bestErr;
+				finished++;
+				if (finished === runners.length && !resolved) finishAll([]);
+			});
+		}
+	});
 }
 
 function youtubeAttempts(force: boolean): YtDlpAttempt[] {
@@ -389,21 +445,8 @@ async function raceYoutubeFormats(url: string, force: boolean): Promise<FormatLi
 	const attempts = youtubeAttempts(force);
 	let lastErr = '';
 
-	if (force) {
-		for (const attempt of attempts) {
-			const run = runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, {
-				label: attempt.label,
-				extraArgs: attempt.extraArgs
-			});
-			const formats = tagFormats(await run.promise, 'youtube');
-			run.kill();
-			if (formats.length) return { formats, lastErr: '' };
-			lastErr = run.getError() || lastErr;
-		}
-		return { formats: [], lastErr };
-	}
-
-	// Fast path: one chrome/chromium attempt usually succeeds in ~7s once JS runtime is enabled.
+	// force used to walk attempts serially (slow badge clicks). Now force only lengthens
+	// timeouts / attempt set; race strategy matches prefetch: primary then parallel fallbacks.
 	const primary = attempts[0];
 	if (primary) {
 		const run = runYtDlpJson(url, primary.cookieArgs, primary.timeoutMs, {
@@ -463,19 +506,9 @@ async function raceGenericYtDlpFormats(
 		{ cookieArgs: ['--cookies-from-browser', 'chromium'], timeoutMs: force ? 24_000 : 20_000, label: `${source}/chromium` },
 		{ cookieArgs: [], timeoutMs: 12_000, label: `${source}/no-cookies` }
 	];
-	let lastErr = '';
 
-	if (force) {
-		for (const attempt of attempts) {
-			const run = runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, { label: attempt.label });
-			const formats = tagFormats(await run.promise, source);
-			run.kill();
-			if (formats.length) return { formats, lastErr: '' };
-			lastErr = run.getError() || lastErr;
-		}
-		return { formats: [], lastErr };
-	}
-
+	// Always race in parallel (force only lengthens timeouts). Serial force walks used to
+	// make TikTok/X badge clicks wait for chrome then chromium then no-cookies one-by-one.
 	const runners = attempts.map((attempt) =>
 		runYtDlpJson(url, attempt.cookieArgs, attempt.timeoutMs, { label: attempt.label })
 	);
@@ -790,7 +823,10 @@ function parseFormatHeight(label: string): number {
 	return 0;
 }
 
-/** YouTube picker: hide silent video-only DASH streams; offer a merged "best" row. */
+/** YouTube picker: hide silent video-only DASH streams; offer a merged "best" row.
+ * Seed Best.url from the top progressive so Best clicks pass directUrl and skip
+ * a second yt-dlp `-f b -g` (that used to double latency after listing).
+ */
 function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
 	const combined = dedupeFormats(formats.filter((f) => f.av === 'both'));
 	combined.sort((a, b) => {
@@ -800,11 +836,13 @@ function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
 		return (b.filesize ?? 0) - (a.filesize ?? 0);
 	});
 	const titleStem = combined[0]?.label.split(' — ')[0] || 'video';
+	const top = combined[0];
 	const best: MediaFormat = {
 		id: 'best',
 		label: `${titleStem} — Best (video + audio)`,
-		url: '',
-		ext: '.mp4',
+		url: top?.url || '',
+		ext: top?.ext || '.mp4',
+		filesize: top?.filesize,
 		source: 'youtube',
 		kind: 'progressive',
 		av: 'both'

@@ -88,6 +88,7 @@ fn backend_parity_youtube_picker() {
     ];
     let out = ytdlp::finalize_youtube_picker(raw);
     assert_eq!(out[0].id, "best");
+    assert_eq!(out[0].url, "https://v.example/p");
     assert!(out.iter().any(|f| f.id == "18"));
     assert!(!out.iter().any(|f| f.id == "137"));
     assert!(!out.iter().any(|f| f.id == "140"));

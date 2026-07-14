@@ -158,15 +158,14 @@ pub fn validators_match(
     etag: &Option<String>,
     last_modified: &Option<String>,
 ) -> bool {
-    if let (Some(a), Some(b)) = (&state.etag, etag) {
-        if a != b {
-            return false;
-        }
+    // Stronger resume: if the server now provides a validator, the state must
+    // carry the same value (missing/mismatched → restart). Prevents silent
+    // resume against a replaced CDN object.
+    if etag.is_some() && state.etag.as_ref() != etag.as_ref() {
+        return false;
     }
-    if let (Some(a), Some(b)) = (&state.last_modified, last_modified) {
-        if a != b {
-            return false;
-        }
+    if last_modified.is_some() && state.last_modified.as_ref() != last_modified.as_ref() {
+        return false;
     }
     true
 }
@@ -254,5 +253,18 @@ mod tests {
     fn validators_mismatch_etag() {
         let s = sample();
         assert!(!validators_match(&s, &Some("other".into()), &None));
+        // Sample state etag is "\"abc\"" — same value must still match.
+        assert!(validators_match(&s, &Some("\"abc\"".into()), &None));
+    }
+
+    #[test]
+    fn validators_require_server_etag_when_present() {
+        let mut s = sample();
+        s.etag = None;
+        // Server now has etag, state missing → restart
+        assert!(!validators_match(&s, &Some("\"new\"".into()), &None));
+        // Matching etags OK
+        s.etag = Some("\"new\"".into());
+        assert!(validators_match(&s, &Some("\"new\"".into()), &None));
     }
 }

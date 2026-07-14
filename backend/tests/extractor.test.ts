@@ -37,6 +37,9 @@ describe('normalizeFormatUrl', () => {
 		expect(normalizeFormatUrl('https://www.instagram.com/reel/AbCd/?igsh=1')).toBe(
 			'https://www.instagram.com/reel/AbCd'
 		);
+		expect(normalizeFormatUrl('https://www.instagram.com/reels/AbCd/?igsh=1')).toBe(
+			'https://www.instagram.com/reel/AbCd'
+		);
 	});
 
 	it('canonicalizes Instagram story URLs', () => {
@@ -72,6 +75,8 @@ describe('finalizeFormatsForPicker', () => {
 		];
 		const out = finalizeFormatsForPicker(raw, 'youtube');
 		expect(out[0]?.id).toBe('best');
+		// Best is seeded from the top progressive URL so download can skip a second yt-dlp.
+		expect(out[0]?.url).toBe('https://v.example/p');
 		expect(out.some((f) => f.id === '137')).toBe(false);
 		expect(out.some((f) => f.id === '18')).toBe(true);
 		expect(out.some((f) => f.id === '140')).toBe(false);

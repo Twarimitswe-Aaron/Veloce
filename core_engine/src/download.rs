@@ -131,54 +131,69 @@ pub async fn download_piece(
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(bytes))) => {
                 let _ = t_first_byte.get_or_insert_with(Instant::now);
-                let n = bytes.len();
-                limiter.acquire(n as u64).await;
-                buf.extend_from_slice(&bytes);
-                if buf.len() >= read_buffer_bytes {
-                    #[cfg(target_os = "linux")]
-                    if let Some(engine) = uring.as_mut() {
-                        engine.write_at(file_offset, &buf).context("disk write")?;
-                    } else {
-                        output.write_at(file_offset, &buf).context("disk write")?;
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    output.write_at(file_offset, &buf).context("disk write")?;
-                    file_offset += buf.len() as u64;
-                    buf.clear();
+                let remaining = piece_len.saturating_sub(piece_done);
+                if remaining == 0 {
+                    break;
                 }
-                worker_partial.fetch_add(n as u64, Ordering::Relaxed);
-                piece_done += n as u64;
-                bar.inc(n as u64);
+                // Cap to piece end so over-long responses cannot corrupt neighbours.
+                let take = (bytes.len() as u64).min(remaining) as usize;
+                let chunk = &bytes[..take];
+                let n = take as u64;
+                limiter.acquire(n).await;
+                buf.extend_from_slice(chunk);
 
-                // Milestone progress — in-place update (no newline)
+                if buf.len() >= read_buffer_bytes {
+                    let wrote = buf.len() as u64;
+                    flush_piece_buf(
+                        output,
+                        file_offset,
+                        &mut buf,
+                        read_buffer_bytes,
+                        #[cfg(target_os = "linux")]
+                        &mut uring,
+                    )?;
+                    file_offset += wrote;
+                }
+
+                worker_partial.fetch_add(n, Ordering::Relaxed);
+                piece_done += n;
+                bar.inc(n);
+
                 while piece_done >= next_milestone_at && next_milestone > 0 {
                     let pct = (piece_done as f64 / piece_len as f64) * 100.0;
-                    eprint!("   \r📦 Chunk progress: {:.0}% ({:.1} MB / {:.1} MB)  ",
-                        pct,
-                        piece_done as f64 / 1_048_576.0,
-                        piece_len as f64 / 1_048_576.0
-                    );
+                    if !crate::logutil::is_quiet() {
+                        eprint!(
+                            "   \r📦 Chunk progress: {:.0}% ({:.1} MB / {:.1} MB)  ",
+                            pct,
+                            piece_done as f64 / 1_048_576.0,
+                            piece_len as f64 / 1_048_576.0
+                        );
+                    }
                     milestone_printed = true;
                     next_milestone_at += next_milestone;
+                }
+
+                if piece_done >= piece_len {
+                    break;
                 }
             }
         }
     }
 
     // Clear the in-place progress line so the "✅ Piece complete" lands cleanly.
-    if milestone_printed {
-        eprintln!("");
+    if milestone_printed && !crate::logutil::is_quiet() {
+        eprintln!();
     }
 
     if !buf.is_empty() {
-        #[cfg(target_os = "linux")]
-        if let Some(engine) = uring.as_mut() {
-            engine.write_at(file_offset, &buf).context("disk write")?;
-        } else {
-            output.write_at(file_offset, &buf).context("disk write")?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        output.write_at(file_offset, &buf).context("disk write")?;
+        flush_piece_buf(
+            output,
+            file_offset,
+            &mut buf,
+            read_buffer_bytes,
+            #[cfg(target_os = "linux")]
+            &mut uring,
+        )?;
     }
 
     // Flush any remaining batched writes to ensure all data is visible
@@ -197,7 +212,8 @@ pub async fn download_piece(
 
     let bytes_dl = piece_done;
     let xfer_speed = bytes_dl as f64 / 1_048_576.0 / transfer_secs.max(0.001);
-    eprintln!("   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — TTFB {:5.2}s — Xfer {:5.2}s — {:5.1} MB/s",
+    crate::elog!(
+        "   ✅ Piece [{:.1} MB - {:.1} MB] complete ({}) — TTFB {:5.2}s — Xfer {:5.2}s — {:5.1} MB/s",
         start as f64 / 1_048_576.0,
         end as f64 / 1_048_576.0,
         format_bytes(piece_len),
@@ -222,6 +238,27 @@ pub async fn download_piece(
         });
     }
 
+    Ok(())
+}
+
+fn flush_piece_buf(
+    output: &SharedOutput,
+    file_offset: u64,
+    buf: &mut Vec<u8>,
+    read_buffer_bytes: usize,
+    #[cfg(target_os = "linux")] uring: &mut Option<&mut IoUringEngine>,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(engine) = uring.as_deref_mut() {
+        let owned = std::mem::replace(buf, Vec::with_capacity(read_buffer_bytes));
+        engine
+            .write_at_owned(file_offset, owned)
+            .context("disk write")?;
+        return Ok(());
+    }
+    let _ = read_buffer_bytes;
+    output.write_at(file_offset, buf).context("disk write")?;
+    buf.clear();
     Ok(())
 }
 

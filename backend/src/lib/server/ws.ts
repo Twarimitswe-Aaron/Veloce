@@ -460,12 +460,17 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			);
 			return;
 		}
+		const finalSafety = isSafeDownloadUrl(finalUrl);
+		if (!finalSafety.ok) {
+			await markError(id, finalSafety.reason);
+			return;
+		}
 		const bin = coreEngineBinaryPath();
 		const engineArgs = buildEngineCliArgs({
 			id,
 			url: finalUrl,
 			savePath,
-			threads: spec.threads,
+			threads: Math.min(64, Math.max(1, spec.threads || runtime.defaultThreads)),
 			maxRateBytes: runtime.maxRateBytes,
 			engineQuiet: runtime.engineQuiet,
 			referer: referer || undefined
@@ -936,7 +941,7 @@ export function setupWebSocketServer(server: Server) {
 						console.error('Invalid URL during normalization');
 					}
 
-					const threads = data.payload.threads || runtime.defaultThreads;
+					const threads = Math.min(64, Math.max(1, Number(data.payload.threads) || runtime.defaultThreads));
 
 					let baseDir = data.payload.baseDirectory;
 					if (!baseDir || baseDir.trim() === '') {
@@ -985,36 +990,48 @@ export function setupWebSocketServer(server: Server) {
 						ws.send(JSON.stringify({ type: 'DOWNLOAD_ERROR', downloadId: null, error: result.error }));
 					}
 				} else if (data.type === 'LIST_FORMATS') {
+					// Non-blocking — desktop tokio::spawn parity. Awaiting yt-dlp here used to
+					// stall the whole WS read loop so prefetch + badge clicks serialized.
 					const pageUrl = data.payload?.url ?? '';
+					const requestId = data.requestId;
+					const force = data.payload?.force === true;
 					if (/^(blob:|data:|mediastream:)/i.test(pageUrl)) {
 						ws.send(JSON.stringify({
 							type: 'FORMATS_ERROR',
-							requestId: data.requestId,
+							requestId,
 							error: 'Browser-only blob URL — reload the Veloce extension and refresh the page. The badge should resolve to the Instagram post link (/p/…).'
 						}));
 						return;
 					}
 					const safety = isSafeDownloadUrl(pageUrl);
 					if (!safety.ok) {
-						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId: data.requestId, error: safety.reason }));
+						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId, error: safety.reason }));
 						return;
 					}
-					try {
-						const formats = await listFormats(pageUrl, { force: data.payload?.force === true });
-						if (!formats.length) {
-							const hint = getRecentFormatError(pageUrl);
-							ws.send(JSON.stringify({
-								type: 'FORMATS_ERROR',
-								requestId: data.requestId,
-								error: hint ?? 'No formats found for this URL.'
-							}));
-							return;
+					void (async () => {
+						try {
+							const formats = await listFormats(pageUrl, { force });
+							if (!formats.length) {
+								const hint = getRecentFormatError(pageUrl);
+								if (ws.readyState === 1) {
+									ws.send(JSON.stringify({
+										type: 'FORMATS_ERROR',
+										requestId,
+										error: hint ?? 'No formats found for this URL.'
+									}));
+								}
+								return;
+							}
+							if (ws.readyState === 1) {
+								ws.send(JSON.stringify({ type: 'FORMATS_LIST', requestId, formats }));
+							}
+						} catch (e) {
+							console.error('LIST_FORMATS failed:', e);
+							if (ws.readyState === 1) {
+								ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId, error: 'Could not list formats.' }));
+							}
 						}
-						ws.send(JSON.stringify({ type: 'FORMATS_LIST', requestId: data.requestId, formats }));
-					} catch (e) {
-						console.error('LIST_FORMATS failed:', e);
-						ws.send(JSON.stringify({ type: 'FORMATS_ERROR', requestId: data.requestId, error: 'Could not list formats.' }));
-					}
+					})();
 				} else if (data.type === 'PAUSE_DOWNLOAD') {
 					const pl = await getPlaylistJob(data.downloadId);
 					if (pl) {

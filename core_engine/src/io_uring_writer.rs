@@ -107,7 +107,13 @@ impl IoUringEngine {
     /// Queue a positioned write.  Does **not** block unless the pending
     /// batch is full (auto-flush).  Call `flush()` at the end.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.pending.push(PendingWrite { offset, data: data.to_vec() });
+        self.write_at_owned(offset, data.to_vec())
+    }
+
+    /// Same as `write_at` but takes ownership — avoids an extra copy when the
+    /// caller already holds a `Vec` (e.g. flush of the read buffer).
+    pub fn write_at_owned(&mut self, offset: u64, data: Vec<u8>) -> io::Result<()> {
+        self.pending.push(PendingWrite { offset, data });
         if self.pending.len() >= BATCH_SIZE {
             self.flush()?;
         }

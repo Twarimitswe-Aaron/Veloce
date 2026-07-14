@@ -1,4 +1,5 @@
 use clap::Parser;
+use crate::safety::{clamp_threads, MAX_THREADS};
 
 /// Veloce high-performance download engine
 #[derive(Parser, Debug, Clone)]
@@ -13,7 +14,7 @@ pub struct EngineArgs {
     #[arg(long)]
     pub save_path: String,
 
-    /// Maximum parallel connections (ceiling for auto-tune).
+    /// Maximum parallel connections (ceiling for auto-tune). Clamped to 1..=64.
     #[arg(long, default_value_t = 8)]
     pub threads: u64,
 
@@ -53,4 +54,26 @@ pub struct EngineArgs {
     /// Optional JSON host profile file path.
     #[arg(long)]
     pub profiles_path: Option<String>,
+
+    /// Optional download root — save_path must resolve under this directory.
+    #[arg(long)]
+    pub base_dir: Option<String>,
+}
+
+impl EngineArgs {
+    /// Normalize threads / flags after clap parse.
+    pub fn normalize(mut self) -> Self {
+        let before = self.threads;
+        self.threads = clamp_threads(self.threads);
+        if before != self.threads && !self.quiet {
+            eprintln!(
+                "   ⚠️  threads clamped from {before} to {} (max {MAX_THREADS})",
+                self.threads
+            );
+        }
+        if self.no_auto_tune {
+            self.auto_tune = false;
+        }
+        self
+    }
 }

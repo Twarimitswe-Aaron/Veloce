@@ -423,6 +423,23 @@ impl Database {
         Ok(out)
     }
 
+    /// Active + recently finished playlist jobs (any device) for desktop UI hydration.
+    pub fn list_playlist_jobs_for_ui(&self, limit: i64) -> Result<Vec<PlaylistJobRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, playlist_url, title, save_dir, status, current_index, total_tracks, completed_tracks, failed_tracks, entries, settings, referer, threads, current_track_title, error, failed_indices, downloaded_bytes, total_bytes, created_at
+             FROM playlist_jobs
+             WHERE status NOT IN ('cancelled')
+             ORDER BY created_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit], |row| playlist_row_from_stmt(row))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn delete_playlist_job(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM playlist_jobs WHERE id = ?1", params![id])?;

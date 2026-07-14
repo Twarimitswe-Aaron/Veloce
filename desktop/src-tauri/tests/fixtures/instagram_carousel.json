@@ -1,0 +1,20 @@
+{
+  "_type": "playlist",
+  "title": "Carousel Post",
+  "entries": [
+    {
+      "id": "1",
+      "title": "",
+      "url": "https://cdn.example.com/slide1.mp4",
+      "ext": "mp4",
+      "formats": []
+    },
+    {
+      "id": "2",
+      "title": "",
+      "url": "https://cdn.example.com/slide2.mp4",
+      "ext": "mp4",
+      "formats": []
+    }
+  ]
+}

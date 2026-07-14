@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Instant, Duration};
 
 /// Platform/media source for a URL.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MediaSource {
     YouTube,
     Instagram,
@@ -218,10 +218,17 @@ pub fn instagram_url_variants(url: &str) -> Vec<String> {
     variants.into_iter().collect()
 }
 
-/// HLS/DASH manifest URLs need special handling in the download engine.
+/// HLS/DASH manifest URLs need special handling (omit directUrl → re-extract).
 pub fn is_manifest_format_url(url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
     let lower = url.to_lowercase();
-    lower.contains(".m3u8") || lower.contains(".mpd")
+    lower.contains(".m3u8")
+        || lower.contains(".mpd")
+        || lower.contains("/manifest/")
+        || lower.contains("playlist_type")
+        || lower.contains("format=m3u8")
 }
 
 /// Redirect/API/graphql trap URLs — backend parity.
@@ -245,6 +252,63 @@ pub fn is_trap_download_url(url: &str) -> bool {
     false
 }
 
+/// Soft-fail TTL: Instagram stays failed longer (cookies / empty media recover slowly).
+pub fn fail_cache_ttl_secs(source: MediaSource) -> u64 {
+    match source {
+        MediaSource::Instagram => 5 * 60,
+        _ => 90,
+    }
+}
+
+/// User-facing error matched to the URL platform — never a cross-site message.
+pub fn fail_reason_for_source(source: MediaSource, last_err: Option<&str>) -> String {
+    let err = last_err.unwrap_or("").to_lowercase();
+
+    match source {
+        MediaSource::Instagram => {
+            if err.contains("empty media") {
+                return "Instagram blocked yt-dlp for this post. Stay logged in to Instagram in Chrome (not only Chromium), reload the post, then click the Veloce badge again. Image-only posts have no video.".into();
+            }
+            if err.contains("story") || err.contains("stories") {
+                return "Instagram story extraction failed. Stay logged in to Chrome, open the video story, then click the Veloce badge. Photo-only stories have no video stream.".into();
+            }
+            "Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry.".into()
+        }
+        MediaSource::YouTube => {
+            if err.contains("challenge solving")
+                || err.contains("signature solving")
+                || err.contains("only images are available")
+            {
+                return "YouTube blocked format extraction (JS challenge). Ensure Node.js is installed on your system, restart Veloce, then retry from the badge.".into();
+            }
+            if err.contains("not available") || err.contains("private") {
+                return "YouTube reports this video is unavailable (region, sign-in, or age gate). Open it in your browser, sign in if needed, then retry from the Veloce badge.".into();
+            }
+            if err.contains("requested format is not available") {
+                return "YouTube returned no progressive formats for this video. Retry with the Veloce badge — alternate player clients will be tried.".into();
+            }
+            "YouTube returned no formats. Sign in to YouTube in Chrome and retry.".into()
+        }
+        MediaSource::TikTok => {
+            "TikTok returned no formats. Open the video in your browser while logged in, then retry.".into()
+        }
+        MediaSource::Twitter => {
+            "X/Twitter returned no formats. Open the post in your browser while logged in, then retry.".into()
+        }
+        _ => {
+            if let Some(raw) = last_err.filter(|s| !s.is_empty()) {
+                if raw.len() > 240 {
+                    format!("{}…", &raw[..237])
+                } else {
+                    raw.to_string()
+                }
+            } else {
+                "No downloadable formats found for this URL.".into()
+            }
+        }
+    }
+}
+
 /// Normalize a URL for consistent caching.
 pub fn normalize_url(url: &str) -> String {
     let lower = url.to_lowercase();
@@ -255,9 +319,9 @@ pub fn normalize_url(url: &str) -> String {
         }
     }
     if lower.contains("instagram.com") {
-        // Strip trailing slash and query params
+        // Strip query; map /reels/ → /reel/ so feed + viewer share one cache key.
         let no_query = url.split('?').next().unwrap_or(url).trim_end_matches('/');
-        return no_query.to_string();
+        return no_query.replace("/reels/", "/reel/").replace("/Reels/", "/reel/");
     }
     // Default: strip query string
     url.split('?').next().unwrap_or(url).trim_end_matches('/').to_string()
@@ -564,6 +628,14 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_url_instagram_reels_to_reel() {
+        assert_eq!(
+            normalize_url("https://www.instagram.com/reels/AbCdEf/?igsh=1"),
+            "https://www.instagram.com/reel/AbCdEf"
+        );
+    }
+
+    #[test]
     fn test_normalize_url_generic() {
         assert_eq!(
             normalize_url("https://example.com/page?query=param"),
@@ -628,9 +700,31 @@ mod tests {
     fn test_is_manifest_format_url() {
         assert!(is_manifest_format_url("https://cdn.example.com/stream.m3u8?sig=1"));
         assert!(is_manifest_format_url("https://cdn.example.com/manifest.mpd"));
+        assert!(is_manifest_format_url(
+            "https://cdn.example.com/manifest/hls/index"
+        ));
+        assert!(is_manifest_format_url(
+            "https://cdn.example.com/play?format=m3u8&token=1"
+        ));
         assert!(!is_manifest_format_url(
             "https://googlevideo.com/videoplayback?id=1&itag=22"
         ));
+    }
+
+    #[test]
+    fn test_fail_cache_ttl_instagram_longer() {
+        assert_eq!(fail_cache_ttl_secs(MediaSource::Instagram), 300);
+        assert_eq!(fail_cache_ttl_secs(MediaSource::YouTube), 90);
+    }
+
+    #[test]
+    fn test_fail_reason_for_source_platform_specific() {
+        let ig = fail_reason_for_source(MediaSource::Instagram, Some("empty media response"));
+        assert!(ig.contains("Instagram"));
+        assert!(!ig.to_lowercase().contains("youtube"));
+        let yt = fail_reason_for_source(MediaSource::YouTube, Some("challenge solving failed"));
+        assert!(yt.contains("YouTube"));
+        assert!(yt.contains("Node"));
     }
 
     #[test]

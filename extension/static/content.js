@@ -1578,7 +1578,10 @@
 					const pageUrl = location.href.split('#')[0];
 					const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 					const manifest = isManifestFormat(fmt);
-					const useDirect = fmt.url && fmt.id !== 'best' && !manifest;
+					// Prefer directUrl when the format already carries a CDN/progressive URL
+					// (including seeded Best). Manifests still omit it so the coordinator
+					// re-extracts. Empty Best URLs used to force a second yt-dlp every click.
+					const useDirect = !!fmt.url && !manifest;
 					if (!extensionAlive()) {
 						showVeloceToast('Veloce was updated — refresh this page (F5)', true);
 						return;
@@ -1590,41 +1593,30 @@
 						formatId: fmt.id,
 						manifest
 					});
-					try {
-						chrome.storage.local.get(['veloce_base_dir', 'veloce_intercept'], (cfg) => {
-							if (chrome.runtime.lastError && isExtensionInvalidatedError(chrome.runtime.lastError)) {
-								markExtensionDead(chrome.runtime.lastError);
+					// Skip chrome.storage on the hot path — background fills baseDirectory
+					// from in-memory selectedDirectory / settings.
+					const payload = {
+						url: sourceUrl,
+						directUrl: useDirect ? fmt.url : undefined,
+						pageUrl,
+						referer: pageUrl,
+						fileName,
+						ext: fmt.ext,
+						threads: 8
+					};
+					safeSendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
+						if (!resp?.ok) {
+							if (extensionDead) {
 								showVeloceToast('Veloce was updated — refresh this page (F5)', true);
 								return;
 							}
-							const payload = {
-								url: sourceUrl,
-								directUrl: useDirect ? fmt.url : undefined,
-								pageUrl,
-								referer: pageUrl,
-								fileName,
-								ext: fmt.ext,
-								baseDirectory: cfg.veloce_base_dir || undefined,
-								threads: 8
-							};
-							safeSendMessage({ type: 'VELOCE_NEW_DOWNLOAD', payload }, (resp) => {
-								if (!resp?.ok) {
-									if (extensionDead) {
-										showVeloceToast('Veloce was updated — refresh this page (F5)', true);
-										return;
-									}
-									interceptLog('step 7: FAILED — coordinator not reached', { resp });
-									showVeloceToast('Veloce: backend offline — run: cd backend && pnpm dev', true);
-									return;
-								}
-								interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
-								showVeloceToast(`Veloce: downloading ${fileName}`, false);
-							});
-						});
-					} catch (e) {
-						if (isExtensionInvalidatedError(e)) markExtensionDead(e);
-						showVeloceToast('Veloce was updated — refresh this page (F5)', true);
-					}
+							interceptLog('step 7: FAILED — coordinator not reached', { resp });
+							showVeloceToast('Veloce: backend offline — run desktop or: cd backend && pnpm dev', true);
+							return;
+						}
+						interceptLog('step 7: download queued OK', { fileName, directUrl: fmt.url });
+						showVeloceToast(`Veloce: downloading ${fileName}`, false);
+					});
 				} catch (clickErr) {
 					console.error('[Veloce] Format button click error:', clickErr);
 					showVeloceToast('Veloce: ' + (clickErr?.message || String(clickErr)), true);

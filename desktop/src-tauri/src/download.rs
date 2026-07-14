@@ -15,8 +15,6 @@ use crate::state::{AppState, DownloadStatus};
 use crate::util;
 use crate::ytdlp;
 
-const FAIL_CACHE_TTL_SECS: u64 = 90;
-
 static FORMAT_INFLIGHT: Lazy<
     TokioMutex<HashMap<String, broadcast::Sender<Result<Vec<MediaFormat>, String>>>>,
 > = Lazy::new(|| TokioMutex::new(HashMap::new()));
@@ -53,18 +51,34 @@ pub async fn list_formats_for_url(
     let source = formats::detect_source(url);
     let normalized = formats::normalize_url(url);
 
-    if !force {
-        if let Some(cached) = state.format_cache.get(&normalized) {
-            if let Ok(formats) = serde_json::from_str::<Vec<MediaFormat>>(&cached) {
-                if !formats.is_empty() {
-                    return Ok(formats);
-                }
+    // Trap/redirect URLs never yield media — fail fast with a page-intercept hint.
+    if formats::is_trap_download_url(url) && source == formats::MediaSource::Generic {
+        return Err(
+            "Redirect/API link — use the Veloce intercept format picker on the page instead of this URL directly."
+                .to_string(),
+        );
+    }
+
+    // Success cache always wins — matching backend listFormats().
+    // force only means "ignore a recent soft-fail and retry yt-dlp", not "throw away
+    // a warm prefetch that already succeeded". Badge clicks send force:true; without
+    // this, every click re-spawns yt-dlp even when formats were listed seconds ago.
+    if let Some(cached) = state.format_cache.get(&normalized) {
+        if let Ok(formats) = serde_json::from_str::<Vec<MediaFormat>>(&cached) {
+            if !formats.is_empty() {
+                return Ok(formats);
             }
         }
-        if let Some((reason, ts)) = FORMAT_FAIL_CACHE.lock().await.get(&normalized).cloned() {
-            if now_secs().saturating_sub(ts) < FAIL_CACHE_TTL_SECS {
-                return Err(reason);
-            }
+    }
+
+    // Fail cache: soft-block repeats of known-bad URLs. force clears / bypasses it
+    // so the user can retry after login, cookie, or network fixes.
+    let fail_ttl = formats::fail_cache_ttl_secs(source);
+    if force {
+        FORMAT_FAIL_CACHE.lock().await.remove(&normalized);
+    } else if let Some((reason, ts)) = FORMAT_FAIL_CACHE.lock().await.get(&normalized).cloned() {
+        if now_secs().saturating_sub(ts) < fail_ttl {
+            return Err(reason);
         }
     }
 
@@ -144,58 +158,21 @@ async fn list_formats_uncached(
             }]
         }
         formats::MediaSource::Instagram => {
-            // Instagram: try URL variants (/p/ & /reel/) with Chrome/Chromium — backend parity.
-            let variants = formats::instagram_url_variants(url);
-            let browsers: &[&str] = if force {
-                &["chrome", "chromium", "brave", "firefox"]
-            } else {
-                &["chrome", "chromium"]
-            };
-            let timeout_secs = if force { 24 } else { 14 };
-
-            let mut last_err = String::new();
-            let mut result: Vec<MediaFormat> = vec![];
-
-            for variant in &variants {
-                for browser in browsers {
-                    let v = variant.clone();
-                    let b = browser.to_string();
-                    match tokio::task::spawn_blocking(move || {
-                        // Build specific instagram attempt with single browser
-                        let attempts = vec![ytdlp::YtAttempt {
-                            cookie_args: vec!["--cookies-from-browser".into(), b],
-                            extra_args: vec![],
-                            timeout_secs,
-                            label: format!("instagram/{browser}"),
-                        }];
-                        ytdlp::run_attempts(&v, &attempts, false)
-                    }).await {
-                        Ok(Ok(formats)) if !formats.is_empty() => {
-                            result = formats;
-                            break;
-                        }
-                        Ok(Ok(_)) => {} // empty formats, continue
-                        Ok(Err(e)) => last_err = e,
-                        Err(e) => last_err = format!("Task failed: {e}"),
-                    }
-                }
-                if !result.is_empty() {
-                    break;
+            // Parallel variant×browser race + carousel playlist expand (list_instagram_formats).
+            let page = url.to_string();
+            match tokio::task::spawn_blocking(move || ytdlp::list_instagram_formats(&page, force))
+                .await
+                .map_err(|e| format!("yt-dlp task failed: {e}"))?
+            {
+                Ok(formats) => formats,
+                Err(last_err) => {
+                    FORMAT_FAIL_CACHE
+                        .lock()
+                        .await
+                        .insert(normalized.to_string(), (last_err.clone(), now_secs()));
+                    return Err(last_err);
                 }
             }
-
-            if result.is_empty() {
-                FORMAT_FAIL_CACHE
-                    .lock()
-                    .await
-                    .insert(normalized.to_string(), (last_err.clone(), now_secs()));
-                return Err(if last_err.is_empty() {
-                    "Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry.".to_string()
-                } else {
-                    last_err
-                });
-            }
-            result
         }
         _ => {
             let normalized = normalized.to_string();
@@ -206,7 +183,7 @@ async fn list_formats_uncached(
     };
 
     if formats.is_empty() {
-        let reason = "No downloadable formats found for this link".to_string();
+        let reason = formats::fail_reason_for_source(source, None);
         FORMAT_FAIL_CACHE
             .lock()
             .await
@@ -216,6 +193,16 @@ async fn list_formats_uncached(
 
     if let Ok(json) = serde_json::to_string(&formats) {
         state.format_cache.set(normalized, &json);
+    }
+
+    // Also seed best_url_cache from the Best (or first) progressive URL so a
+    // download that omits directUrl still avoids a second yt-dlp extract.
+    if let Some(seed) = formats
+        .iter()
+        .find(|f| f.id == "best" && !f.url.is_empty())
+        .or_else(|| formats.iter().find(|f| !f.url.is_empty()))
+    {
+        state.best_url_cache.set(normalized, &seed.url);
     }
 
     Ok(formats)
@@ -229,6 +216,10 @@ pub struct StartDownloadRequest {
     pub device_id: String,
     pub download_id: Option<String>,
     pub save_path: Option<String>,
+    /// Optional override from extension payload.baseDirectory (popup folder picker).
+    pub base_directory: Option<String>,
+    /// Optional override from extension payload.threads.
+    pub threads: Option<u32>,
 }
 
 /// Resolve the HTTP URL the engine should fetch.
@@ -241,6 +232,9 @@ pub async fn resolve_download_url(
     if formats::detect_source(page_url) == formats::MediaSource::MediaFire {
         log::info!(" -> Detected MediaFire, resolving direct link via scrape...");
         let info = formats::resolve_mediafire(page_url).await?;
+        if !util::is_safe_download_url(&info.direct_url) {
+            return Err("Blocked: MediaFire CDN URL points to a private or local network address".to_string());
+        }
         return Ok(info.direct_url);
     }
 
@@ -264,6 +258,9 @@ pub async fn resolve_download_url(
     let normalized = formats::normalize_url(page_url);
     if let Some(cached) = state.best_url_cache.get(&normalized) {
         log::info!(" -> Using cached extraction for {}", normalized);
+        if !util::is_safe_download_url(&cached) {
+            return Err("Blocked: cached media URL points to a private or local network address".to_string());
+        }
         return Ok(cached);
     }
 
@@ -274,6 +271,10 @@ pub async fn resolve_download_url(
     }).await.map_err(|e| format!("yt-dlp task failed: {}", e))??;
 
     log::info!(" -> yt-dlp extraction successful");
+    // Re-validate post-extract — yt-dlp/MediaFire can return unexpected hosts.
+    if !util::is_safe_download_url(&extracted) {
+        return Err("Blocked: extracted media URL points to a private or local network address".to_string());
+    }
     state.best_url_cache.set(&normalized, &extracted);
     Ok(extracted)
 }
@@ -286,7 +287,15 @@ pub async fn enqueue_download_job(
     let config = Config::from_env();
     let download_id = req.download_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     log::info!("[Step 2: Enqueue Job] ID: {}, URL: {}", download_id, req.url);
-    let (save_dir, _, _) = state.get_runtime_settings();
+    let (runtime_dir, _, runtime_threads) = state.get_runtime_settings();
+    // Prefer per-request baseDirectory from the extension popup when set.
+    let save_dir = req
+        .base_directory
+        .as_ref()
+        .filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or(runtime_dir);
+    let job_threads = req.threads.filter(|t| *t > 0).unwrap_or(runtime_threads);
 
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create save directory: {}", e))?;
@@ -390,6 +399,7 @@ pub async fn enqueue_download_job(
         eta_secs: 0,
         is_playlist: false,
         error: None,
+        threads: Some(job_threads),
     };
 
     state.scheduler.enqueue(job_state);
@@ -419,7 +429,14 @@ pub fn pump_scheduler(state: Arc<AppState>) {
 async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobState, referer: Option<String>) -> Result<(), String> {
     let config = Config::from_env();
     let download_id = job.id;
-    let download_url = job.direct_url.unwrap_or(job.url);
+    // MediaFire CDN tokens expire while jobs wait in the queue — re-scrape at engine
+    // start (backend runDownloadJob parity), not only at enqueue time.
+    let download_url = if formats::detect_source(&job.url) == formats::MediaSource::MediaFire {
+        log::info!("[MediaFire] Re-resolving CDN URL at engine start for {}", download_id);
+        formats::resolve_mediafire(&job.url).await?.direct_url
+    } else {
+        job.direct_url.unwrap_or(job.url.clone())
+    };
     let save_path_str = job.save_path;
 
     let _ = state.db.update_download_status(&download_id, "downloading");
@@ -445,18 +462,39 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         }
     };
 
-    let (_, _, default_threads) = state.get_runtime_settings();
-    
+    let (save_dir_runtime, _, default_threads) = state.get_runtime_settings();
+    let base_dir = save_dir_runtime.to_string_lossy().into_owned();
+    let threads = job
+        .threads
+        .filter(|t| *t > 0)
+        .unwrap_or(default_threads)
+        .clamp(1, 64);
+    // Direct/CDN hosts already have known Range behavior — skip auto-tune probe
+    // so time-to-first-byte stays low. Keep auto-tune for social/CDN adaptive hosts.
+    let page_source = formats::detect_source(&job.url);
+    let auto_tune = config.engine_auto_tune
+        && !matches!(
+            page_source,
+            formats::MediaSource::MediaFire
+                | formats::MediaSource::Direct
+                | formats::MediaSource::GitHub
+        );
+
+    if !util::is_safe_download_url(&download_url) {
+        return Err("Blocked: download URL points to a private or local network address".to_string());
+    }
+
     match EngineProcess::spawn(
         download_id.clone(),
         &download_url,
         &save_path_str,
-        default_threads,
+        threads,
         config.max_rate_bytes,
         config.engine_quiet,
         config.engine_read_buffer_bytes,
-        config.engine_auto_tune,
+        auto_tune,
         referer.as_deref(),
+        Some(&base_dir),
         on_progress,
     ) {
         Ok((engine, _reader)) => {
@@ -696,6 +734,8 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
             device_id: row.device_id.clone(),
             download_id: Some(id.to_string()),
             save_path: Some(row.save_path.clone()),
+            base_directory: None,
+            threads: None,
         },
     )
     .await?;
@@ -795,11 +835,39 @@ mod tests {
         assert_eq!(first[0].url, second[0].url);
     }
 
+    /// force:true must still return the warm success cache (backend parity).
+    #[tokio::test]
+    async fn force_true_still_hits_success_cache() {
+        let state = test_state();
+        let url = "https://cdn.example.com/force-cache.zip";
+        let first = list_formats_for_url(&state, url, false)
+            .await
+            .expect("seed cache");
+        let forced = list_formats_for_url(&state, url, true)
+            .await
+            .expect("force must not drop success cache");
+        assert_eq!(first[0].url, forced[0].url);
+        assert_eq!(forced[0].source.as_deref(), Some("direct"));
+    }
+
     #[tokio::test]
     async fn force_still_validates_url() {
         let state = test_state();
         let err = list_formats_for_url(&state, "", true).await.unwrap_err();
         assert!(err.contains("No URL"));
+    }
+
+    #[tokio::test]
+    async fn trap_url_rejected_on_list() {
+        let state = test_state();
+        let err = list_formats_for_url(
+            &state,
+            "https://evil.example.com/api/graphql?a=redirect",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Redirect/API") || err.contains("intercept"));
     }
 
     #[tokio::test]
@@ -813,6 +881,25 @@ mod tests {
         .await
         .expect("direct");
         assert_eq!(url, "https://cdn.example.com/direct.mp4");
+    }
+
+    /// Listing must seed best_url_cache so a Best-style resolve without directUrl
+    /// still skips a second yt-dlp when formats were already listed.
+    #[tokio::test]
+    async fn list_formats_seeds_best_url_cache() {
+        let state = test_state();
+        let url = "https://cdn.example.com/seed-best.zip";
+        let formats = list_formats_for_url(&state, url, false)
+            .await
+            .expect("list");
+        assert!(!formats[0].url.is_empty());
+        let key = formats::normalize_url(url);
+        let cached = state.best_url_cache.get(&key).expect("best url seeded");
+        assert_eq!(cached, formats[0].url);
+        let resolved = resolve_download_url(&state, url, None)
+            .await
+            .expect("resolve from seed");
+        assert_eq!(resolved, formats[0].url);
     }
 
     #[tokio::test]

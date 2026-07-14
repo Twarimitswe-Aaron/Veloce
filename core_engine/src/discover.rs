@@ -27,7 +27,10 @@ pub fn build_http_client(threads: usize, referer: Option<&str>, origin: Option<&
         .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(threads.max(1))
-        .connect_timeout(Duration::from_secs(30));
+        .connect_timeout(Duration::from_secs(30))
+        // Block redirects into private/loopback/metadata — coordinator SSRF defense
+        // is not enough once Location headers are followed inside the engine.
+        .redirect(crate::safety::safe_redirect_policy());
 
     let mut default_headers = reqwest::header::HeaderMap::new();
     if let Some(r) = referer {

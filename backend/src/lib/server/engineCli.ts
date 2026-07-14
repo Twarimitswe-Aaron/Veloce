@@ -14,6 +14,7 @@ export type EngineCapabilities = {
 	readBufferBytes: boolean;
 	pieceSizeBytes: boolean;
 	noAutoTune: boolean;
+	baseDir: boolean;
 };
 
 let capsCache: EngineCapabilities | null = null;
@@ -39,7 +40,8 @@ export function getCoreEngineCapabilities(): EngineCapabilities {
 		origin: help.includes('--origin'),
 		readBufferBytes: help.includes('--read-buffer-bytes'),
 		pieceSizeBytes: help.includes('--piece-size-bytes'),
-		noAutoTune: help.includes('--no-auto-tune')
+		noAutoTune: help.includes('--no-auto-tune'),
+		baseDir: help.includes('--base-dir')
 	};
 	return capsCache;
 }
@@ -63,11 +65,12 @@ export type EngineCliOpts = {
 /** CLI arguments for core_engine — keeps ws + playlist runner in sync. */
 export function buildEngineCliArgs(opts: EngineCliOpts): string[] {
 	const caps = opts.caps ?? getCoreEngineCapabilities();
+	const threads = Math.min(64, Math.max(1, opts.threads || 8));
 	const args = [
 		'--id', opts.id,
 		'--url', opts.url,
 		'--save-path', opts.savePath,
-		'--threads', String(opts.threads),
+		'--threads', String(threads),
 		'--max-rate', String(opts.maxRateBytes)
 	];
 	if (caps.readBufferBytes) {
@@ -83,6 +86,15 @@ export function buildEngineCliArgs(opts: EngineCliOpts): string[] {
 				args.push('--origin', new URL(opts.referer).origin);
 			} catch { /* ignore */ }
 		}
+	}
+	// Confine writes under the download root when the engine supports --base-dir.
+	if (caps.baseDir) {
+		try {
+			const base = path.dirname(opts.savePath);
+			if (base && base !== '.' && base !== opts.savePath) {
+				args.push('--base-dir', base);
+			}
+		} catch { /* ignore */ }
 	}
 	return args;
 }

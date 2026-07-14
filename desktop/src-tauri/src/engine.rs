@@ -40,11 +40,14 @@ impl EngineProcess {
         read_buffer_bytes: u32,
         auto_tune: bool,
         referer: Option<&str>,
+        base_dir: Option<&str>,
         on_progress: F,
     ) -> Result<(Self, std::thread::JoinHandle<()>), String>
     where
         F: Fn(EngineProgress) + Send + 'static,
     {
+        // Clamp threads at the spawn boundary (engine also clamps).
+        let threads = threads.clamp(1, 64);
         let engine_path = Self::find_engine();
         let mut args = vec![
             "--id".to_string(),
@@ -69,6 +72,18 @@ impl EngineProcess {
         if let Some(ref_) = referer {
             args.push("--referer".to_string());
             args.push(ref_.to_string());
+            // Match backend engineCli — googlevideo-style CDNs often need Origin.
+            if let Ok(parsed) = url::Url::parse(ref_) {
+                let origin = parsed.origin().ascii_serialization();
+                if origin != "null" {
+                    args.push("--origin".to_string());
+                    args.push(origin);
+                }
+            }
+        }
+        if let Some(dir) = base_dir.filter(|d| !d.is_empty()) {
+            args.push("--base-dir".to_string());
+            args.push(dir.to_string());
         }
 
         let mut child = Command::new(&engine_path)
@@ -204,7 +219,7 @@ mod tests {
         assert_eq!(p.total, Some(1000));
         assert_eq!(p.speed_bps, Some(2_500_000));
         assert_eq!(p.eta_secs, Some(30));
-        assert_eq!(p.elapsed_secs, Some(10));
+        assert_eq!(p.elapsed_secs, Some(10.0));
         assert_eq!(p.error, None);
     }
 
@@ -250,7 +265,7 @@ mod tests {
             total: Some(1000),
             speed_bps: Some(2_500_000),
             eta_secs: Some(30),
-            elapsed_secs: Some(10),
+            elapsed_secs: Some(10.0),
             error: None,
         };
         let json = serde_json::to_string(&p).expect("should serialize");

@@ -286,6 +286,8 @@ These are the failure modes that bite naive downloaders. Each is handled so the 
 | Disk fills up | Partial file, confusing error | Size-aware `statvfs` check *before* writing + preallocation; clean `fatal` message |
 | Filename already exists | Overwrites an unrelated file | Auto-rename `name (1).ext`, … |
 | Malicious filename `../../etc/...` | Writes outside the target dir | Basename + base-dir confinement |
+| Redirect to `169.254.169.254` / LAN | SSRF via open redirect | Engine redirect policy + coordinator URL re-check post-extract |
+| Huge `--threads` / Content-Length | DoS / OOM | Threads clamped 1..=64; file ≤512 GiB; piece map ≤1M |
 | Malicious website opens `ws://localhost` | Drives your downloader / scans LAN | Origin allowlist + SSRF host blocking |
 | URL has no file extension (Instagram reel) | Saves HTML or fails | yt-dlp resolution (cookie fallback) → single progressive `mp4`; re-extracted on resume |
 | CDN blocks library agents | `403 Forbidden` | Realistic Chrome `User-Agent` |

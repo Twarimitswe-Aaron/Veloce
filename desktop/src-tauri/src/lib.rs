@@ -46,6 +46,8 @@ async fn start_download(
             device_id: "desktop".to_string(),
             download_id: None,
             save_path: None,
+            base_directory: None,
+            threads: None,
         },
     )
     .await
@@ -102,27 +104,95 @@ async fn get_history(
 
 #[tauri::command]
 async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let settings = state
-        .db
-        .get_device_settings("desktop")
-        .map_err(|e| format!("DB error: {}", e))?;
-    match settings {
-        Some(s) => serde_json::from_str(&s).map_err(|e| format!("Parse error: {}", e)),
-        None => Ok(serde_json::json!({
-            "base_dir": config::Config::from_env().base_directory().to_string_lossy().to_string(),
-            "max_concurrent": 10,
-            "default_threads": 8,
-            "max_rate": 0,
-        })),
-    }
+    Ok(state.get_ui_settings())
 }
 
 #[tauri::command]
 async fn update_settings(settings: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state
+    let patch: serde_json::Value =
+        serde_json::from_str(&settings).map_err(|e| format!("Parse error: {}", e))?;
+    state.apply_settings_patch(&patch);
+    Ok(())
+}
+
+#[tauri::command]
+async fn select_directory(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let path = util::pick_directory().ok_or_else(|| {
+        "No folder selected (or install zenity/kdialog for a graphical picker)".to_string()
+    })?;
+    state.apply_settings_patch(&serde_json::json!({
+        "base_dir": &path,
+        "baseDirectory": &path,
+    }));
+    // Notify extension clients so popup Save-to stays in sync.
+    state.ws_clients.broadcast(
+        &serde_json::json!({
+            "type": "DIRECTORY_SELECTED",
+            "payload": { "path": &path },
+        })
+        .to_string(),
+    );
+    Ok(path)
+}
+
+#[tauri::command]
+async fn queue_playlist(
+    url: String,
+    file_name: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let (_, _, threads) = state.get_runtime_settings();
+    let (id, total, title, folder) = playlist::queue_playlist_download(
+        &state,
+        &url,
+        file_name.as_deref(),
+        Some(&url),
+        threads,
+    )
+    .await?;
+    playlist::schedule_playlist_job(state.inner().clone(), id.clone());
+    state.emit_playlist_queued(&state::PlaylistQueuedEvent {
+        playlist_id: id.clone(),
+        count: total,
+        total,
+        folder: folder.clone(),
+        title: title.clone(),
+    });
+    state.ws_clients.broadcast_playlist_queued(&id, total, total, &folder, &title);
+    Ok(serde_json::json!({
+        "playlistId": id,
+        "total": total,
+        "title": title,
+        "folder": folder,
+    }))
+}
+
+#[tauri::command]
+async fn list_playlists(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let rows = state
         .db
-        .update_device_settings("desktop", &settings)
-        .map_err(|e| format!("DB error: {}", e))
+        .list_playlist_jobs_for_ui(30)
+        .map_err(|e| format!("DB error: {}", e))?;
+    let list: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "playlistId": r.id,
+                "fileName": format!("{} ({}/{} tracks)", r.title, r.current_index.max(r.completed_tracks), r.total_tracks),
+                "status": r.status,
+                "current": r.current_index,
+                "total": r.total_tracks,
+                "completed": r.completed_tracks,
+                "failed": r.failed_tracks,
+                "trackTitle": r.current_track_title,
+                "saveDir": r.save_dir,
+                "downloaded": r.downloaded_bytes.unwrap_or(0),
+                "totalBytes": r.total_bytes.unwrap_or(0),
+                "error": r.error,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!(list))
 }
 
 #[tauri::command]
@@ -245,11 +315,35 @@ pub fn run() {
             get_history,
             get_settings,
             update_settings,
+            select_directory,
+            queue_playlist,
+            list_playlists,
             get_config,
         ])
         .setup(|app| {
             let state = app.state::<Arc<AppState>>();
             state.set_app_handle(app.handle().clone());
+            // Ensure desktop device row exists and scheduler uses saved concurrency.
+            let _ = state.db.upsert_device("desktop");
+            let (_, max_c, _) = state.get_runtime_settings();
+            state.scheduler.set_max_concurrent(max_c);
+            // Re-schedule any playlists left mid-flight after a crash/restart.
+            if let Ok(active) = state.db.list_playlist_jobs_for_ui(20) {
+                for job in active {
+                    if matches!(job.status.as_str(), "queued" | "downloading" | "paused")
+                        && !playlist::is_playlist_running(&job.id)
+                    {
+                        if job.status == "paused" {
+                            continue; // wait for user Resume
+                        }
+                        let _ = state.db.update_playlist_job(
+                            &job.id,
+                            &serde_json::json!({"status": "queued"}),
+                        );
+                        playlist::schedule_playlist_job(state.inner().clone(), job.id);
+                    }
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

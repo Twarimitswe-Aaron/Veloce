@@ -31,6 +31,66 @@ impl Default for PlaylistFormatSettings {
     }
 }
 
+impl PlaylistFormatSettings {
+    /// Parse from device settings JSON (`playlistFormats` camelCase) or job row.
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let o = value
+            .get("playlistFormats")
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        let media_type = o
+            .get("mediaType")
+            .or_else(|| o.get("media_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("audio");
+        let video_quality = o
+            .get("videoQuality")
+            .or_else(|| o.get("video_quality"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("720");
+        let audio_missing_fallback = o
+            .get("audioMissingFallback")
+            .or_else(|| o.get("audio_missing_fallback"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("video");
+        Self {
+            media_type: if media_type == "video" {
+                "video".into()
+            } else {
+                "audio".into()
+            },
+            video_quality: match video_quality {
+                "1080" | "720" | "480" | "360" | "best" => video_quality.to_string(),
+                _ => "720".into(),
+            },
+            audio_missing_fallback: if audio_missing_fallback == "skip" {
+                "skip".into()
+            } else {
+                "video".into()
+            },
+        }
+    }
+
+    /// Ordered yt-dlp `-f` selectors (backend `formatAttemptsForTrack` parity).
+    pub fn format_attempts(&self) -> Vec<String> {
+        let video = match self.video_quality.as_str() {
+            "best" => "best[vcodec!=none][acodec!=none]/b".to_string(),
+            "1080" => "best[height<=1080][vcodec!=none][acodec!=none]/best[height<=720][vcodec!=none][acodec!=none]/best[height<=480][vcodec!=none][acodec!=none]/best[height<=360][vcodec!=none][acodec!=none]/b".to_string(),
+            "480" => "best[height<=480][vcodec!=none][acodec!=none]/best[height<=360][vcodec!=none][acodec!=none]/b".to_string(),
+            "360" => "best[height<=360][vcodec!=none][acodec!=none]/b".to_string(),
+            _ => "best[height<=720][vcodec!=none][acodec!=none]/best[height<=480][vcodec!=none][acodec!=none]/best[height<=360][vcodec!=none][acodec!=none]/b".to_string(),
+        };
+        if self.media_type == "video" {
+            return vec![video];
+        }
+        let mut attempts = vec!["ba/b/bestaudio/b".to_string()];
+        if self.audio_missing_fallback == "video" {
+            attempts.push(video);
+        }
+        attempts
+    }
+}
+
 /// Runtime settings for a running playlist job.
 #[derive(Debug, Clone)]
 pub struct PlaylistRuntime {
@@ -68,18 +128,20 @@ pub async fn queue_playlist_download(
     referer: Option<&str>,
     threads: u32,
 ) -> Result<(String, i64, String, String), String> {
-    // Check for existing active playlist with same URL.
-    if let Some(existing_id) = app
-        .db
-        .has_active_playlist_for_url("extension", playlist_url)
-        .map_err(|e| format!("DB error: {}", e))?
-    {
-        let row = app
+    // Check for existing active playlist with same URL (any device).
+    for device in ["desktop", "extension"] {
+        if let Some(existing_id) = app
             .db
-            .get_playlist_job(&existing_id)
+            .has_active_playlist_for_url(device, playlist_url)
             .map_err(|e| format!("DB error: {}", e))?
-            .ok_or("Playlist job not found")?;
-        return Ok((existing_id, row.total_tracks, row.title, row.save_dir));
+        {
+            let row = app
+                .db
+                .get_playlist_job(&existing_id)
+                .map_err(|e| format!("DB error: {}", e))?
+                .ok_or("Playlist job not found")?;
+            return Ok((existing_id, row.total_tracks, row.title, row.save_dir));
+        }
     }
 
     // Resolve playlist entries via yt-dlp.
@@ -110,9 +172,11 @@ pub async fn queue_playlist_download(
     let id = Uuid::new_v4().to_string();
     let entries_json = serde_json::to_string(&entries).unwrap_or_default();
 
+    let format_settings = PlaylistFormatSettings::from_json(&app.get_ui_settings());
+
     let row = db::PlaylistJobRow {
         id: id.clone(),
-        device_id: "extension".to_string(),
+        device_id: "desktop".to_string(),
         playlist_url: playlist_url.to_string(),
         title: title.clone(),
         save_dir: save_dir.to_string_lossy().to_string(),
@@ -122,7 +186,7 @@ pub async fn queue_playlist_download(
         completed_tracks: 0,
         failed_tracks: 0,
         entries: entries_json,
-        settings: Some(serde_json::to_string(&PlaylistFormatSettings::default()).unwrap_or_default()),
+        settings: Some(serde_json::to_string(&format_settings).unwrap_or_default()),
         referer: referer.map(|s| s.to_string()),
         threads: threads as i64,
         current_track_title: None,
@@ -155,9 +219,9 @@ pub fn schedule_playlist_job(state: Arc<AppState>, playlist_id: String) {
     );
     drop(running);
 
+    let handle = state.runtime_handle.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async move {
+        handle.block_on(async move {
             run_playlist_job(state, &playlist_id).await;
         });
     });
@@ -397,11 +461,34 @@ async fn process_single_track(
         format!("https://www.youtube.com/watch?v={}", entry.url)
     };
 
-    let media_url = match ytdlp::extract_best_url(&entry_url) {
-        Ok(url) => url,
-        Err(e) => {
-            log::error!("Failed to extract URL for track {}: {}", track_title, e);
-            return (false, index + 1, completed, failed + 1);
+    let media_url = {
+        let fmt_settings = state
+            .db
+            .get_playlist_job(playlist_id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.settings)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| PlaylistFormatSettings::from_json(&v))
+            .unwrap_or_default();
+        let mut extracted = None;
+        for attempt in fmt_settings.format_attempts() {
+            match ytdlp::extract_url_with_format(&entry_url, &attempt) {
+                Ok(url) => {
+                    extracted = Some(url);
+                    break;
+                }
+                Err(e) => {
+                    log::debug!("Playlist format attempt `{attempt}` failed: {e}");
+                }
+            }
+        }
+        match extracted {
+            Some(url) => url,
+            None => {
+                log::error!("Failed to extract URL for track {}", track_title);
+                return (false, index + 1, completed, failed + 1);
+            }
         }
     };
 
@@ -559,10 +646,10 @@ pub async fn retry_failed_playlist(
         return Err("Failed to resolve entries for retry".to_string());
     }
 
-    let config = Config::from_env();
     let retry_title = format!("{} - Retry", row.title);
     let playlist_dir_name = util::sanitize_filename(&retry_title);
-    let save_dir = config.base_directory().join("playlists").join(&playlist_dir_name);
+    let (base_dir, _, _) = state.get_runtime_settings();
+    let save_dir = base_dir.join("playlists").join(&playlist_dir_name);
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create retry directory: {}", e))?;
 
@@ -640,16 +727,20 @@ async fn download_track(
         }
     };
 
+    let base_dir = std::path::Path::new(save_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned());
     match EngineProcess::spawn(
         track_key.to_string(),
         url,
         save_path,
-        threads,
+        threads.clamp(1, 64),
         max_rate,
         quiet,
         read_buffer,
         auto_tune,
         referer,
+        base_dir.as_deref(),
         on_progress,
     ) {
         Ok((engine, _reader)) => {

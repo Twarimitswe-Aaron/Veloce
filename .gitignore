@@ -44,6 +44,7 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.test
+.tmp/
 
 # ── IDE / Editor ─────────────────────────────────────────────────────────────
 .idea/

@@ -660,6 +660,18 @@ async function enrichDownloadPayload(payload, tabId) {
 		out.referer = out.referer || pageUrl;
 	}
 
+	// Prefer in-memory directory from SETTINGS / DIRECTORY_SELECTED — avoids a
+	// chrome.storage round-trip on every badge click before NEW_DOWNLOAD.
+	if (!out.baseDirectory) {
+		out.baseDirectory = selectedDirectory
+			|| settings?.baseDirectory
+			|| settings?.base_dir
+			|| undefined;
+	}
+	if (!out.threads && settings?.defaultThreads) {
+		out.threads = settings.defaultThreads;
+	}
+
 	if (out.directUrl && BROWSER_ONLY_URL.test(out.directUrl)) {
 		delete out.directUrl;
 	}

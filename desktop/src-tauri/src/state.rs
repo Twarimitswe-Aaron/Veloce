@@ -151,22 +151,160 @@ impl AppState {
         let mut default_threads = config.default_threads;
         let mut max_concurrent = config.max_concurrent_downloads;
 
-        if let Ok(Some(s)) = self.db.get_device_settings("desktop") {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
-                if let Some(dir) = json.get("base_dir").and_then(|v| v.as_str()) {
-                    if !dir.is_empty() {
-                        save_dir = std::path::PathBuf::from(dir);
+        // Extension first, then desktop — desktop Settings / folder picker wins.
+        for device in ["extension", "desktop"] {
+            if let Ok(Some(s)) = self.db.get_device_settings(device) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+                    let dir = json
+                        .get("base_dir")
+                        .or_else(|| json.get("baseDirectory"))
+                        .and_then(|v| v.as_str());
+                    if let Some(d) = dir.filter(|d| !d.is_empty()) {
+                        save_dir = std::path::PathBuf::from(d);
                     }
-                }
-                if let Some(t) = json.get("default_threads").and_then(|v| v.as_u64()) {
-                    default_threads = t as u32;
-                }
-                if let Some(c) = json.get("max_concurrent").and_then(|v| v.as_u64()) {
-                    max_concurrent = c as u32;
+                    if let Some(t) = json
+                        .get("default_threads")
+                        .or_else(|| json.get("defaultThreads"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        default_threads = t as u32;
+                    }
+                    if let Some(c) = json
+                        .get("max_concurrent")
+                        .or_else(|| json.get("maxConcurrentDownloads"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        max_concurrent = c as u32;
+                    }
                 }
             }
         }
-        (save_dir, max_concurrent, default_threads)
+        (save_dir, max_concurrent.max(1), default_threads.max(1))
+    }
+
+    /// Merge a settings patch into both `desktop` and `extension` device rows
+    /// (keeps playlistFormats / rate / quiet keys intact) and update the scheduler cap.
+    pub fn apply_settings_patch(&self, patch: &serde_json::Value) {
+        for device in ["desktop", "extension"] {
+            let _ = self.db.upsert_device(device);
+            let mut merged = self
+                .db
+                .get_device_settings(device)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            if let (Some(dst), Some(src)) = (merged.as_object_mut(), patch.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+
+            // Keep snake_case + camelCase aliases in sync for folder / threads.
+            if let Some(obj) = merged.as_object_mut() {
+                if let Some(d) = obj
+                    .get("base_dir")
+                    .or_else(|| obj.get("baseDirectory"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    obj.insert("base_dir".into(), serde_json::json!(d));
+                    obj.insert("baseDirectory".into(), serde_json::json!(d));
+                }
+                if let Some(t) = obj
+                    .get("default_threads")
+                    .or_else(|| obj.get("defaultThreads"))
+                    .cloned()
+                {
+                    obj.insert("default_threads".into(), t.clone());
+                    obj.insert("defaultThreads".into(), t);
+                }
+                if let Some(c) = obj
+                    .get("max_concurrent")
+                    .or_else(|| obj.get("maxConcurrentDownloads"))
+                    .cloned()
+                {
+                    obj.insert("max_concurrent".into(), c.clone());
+                    obj.insert("maxConcurrentDownloads".into(), c);
+                }
+                if let Some(r) = obj
+                    .get("max_rate_bytes")
+                    .or_else(|| obj.get("maxRateBytes"))
+                    .cloned()
+                {
+                    obj.insert("max_rate_bytes".into(), r.clone());
+                    obj.insert("maxRateBytes".into(), r);
+                }
+                if let Some(q) = obj
+                    .get("engine_quiet")
+                    .or_else(|| obj.get("engineQuiet"))
+                    .cloned()
+                {
+                    obj.insert("engine_quiet".into(), q.clone());
+                    obj.insert("engineQuiet".into(), q);
+                }
+            }
+
+            let _ = self
+                .db
+                .update_device_settings(device, &merged.to_string());
+        }
+
+        let (_, max_c, _) = self.get_runtime_settings();
+        self.scheduler.set_max_concurrent(max_c);
+    }
+
+    /// Full settings object for the Tauri Settings UI (merged aliases + defaults).
+    pub fn get_ui_settings(&self) -> serde_json::Value {
+        let config = crate::config::Config::from_env();
+        let (save_dir, max_c, threads) = self.get_runtime_settings();
+
+        let mut playlist_formats = serde_json::json!({
+            "mediaType": "audio",
+            "videoQuality": "720",
+            "audioMissingFallback": "video",
+        });
+        let mut max_rate = config.max_rate_bytes;
+        let mut engine_quiet = config.engine_quiet;
+
+        for device in ["extension", "desktop"] {
+            if let Ok(Some(s)) = self.db.get_device_settings(device) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if let Some(pf) = json.get("playlistFormats") {
+                        playlist_formats = pf.clone();
+                    }
+                    if let Some(r) = json
+                        .get("max_rate_bytes")
+                        .or_else(|| json.get("maxRateBytes"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        max_rate = r;
+                    }
+                    if let Some(q) = json
+                        .get("engine_quiet")
+                        .or_else(|| json.get("engineQuiet"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        engine_quiet = q;
+                    }
+                }
+            }
+        }
+
+        serde_json::json!({
+            "base_dir": save_dir.to_string_lossy(),
+            "baseDirectory": save_dir.to_string_lossy(),
+            "max_concurrent": max_c,
+            "maxConcurrentDownloads": max_c,
+            "default_threads": threads,
+            "defaultThreads": threads,
+            "max_rate_bytes": max_rate,
+            "maxRateBytes": max_rate,
+            "engine_quiet": engine_quiet,
+            "engineQuiet": engine_quiet,
+            "playlistFormats": playlist_formats,
+        })
     }
 
     pub fn set_app_handle(&self, handle: AppHandle) {

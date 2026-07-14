@@ -8,11 +8,13 @@ pub mod engine;
 pub mod file_io;
 #[cfg(target_os = "linux")]
 pub mod io_uring_writer;
+pub mod logutil;
 pub mod piece;
 pub mod profiles;
 pub mod probe;
 pub mod rate_limit;
 pub mod resume;
+pub mod safety;
 
 pub use args::EngineArgs;
 pub use engine::run_download;

@@ -28,52 +28,98 @@ const RESUME_INTERVAL_MS: u64 = 2000;
 const STAGGER_MS: u64 = 75;
 
 pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let args = args.normalize();
+    crate::logutil::set_quiet(args.quiet);
+
+    // SSRF guard on the initial URL (redirects also checked in the HTTP client).
+    crate::safety::is_safe_download_url(&args.url).map_err(|e| e)?;
+
+    let resolved_save = crate::safety::resolve_save_path(args.base_dir.as_deref(), &args.save_path)
+        .map_err(|e| e)?;
+    let mut args = args;
+    args.save_path = resolved_save.to_string_lossy().to_string();
+
     let start_time = Instant::now();
     let path = Path::new(&args.save_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    eprintln!("");
-    eprintln!("━━━ [1/5] Initializing ───────────────────────────── +0.00s");
+    crate::elog!("");
+    crate::elog!("━━━ [1/5] Initializing ───────────────────────────── +0.00s");
 
     let profiles = ProfileStore::load(args.profiles_path.as_deref().map(Path::new));
     let thread_ceiling = profiles.thread_ceiling(&args.url, args.threads) as usize;
-    eprintln!("   📋 Thread ceiling: {} (from {})", thread_ceiling, if args.profiles_path.is_some() { "host profile" } else { "args" });
+    crate::elog!(
+        "   📋 Thread ceiling: {} (from {})",
+        thread_ceiling,
+        if args.profiles_path.is_some() {
+            "host profile"
+        } else {
+            "args"
+        }
+    );
 
     let client = Arc::new(build_http_client(
         thread_ceiling,
         args.referer.as_deref(),
         args.origin.as_deref(),
     )?);
-    eprintln!("   🌐 HTTP client ready (pool: {}, referer: {})",
+    crate::elog!(
+        "   🌐 HTTP client ready (pool: {}, referer: {})",
         thread_ceiling,
         args.referer.as_deref().unwrap_or("none")
     );
     let t_init = start_time.elapsed();
 
-    eprintln!("");
-    eprintln!("━━━ [2/5] Discovering file ───────────────────────── +{}.{:02}s",
-        t_init.as_secs(), t_init.subsec_millis() / 10
+    crate::elog!("");
+    crate::elog!(
+        "━━━ [2/5] Discovering file ───────────────────────── +{}.{:02}s",
+        t_init.as_secs(),
+        t_init.subsec_millis() / 10
     );
     let discovery = discover(&client, &args.url).await?;
     let total_size = discovery.total_size;
-    eprintln!("   ✅ Discovery complete: {} bytes ({:.1} MB)", total_size, total_size as f64 / 1_048_576.0);
+    if total_size == 0 {
+        return Err("Discovered file size is zero".into());
+    }
+    if total_size > crate::safety::MAX_FILE_BYTES {
+        return Err(format!(
+            "File too large ({} bytes > {} byte limit)",
+            total_size,
+            crate::safety::MAX_FILE_BYTES
+        )
+        .into());
+    }
+    crate::elog!(
+        "   ✅ Discovery complete: {} bytes ({:.1} MB)",
+        total_size,
+        total_size as f64 / 1_048_576.0
+    );
     let t_discover = start_time.elapsed();
 
     let sidecar = format!("{}.veloce_done", args.save_path);
     if Path::new(&sidecar).exists() {
-        eprintln!("   ✅ Already complete (sidecar found).");
-        println!(
-            "{}",
-            json!({
-                "type": "already_exists",
-                "downloaded": total_size,
-                "total": total_size,
-                "elapsed_secs": 0
-            })
-        );
-        return Ok(());
+        // Integrity: sidecar alone is not enough — file must exist and match size.
+        let complete = path.exists()
+            && std::fs::metadata(path)
+                .map(|m| m.len() == total_size)
+                .unwrap_or(false);
+        if complete {
+            crate::elog!("   ✅ Already complete (sidecar + matching size).");
+            println!(
+                "{}",
+                json!({
+                    "type": "already_exists",
+                    "downloaded": total_size,
+                    "total": total_size,
+                    "elapsed_secs": 0
+                })
+            );
+            return Ok(());
+        }
+        crate::elog!("   ⚠️  Stale sidecar — file missing or size mismatch; re-downloading");
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     let state_file = format!("{}.veloce_state", args.save_path);
@@ -130,16 +176,17 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
         let profile_piece = profiles.piece_bytes(&args.url);
         piece_size = if args.piece_size_bytes > 0 {
-            eprintln!("   📐 Piece size: {} B (from args)", args.piece_size_bytes);
+            crate::elog!("   📐 Piece size: {} B (from args)", args.piece_size_bytes);
             args.piece_size_bytes
         } else if ranges_ok {
             let ps = adaptive_piece_size(total_size, profile_piece);
-            eprintln!("   📐 Piece size: {} B ({:.1} MB) (adaptive)", ps, ps as f64 / 1_048_576.0);
+            crate::elog!("   📐 Piece size: {} B ({:.1} MB) (adaptive)", ps, ps as f64 / 1_048_576.0);
             ps
         } else {
-            eprintln!("   📐 Piece size: {} B (entire file — no ranges)", total_size);
+            crate::elog!("   📐 Piece size: {} B (entire file — no ranges)", total_size);
             total_size.max(1)
         };
+        crate::safety::validate_discovery_size(total_size, piece_size).map_err(|e| e)?;
 
         if let Some(avail) = available_space(path) {
             eprintln!("   💾 Free space: {} MB", avail as f64 / 1_048_576.0);

@@ -141,6 +141,65 @@ pub fn format_bytes(n: u64) -> String {
     format!("{:.1} {}", size, units[unit_idx])
 }
 
+/// Open a graphical folder picker via zenity or kdialog (Linux).
+/// Returns `None` if the user cancels or no picker is installed.
+pub fn pick_directory() -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let zenity = Command::new("zenity")
+        .args(["--file-selection", "--directory"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = zenity {
+        let mut output = String::new();
+        if child
+            .stdout
+            .take()
+            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
+        {
+            let trimmed = output.trim().to_string();
+            if !trimmed.is_empty() {
+                if child.wait().map_or(false, |s| s.success()) {
+                    return Some(trimmed);
+                }
+                return None; // user cancelled
+            }
+        }
+    }
+
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".into());
+    let kdialog = Command::new("kdialog")
+        .args(["--getexistingdirectory", &home])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = kdialog {
+        let mut output = String::new();
+        if child
+            .stdout
+            .take()
+            .map_or(false, |mut o| o.read_to_string(&mut output).is_ok())
+        {
+            let trimmed = output.trim().to_string();
+            if !trimmed.is_empty() {
+                if child.wait().map_or(false, |s| s.success()) {
+                    return Some(trimmed);
+                }
+                return None;
+            }
+        }
+    }
+
+    log::warn!("No graphical folder picker available (tried zenity, kdialog).");
+    None
+}
+
 /// Resolve the path to the core_engine binary, checking relative to executable first,
 /// then Tauri resource dir, then release build dir, then PATH.
 pub fn find_core_engine(manifest_dir: &str) -> PathBuf {
