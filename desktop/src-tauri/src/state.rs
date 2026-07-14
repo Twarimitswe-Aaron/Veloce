@@ -360,6 +360,7 @@ impl AppState {
     }
 
     pub async fn emit_status(&self, id: &str, status: &str, error: Option<String>) {
+        let mut completed_bytes = (0u64, 0u64);
         {
             let mut progress = self.progress.lock().await;
             if let Some(entry) = progress.get_mut(id) {
@@ -368,6 +369,20 @@ impl AppState {
                 if status == "completed" || status == "failed" || status == "cancelled" {
                     entry.speed_bps = 0;
                     entry.eta_secs = 0;
+                }
+                if status == "completed" {
+                    let tot = entry.total.max(entry.downloaded);
+                    if tot > 0 {
+                        entry.downloaded = tot;
+                        entry.total = tot;
+                        entry.progress_pct = 100.0;
+                        let _ = self.db.update_download_progress(
+                            id,
+                            tot as i64,
+                            tot as i64,
+                        );
+                    }
+                    completed_bytes = (entry.downloaded, entry.total);
                 }
             }
         }
@@ -382,7 +397,12 @@ impl AppState {
         }
 
         match status {
-            "completed" => self.ws_clients.broadcast_completed(id, status),
+            "completed" => self.ws_clients.broadcast_completed(
+                id,
+                status,
+                completed_bytes.0,
+                completed_bytes.1,
+            ),
             "failed" => {
                 self.ws_clients.broadcast_error(
                     id,

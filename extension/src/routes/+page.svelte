@@ -291,7 +291,13 @@
 							></div>
 						</div>
 						<div class="flex justify-between text-[10px] opacity-60">
-							<span>{formatBytes(d.downloaded)}{d.total ? ` / ${formatBytes(d.total)}` : ''}</span>
+							<span>
+								{#if d.status === 'completed'}
+									{formatBytes(d.total || d.downloaded)}
+								{:else}
+									{formatBytes(d.downloaded)}{d.total ? ` / ${formatBytes(d.total)}` : ''}
+								{/if}
+							</span>
 							{#if d.status === 'downloading'}
 								<span>{formatBytes(d.speedBps)}/s · {formatEta(d.etaSecs)}</span>
 							{:else}

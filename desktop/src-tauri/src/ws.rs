@@ -83,11 +83,13 @@ impl WsClients {
         self.broadcast(&msg);
     }
 
-    pub fn broadcast_completed(&self, download_id: &str, status: &str) {
+    pub fn broadcast_completed(&self, download_id: &str, status: &str, downloaded: u64, total: u64) {
         let msg = serde_json::json!({
             "type": "DOWNLOAD_COMPLETED",
             "downloadId": download_id,
             "status": status,
+            "downloaded": downloaded,
+            "total": total,
         })
         .to_string();
         self.broadcast(&msg);
@@ -584,9 +586,9 @@ async fn handle_message(
             let mut download_id = uuid::Uuid::new_v4().to_string();
 
             // Deduplication & Resume (backend parity)
-            if let Ok(Some(existing)) = state.app.db.get_download_by_url(&url, direct_url.as_deref()) {
+            if let Ok(Some(existing)) = state.app.db.find_resumable_by_url(&url) {
                 let status = existing.status.as_str();
-                if ["queued", "downloading", "completed"].contains(&status) {
+                if matches!(status, "queued" | "downloading") {
                     log::info!("NEW_DOWNLOAD deduplicated (status {}): {}", status, existing.id);
                     let _ = tx.send(
                         serde_json::json!({
@@ -598,11 +600,21 @@ async fn handle_message(
                         .to_string(),
                     );
                     return;
-                } else {
-                    // paused, error, cancelled, failed -> resume
-                    log::info!("NEW_DOWNLOAD resuming existing download: {}", existing.id);
-                    download_id = existing.id.clone();
                 }
+                log::info!("NEW_DOWNLOAD resuming existing download: {}", existing.id);
+                download_id = existing.id.clone();
+            } else if let Ok(Some(done)) = state.app.db.find_completed_on_disk_by_url(&url) {
+                log::info!("NEW_DOWNLOAD deduplicated (completed): {}", done.id);
+                let _ = tx.send(
+                    serde_json::json!({
+                        "type": "DOWNLOAD_ACK",
+                        "downloadId": done.id,
+                        "fileName": done.file_name,
+                        "status": "completed",
+                    })
+                    .to_string(),
+                );
+                return;
             }
 
             let app_state = state.app.clone();

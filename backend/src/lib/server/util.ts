@@ -1,6 +1,7 @@
 import path from 'path';
 import { existsSync } from 'fs';
 import { config } from './config';
+import { isMarkedComplete } from './resumePaths';
 
 /**
  * Validate a user-supplied download URL: only http(s), and (optionally) block
@@ -85,5 +86,5 @@ export function categoryForExt(ext: string): string {
 
 /** True when a download finished and the bytes (or done sidecar) are still on disk. */
 export function completedFileStillExists(savePath: string): boolean {
-	return existsSync(`${savePath}.veloce_done`) || existsSync(savePath);
+	return isMarkedComplete(savePath) || existsSync(savePath);
 }

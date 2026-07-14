@@ -2,6 +2,7 @@ import path from 'path';
 import { existsSync, readdirSync, statSync } from 'fs';
 import type { PlaylistEntry } from './extractor';
 import { sanitizeFileName } from './util';
+import { hasResumeState, isMarkedComplete } from './resumePaths';
 
 export function trackStem(entry: PlaylistEntry, index: number): string {
 	const num = String(entry.index ?? index + 1).padStart(2, '0');
@@ -11,8 +12,8 @@ export function trackStem(entry: PlaylistEntry, index: number): string {
 
 /** A playlist track is done when the engine wrote `.veloce_done`, or a plain file exists with no in-progress state. */
 export function isTrackCompleteOnDisk(filePath: string): boolean {
-	if (existsSync(`${filePath}.veloce_done`)) return true;
-	if (existsSync(`${filePath}.veloce_state`)) return false;
+	if (isMarkedComplete(filePath)) return true;
+	if (hasResumeState(filePath)) return false;
 	if (!existsSync(filePath)) return false;
 	try {
 		return statSync(filePath).size > 0;
@@ -33,6 +34,7 @@ export function findCompletedTrackFile(saveDir: string, stem: string): string | 
 	}
 	for (const name of names) {
 		if (name.endsWith('.veloce_done') || name.endsWith('.veloce_state')) continue;
+		if (name === '.veloce') continue;
 		if (!name.startsWith(prefix)) continue;
 		const full = path.join(saveDir, name);
 		if (isTrackCompleteOnDisk(full)) return full;

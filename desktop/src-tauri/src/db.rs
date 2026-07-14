@@ -296,29 +296,19 @@ impl Database {
         Ok(count > 0)
     }
 
-    pub fn get_download_by_url(&self, url: &str, direct_url: Option<&str>) -> Result<Option<DownloadRow>, rusqlite::Error> {
+    pub fn find_resumable_by_url(&self, url: &str) -> Result<Option<DownloadRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        // Exact match on url, or if direct_url is provided, match that too.
-        let mut stmt = if direct_url.is_some() {
-            conn.prepare(
-                "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
-                 FROM downloads WHERE url = ?1 AND direct_url = ?2 ORDER BY rowid DESC LIMIT 1"
-            )?
-        } else {
-            conn.prepare(
-                "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
-                 FROM downloads WHERE url = ?1 ORDER BY rowid DESC LIMIT 1"
-            )?
-        };
-
-        let mut rows = if let Some(du) = direct_url {
-            stmt.query(params![url, du])?
-        } else {
-            stmt.query(params![url])?
-        };
-
-        match rows.next()? {
-            Some(row) => Ok(Some(DownloadRow {
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
+             FROM downloads
+             WHERE url = ?1
+               AND status IN ('paused', 'failed', 'error', 'queued', 'downloading', 'cancelled')
+             ORDER BY COALESCE(downloaded_bytes, 0) DESC, rowid DESC
+             LIMIT 8",
+        )?;
+        let mut rows = stmt.query(params![url])?;
+        while let Some(row) = rows.next()? {
+            let r = DownloadRow {
                 id: row.get(0)?,
                 device_id: row.get(1)?,
                 url: row.get(2)?,
@@ -329,9 +319,46 @@ impl Database {
                 status: row.get(7)?,
                 total_bytes: row.get(8)?,
                 downloaded_bytes: row.get(9)?,
-            })),
-            None => Ok(None),
+            };
+            let path = std::path::Path::new(&r.save_path);
+            crate::util::migrate_legacy_sidecars(path);
+            if crate::util::has_resume_state(path) || path.exists() {
+                return Ok(Some(r));
+            }
         }
+        Ok(None)
+    }
+
+    pub fn find_completed_on_disk_by_url(&self, url: &str) -> Result<Option<DownloadRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, url, direct_url, referer, file_name, save_path, status, total_bytes, downloaded_bytes
+             FROM downloads
+             WHERE url = ?1 AND status = 'completed'
+             ORDER BY rowid DESC
+             LIMIT 8",
+        )?;
+        let mut rows = stmt.query(params![url])?;
+        while let Some(row) = rows.next()? {
+            let r = DownloadRow {
+                id: row.get(0)?,
+                device_id: row.get(1)?,
+                url: row.get(2)?,
+                direct_url: row.get(3)?,
+                referer: row.get(4)?,
+                file_name: row.get(5)?,
+                save_path: row.get(6)?,
+                status: row.get(7)?,
+                total_bytes: row.get(8)?,
+                downloaded_bytes: row.get(9)?,
+            };
+            let path = std::path::Path::new(&r.save_path);
+            crate::util::migrate_legacy_sidecars(path);
+            if path.exists() {
+                return Ok(Some(r));
+            }
+        }
+        Ok(None)
     }
 
     // ── Playlist Jobs ─────────────────────────────────────────────────────

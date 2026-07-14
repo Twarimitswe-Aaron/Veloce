@@ -364,8 +364,22 @@ function handleWsMessage(data) {
 			});
 			break;
 		case 'DOWNLOAD_COMPLETED': {
-			const name = downloads[data.downloadId]?.fileName ?? 'Download';
-			upsertDownload(data.downloadId, { status: data.status ?? 'completed', speedBps: 0, etaSecs: 0 });
+			const prev = downloads[data.downloadId];
+			const tot = Math.max(
+				data.total ?? 0,
+				data.downloaded ?? 0,
+				prev?.total ?? 0,
+				prev?.downloaded ?? 0
+			);
+			const name = prev?.fileName ?? 'Download';
+			upsertDownload(data.downloadId, {
+				status: data.status ?? 'completed',
+				downloaded: tot,
+				total: tot,
+				speedBps: 0,
+				etaSecs: 0,
+				error: undefined
+			});
 			notify(`veloce-done-${data.downloadId}`, 'Download complete', name);
 			break;
 		}

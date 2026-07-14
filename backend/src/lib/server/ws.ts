@@ -33,6 +33,13 @@ import { buildEngineCliArgs, coreEngineBinaryPath } from './engineCli';
 import { resolveGithubDownloadUrl } from './github';
 import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
 import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
+import {
+	reuseOrUniqueSavePath,
+	removeResumeSidecars,
+	sweepLegacySidecars,
+	hasResumeState,
+	migrateLegacySidecars
+} from './resumePaths';
 
 const MIN_FREE_BYTES = config.minFreeDiskMb * 1024 * 1024; // early sanity buffer
 const VIDEO_CATEGORY = 'videos';
@@ -166,28 +173,31 @@ function isAllowedOrigin(origin?: string): boolean {
 // ── Filesystem / disk helpers ────────────────────────────────────────────────
 
 /**
- * Avoid silently overwriting an unrelated existing file: if `savePath` is taken
- * (on disk or by another DB row), append " (1)", " (2)", … like classic IDMs.
+ * Avoid silently overwriting an unrelated existing file: reuse incomplete
+ * downloads with resume state, else append " (1)", " (2)", … like classic IDMs.
  */
 async function uniqueSavePath(savePath: string): Promise<string> {
+	const reused = reuseOrUniqueSavePath(savePath);
+	if (hasResumeState(reused)) return reused;
+
 	const dir = path.dirname(savePath);
 	const ext = path.extname(savePath);
 	const stem = path.basename(savePath, ext);
-	let candidate = savePath;
-	for (let i = 1; ; i++) {
-		const taken =
-			existsSync(candidate) ||
-			existsSync(`${candidate}.veloce_state`) ||
+	let candidate = reused;
+	for (let i = 0; ; i++) {
+		if (i > 0) candidate = path.join(dir, `${stem} (${i})${ext}`);
+		migrateLegacySidecars(candidate);
+		const dbTaken =
 			(await db.select().from(downloads).where(eq(downloads.savePath, candidate))).length > 0;
-		if (!taken) return candidate;
-		candidate = path.join(dir, `${stem} (${i})${ext}`);
+		if (hasResumeState(candidate)) return candidate;
+		if (!existsSync(candidate) && !dbTaken) return candidate;
+		if (i >= 99) return candidate;
 	}
 }
 
 async function cleanupFiles(savePath: string) {
 	await unlink(savePath).catch(() => {});
-	await unlink(`${savePath}.veloce_state`).catch(() => {});
-	await unlink(`${savePath}.veloce_done`).catch(() => {});
+	removeResumeSidecars(savePath);
 }
 
 /** Free space for a target dir, walking up to the first directory that exists. */
@@ -487,10 +497,22 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			settled = true;
 			await setStatus(id, status);
 			if (status === 'completed') {
-				// DB row is the durable completion record; remove on-disk markers permanently.
-				await unlink(`${savePath}.veloce_done`).catch(() => {});
-				await unlink(`${savePath}.veloce_state`).catch(() => {});
-				broadcast({ type: 'DOWNLOAD_COMPLETED', downloadId: id, status });
+				const row = (await db.select().from(downloads).where(eq(downloads.id, id)))[0];
+				const tot = Math.max(row?.totalBytes ?? 0, row?.downloadedBytes ?? 0);
+				if (tot > 0) {
+					await db
+						.update(downloads)
+						.set({ downloadedBytes: tot, totalBytes: tot })
+						.where(eq(downloads.id, id));
+				}
+				removeResumeSidecars(savePath);
+				broadcast({
+					type: 'DOWNLOAD_COMPLETED',
+					downloadId: id,
+					status,
+					downloaded: tot,
+					total: tot
+				});
 			} else if (status === 'paused') {
 				broadcast({ type: 'DOWNLOAD_PAUSED', downloadId: id });
 			} else {
@@ -728,13 +750,25 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	if (!directUrl) {
 		const activeDownload = sameSource.find((d) => ['queued', 'downloading', 'paused'].includes(d.status));
 		const completedOnDisk = sameSource.find((d) => d.status === 'completed' && completedFileStillExists(d.savePath));
-		duplicate = activeDownload ?? completedOnDisk;
+		const resumable = sameSource.find(
+			(d) =>
+				['paused', 'error', 'failed', 'cancelled'].includes(d.status) &&
+				(hasResumeState(d.savePath) || existsSync(d.savePath))
+		);
+		duplicate = activeDownload ?? resumable ?? completedOnDisk;
 	} else {
 		duplicate = sameSource.find(
 			(d) => ['queued', 'downloading'].includes(d.status) && path.basename(d.savePath) === rawName
 		);
 	}
 	if (duplicate) {
+		if (['paused', 'error', 'failed', 'cancelled'].includes(duplicate.status)) {
+			await setStatus(duplicate.id, 'queued');
+			migrateLegacySidecars(duplicate.savePath);
+			broadcast({ type: 'DOWNLOAD_ACK', downloadId: duplicate.id, fileName: duplicate.fileName, status: 'queued' });
+			scheduleDownload(() => runDownloadJob(specFromRow(duplicate!)));
+			return { ok: true, downloadId: duplicate.id };
+		}
 		broadcast({ type: 'DOWNLOAD_ACK', downloadId: duplicate.id, fileName: duplicate.fileName, status: duplicate.status });
 		return { ok: true, downloadId: duplicate.id };
 	}
@@ -777,10 +811,12 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
  */
 async function reconcileInterrupted() {
 	try {
+		sweepLegacySidecars(runtime.baseDirectory);
 		const stuck = await db.select().from(downloads)
 			.where(inArray(downloads.status, ['downloading', 'queued']));
 		if (stuck.length === 0) return;
 		for (const row of stuck) {
+			migrateLegacySidecars(row.savePath);
 			await setStatus(row.id, 'queued');
 			scheduleDownload(() => runDownloadJob(specFromRow(row)));
 		}

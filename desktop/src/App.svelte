@@ -212,18 +212,26 @@
       const s = event.payload;
       const prev = downloads.find((d) => d.id === s.id);
       const clearError = ["queued", "downloading", "paused", "completed"].includes(s.status);
+      let downloaded = prev?.downloaded ?? 0;
+      let total = prev?.total ?? 0;
+      let progress_pct = prev?.progress_pct ?? 0;
+      if (s.status === "completed") {
+        const tot = Math.max(total, downloaded);
+        downloaded = tot;
+        total = tot;
+        progress_pct = tot > 0 ? 100 : progress_pct;
+      }
       upsertDownload({
         id: s.id,
         url: prev?.url ?? "",
         file_name: prev?.file_name ?? "",
         save_path: prev?.save_path ?? "",
         status: s.status,
-        // Never wipe byte counts on status-only events (pause/retry were resetting to 0%).
-        downloaded: prev?.downloaded ?? 0,
-        total: prev?.total ?? 0,
+        downloaded,
+        total,
         speed_bps: 0,
         eta_secs: 0,
-        progress_pct: prev?.progress_pct ?? 0,
+        progress_pct,
         error: clearError ? undefined : (s.error ?? prev?.error),
       });
       if (s.status === "completed" || s.status === "failed") {
@@ -707,7 +715,11 @@
                   ></div>
                 </div>
                 <span class="dl-size">
-                  {formatBytes(dl.downloaded)} / {formatBytes(dl.total)}
+                  {#if dl.status === "completed"}
+                    {formatBytes(dl.total || dl.downloaded)}
+                  {:else}
+                    {formatBytes(dl.downloaded)} / {formatBytes(dl.total)}
+                  {/if}
                 </span>
               </div>
               <div class="dl-meta">

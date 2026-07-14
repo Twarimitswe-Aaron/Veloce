@@ -65,19 +65,155 @@ pub fn category_for_ext(ext: &str) -> &'static str {
 
 /// Generate a unique save path by appending (1), (2), etc. if the path exists.
 pub fn unique_save_path(save_path: &Path) -> PathBuf {
-    if !save_path.exists() {
+    if !path_is_occupied(save_path) {
         return save_path.to_path_buf();
     }
     let parent = save_path.parent().unwrap_or(Path::new("."));
     let stem = save_path.file_stem().unwrap().to_string_lossy().to_string();
-    let ext = save_path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let ext = save_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
     for i in 1..100 {
         let candidate = parent.join(format!("{} ({}){}", stem, i, ext));
-        if !candidate.exists() {
+        if !path_is_occupied(&candidate) {
             return candidate;
         }
     }
     save_path.to_path_buf()
+}
+
+/// True if a media path, resume state, or done marker already claims this slot.
+pub fn path_is_occupied(save_path: &Path) -> bool {
+    if save_path.exists() {
+        return true;
+    }
+    let (state, done) = resume_sidecar_paths(save_path);
+    if state.exists() || done.exists() {
+        return true;
+    }
+    let legacy_state = PathBuf::from(format!("{}.veloce_state", save_path.display()));
+    let legacy_done = PathBuf::from(format!("{}.veloce_done", save_path.display()));
+    legacy_state.exists() || legacy_done.exists()
+}
+
+pub fn has_resume_state(save_path: &Path) -> bool {
+    let (state, _) = resume_sidecar_paths(save_path);
+    if state.exists() {
+        return true;
+    }
+    PathBuf::from(format!("{}.veloce_state", save_path.display())).exists()
+}
+
+pub fn is_marked_complete(save_path: &Path) -> bool {
+    let (_, done) = resume_sidecar_paths(save_path);
+    if done.exists() {
+        return true;
+    }
+    PathBuf::from(format!("{}.veloce_done", save_path.display())).exists()
+}
+
+/// Prefer an existing incomplete download (with resume state) over creating `(1)/(2)`.
+/// Falls back to [`unique_save_path`] when nothing reusable exists.
+pub fn reuse_or_unique_save_path(desired: &Path) -> PathBuf {
+    migrate_legacy_sidecars(desired);
+
+    if has_resume_state(desired) {
+        return desired.to_path_buf();
+    }
+    if desired.exists() && is_marked_complete(desired) {
+        return desired.to_path_buf();
+    }
+    if !path_is_occupied(desired) {
+        return desired.to_path_buf();
+    }
+
+    // Scan stem / stem (N) for the largest incomplete file that still has state.
+    let parent = desired.parent().unwrap_or(Path::new("."));
+    let stem = desired
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".into());
+    let ext = desired
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    let mut best: Option<(u64, PathBuf)> = None;
+    let candidates = std::iter::once(parent.join(format!("{stem}{ext}"))).chain((1..50).map(|i| {
+        parent.join(format!("{stem} ({i}){ext}"))
+    }));
+    for cand in candidates {
+        migrate_legacy_sidecars(&cand);
+        if !has_resume_state(&cand) {
+            continue;
+        }
+        if is_marked_complete(&cand) {
+            continue;
+        }
+        let size = std::fs::metadata(&cand).map(|m| m.len()).unwrap_or(0);
+        match &best {
+            Some((best_sz, _)) if size <= *best_sz => {}
+            _ => best = Some((size, cand)),
+        }
+    }
+    if let Some((_, path)) = best {
+        return path;
+    }
+
+    unique_save_path(desired)
+}
+
+/// Move legacy `{file}.veloce_state|.veloce_done` into `{parent}/.veloce/`.
+pub fn migrate_legacy_sidecars(save_path: &Path) {
+    let (new_state, new_done) = resume_sidecar_paths(save_path);
+    let legacy_state = PathBuf::from(format!("{}.veloce_state", save_path.display()));
+    let legacy_done = PathBuf::from(format!("{}.veloce_done", save_path.display()));
+
+    if legacy_state.exists() && !new_state.exists() {
+        let _ = ensure_parent_dir(&new_state);
+        if std::fs::rename(&legacy_state, &new_state).is_err() {
+            if let Ok(bytes) = std::fs::read(&legacy_state) {
+                let _ = std::fs::write(&new_state, bytes);
+                let _ = std::fs::remove_file(&legacy_state);
+            }
+        }
+    }
+    if legacy_done.exists() && !new_done.exists() {
+        let _ = ensure_parent_dir(&new_done);
+        if std::fs::rename(&legacy_done, &new_done).is_err() {
+            if let Ok(bytes) = std::fs::read(&legacy_done) {
+                let _ = std::fs::write(&new_done, bytes);
+                let _ = std::fs::remove_file(&legacy_done);
+            }
+        }
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Sweep a downloads directory: migrate every legacy sidecar into `.veloce/`.
+pub fn sweep_legacy_sidecars(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(stem) = name.strip_suffix(".veloce_state") {
+            migrate_legacy_sidecars(&dir.join(stem));
+        } else if let Some(stem) = name.strip_suffix(".veloce_done") {
+            migrate_legacy_sidecars(&dir.join(stem));
+        }
+    }
 }
 
 /// Check if a URL is a safe download target (no private/localhost/metadata IPs).

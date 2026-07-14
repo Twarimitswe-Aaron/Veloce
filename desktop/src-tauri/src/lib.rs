@@ -410,8 +410,10 @@ pub fn run() {
             state.set_app_handle(app.handle().clone());
             // Ensure desktop device row exists and scheduler uses saved concurrency.
             let _ = state.db.upsert_device("desktop");
-            let (_, max_c, _) = state.get_runtime_settings();
+            let (base_dir, max_c, _) = state.get_runtime_settings();
             state.scheduler.set_max_concurrent(max_c);
+            // Migrate leftover `{file}.veloce_state` into hidden `.veloce/`.
+            util::sweep_legacy_sidecars(&base_dir);
             // Re-schedule any playlists left mid-flight after a crash/restart.
             if let Ok(active) = state.db.list_playlist_jobs_for_ui(20) {
                 for job in active {

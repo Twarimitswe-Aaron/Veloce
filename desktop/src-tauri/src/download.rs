@@ -285,10 +285,9 @@ pub async fn enqueue_download_job(
     req: StartDownloadRequest,
 ) -> Result<String, String> {
     let config = Config::from_env();
-    let download_id = req.download_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut download_id = req.download_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     log::info!("[Step 2: Enqueue Job] ID: {}, URL: {}", download_id, req.url);
     let (runtime_dir, _, runtime_threads) = state.get_runtime_settings();
-    // Prefer per-request baseDirectory from the extension popup when set.
     let save_dir = req
         .base_directory
         .as_ref()
@@ -300,10 +299,72 @@ pub async fn enqueue_download_job(
     std::fs::create_dir_all(&save_dir)
         .map_err(|e| format!("Failed to create save directory: {}", e))?;
 
-    let download_url = resolve_download_url(&state, &req.url, req.direct_url.as_deref()).await?;
+    // Already complete on disk for this URL — ACK without re-downloading.
+    if req.save_path.is_none() && req.download_id.is_none() {
+        if let Ok(Some(done)) = state.db.find_completed_on_disk_by_url(&req.url) {
+            let tot = done
+                .total_bytes
+                .or(done.downloaded_bytes)
+                .unwrap_or(0)
+                .max(0) as u64;
+            let dl = done.downloaded_bytes.unwrap_or(tot as i64).max(0) as u64;
+            let final_dl = if tot > 0 { tot } else { dl };
+            state
+                .ws_clients
+                .broadcast_ack(&done.id, &done.file_name, "completed");
+            state.emit_download_added(
+                &done.id,
+                &done.url,
+                &done.file_name,
+                &done.save_path,
+                "completed",
+            );
+            {
+                let mut progress = state.progress.lock().await;
+                progress.insert(
+                    done.id.clone(),
+                    DownloadStatus {
+                        id: done.id.clone(),
+                        url: done.url.clone(),
+                        file_name: done.file_name.clone(),
+                        save_path: done.save_path.clone(),
+                        status: "completed".to_string(),
+                        downloaded: final_dl,
+                        total: final_dl,
+                        speed_bps: 0,
+                        eta_secs: 0,
+                        progress_pct: 100.0,
+                        error: None,
+                        source: None,
+                    },
+                );
+            }
+            log::info!(
+                "[Step 2] Reusing completed download {} at {}",
+                done.id,
+                done.save_path
+            );
+            return Ok(done.id);
+        }
+    }
+
+    let page_source = formats::detect_source(&req.url);
+    let is_resume = req.save_path.is_some() || req.download_id.is_some();
+
+    // MediaFire: scrape ONLY at engine start (tokens expire + saves ~2s on enqueue/resume).
+    let download_url = if page_source == formats::MediaSource::MediaFire {
+        log::info!(" -> MediaFire: deferring CDN scrape until engine start (fast enqueue)");
+        req.url.clone()
+    } else {
+        resolve_download_url(&state, &req.url, req.direct_url.as_deref()).await?
+    };
 
     let mut safe_name = util::sanitize_filename(&req.file_name);
-    if (safe_name.starts_with("file") || safe_name.starts_with("download_file")) && req.direct_url.is_none() {
+    if !is_resume
+        && page_source != formats::MediaSource::MediaFire
+        && (safe_name.starts_with("file") || safe_name.starts_with("download_file"))
+        && req.direct_url.is_none()
+    {
         if let Ok(u) = url::Url::parse(&download_url) {
             if let Some(segments) = u.path_segments() {
                 if let Some(last) = segments.last() {
@@ -319,12 +380,35 @@ pub async fn enqueue_download_job(
         }
     }
 
+    // Reuse existing incomplete path for this URL instead of creating (1)/(2).
+    let mut reused_row: Option<db::DownloadRow> = None;
     let save_path = if let Some(path) = req.save_path.as_ref() {
-        std::path::PathBuf::from(path)
+        let p = std::path::PathBuf::from(path);
+        util::migrate_legacy_sidecars(&p);
+        p
+    } else if let Ok(Some(row)) = state.db.find_resumable_by_url(&req.url) {
+        download_id = row.id.clone();
+        safe_name = row.file_name.clone();
+        let p = std::path::PathBuf::from(&row.save_path);
+        util::migrate_legacy_sidecars(&p);
+        log::info!(
+            "[Step 2] Reusing resumable path {} (id {})",
+            row.save_path,
+            row.id
+        );
+        reused_row = Some(row);
+        p
     } else {
-        util::unique_save_path(&save_dir.join(&safe_name))
+        let desired = save_dir.join(&safe_name);
+        util::reuse_or_unique_save_path(&desired)
     };
     let save_path_str = save_path.to_string_lossy().to_string();
+    if safe_name.is_empty() {
+        safe_name = save_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".into());
+    }
 
     let min_free_bytes = config.min_free_disk_mb * 1024 * 1024;
     if let Some(free) = util::free_space(&save_dir) {
@@ -337,6 +421,25 @@ pub async fn enqueue_download_job(
         }
     }
 
+    let (prev_downloaded, prev_total) = if let Some(row) = reused_row.as_ref() {
+        (
+            row.downloaded_bytes.unwrap_or(0).max(0) as u64,
+            row.total_bytes.unwrap_or(0).max(0) as u64,
+        )
+    } else if let Ok(Some(row)) = state.db.get_download(&download_id) {
+        (
+            row.downloaded_bytes.unwrap_or(0).max(0) as u64,
+            row.total_bytes.unwrap_or(0).max(0) as u64,
+        )
+    } else {
+        (0, 0)
+    };
+    let prev_pct = if prev_total > 0 {
+        (prev_downloaded as f64 / prev_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
     if let Ok(Some(_)) = state.db.get_download(&download_id) {
         let _ = state.db.update_download_status(&download_id, "queued");
     } else {
@@ -344,26 +447,34 @@ pub async fn enqueue_download_job(
             id: download_id.clone(),
             device_id: req.device_id.clone(),
             url: req.url.clone(),
-            direct_url: Some(download_url.clone()),
+            direct_url: if page_source == formats::MediaSource::MediaFire {
+                None
+            } else {
+                Some(download_url.clone())
+            },
             referer: req.referer.clone(),
             file_name: safe_name.clone(),
             save_path: save_path_str.clone(),
             status: "queued".to_string(),
-            total_bytes: None,
-            downloaded_bytes: Some(0),
+            total_bytes: if prev_total > 0 {
+                Some(prev_total as i64)
+            } else {
+                None
+            },
+            downloaded_bytes: Some(prev_downloaded as i64),
         };
         state
             .db
             .insert_download(&row)
             .map_err(|e| format!("DB error: {}", e))?;
     }
-    
+
     state.emit_download_added(
         &download_id,
         &req.url,
         &safe_name,
         &save_path_str,
-        "queued"
+        "queued",
     );
 
     let source = formats::detect_source(&req.url);
@@ -373,11 +484,11 @@ pub async fn enqueue_download_job(
         file_name: safe_name.clone(),
         save_path: save_path_str.clone(),
         status: "queued".to_string(),
-        downloaded: 0,
-        total: 0,
+        downloaded: prev_downloaded,
+        total: prev_total,
         speed_bps: 0,
         eta_secs: 0,
-        progress_pct: 0.0,
+        progress_pct: prev_pct,
         error: None,
         source: Some(format!("{:?}", source).to_lowercase()),
     };
@@ -389,12 +500,16 @@ pub async fn enqueue_download_job(
     let job_state = crate::scheduler::JobState {
         id: download_id.clone(),
         url: req.url.clone(),
-        direct_url: Some(download_url.clone()),
+        direct_url: if page_source == formats::MediaSource::MediaFire {
+            None
+        } else {
+            Some(download_url.clone())
+        },
         file_name: safe_name.clone(),
         save_path: save_path_str.clone(),
         status: "queued".to_string(),
-        downloaded: 0,
-        total: 0,
+        downloaded: prev_downloaded,
+        total: prev_total,
         speed_bps: 0,
         eta_secs: 0,
         is_playlist: false,
@@ -403,7 +518,10 @@ pub async fn enqueue_download_job(
     };
 
     state.scheduler.enqueue(job_state);
-    log::info!(" -> Job {} enqueued successfully. Pumping scheduler...", download_id);
+    log::info!(
+        " -> Job {} enqueued successfully. Pumping scheduler...",
+        download_id
+    );
     pump_scheduler(state.clone());
 
     Ok(download_id)
@@ -467,6 +585,12 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         let state_prog = state.clone();
         let id_prog = download_id.clone();
         move |prog: crate::engine::EngineProgress| {
+            if prog.msg_type == "done" || prog.msg_type == "already_exists" {
+                let total = prog.total.or(prog.downloaded).unwrap_or(0);
+                let downloaded = prog.downloaded.unwrap_or(total).max(total);
+                state_prog.emit_progress(&id_prog, downloaded, total.max(downloaded), 0, 0, 100.0);
+                return;
+            }
             let pct = match (prog.downloaded, prog.total) {
                 (Some(d), Some(t)) if t > 0 => (d as f64 / t as f64) * 100.0,
                 _ => 0.0,
@@ -725,9 +849,12 @@ pub async fn save_blob_download(
     state
         .ws_clients
         .broadcast_ack(&download_id, &safe_name, "completed");
-    state
-        .ws_clients
-        .broadcast_completed(&download_id, "completed");
+    state.ws_clients.broadcast_completed(
+        &download_id,
+        "completed",
+        bytes.len() as u64,
+        bytes.len() as u64,
+    );
 
     Ok(download_id)
 }
