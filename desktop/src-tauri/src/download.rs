@@ -433,7 +433,20 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
     // start (backend runDownloadJob parity), not only at enqueue time.
     let download_url = if formats::detect_source(&job.url) == formats::MediaSource::MediaFire {
         log::info!("[MediaFire] Re-resolving CDN URL at engine start for {}", download_id);
-        formats::resolve_mediafire(&job.url).await?.direct_url
+        match formats::resolve_mediafire(&job.url).await {
+            Ok(info) => info.direct_url,
+            Err(e) => {
+                // Token refresh failed (network blip) — fall back to URL from enqueue scrape.
+                if let Some(cached) = job.direct_url.clone().filter(|u| !u.is_empty()) {
+                    log::warn!(
+                        "[MediaFire] Re-resolve failed ({e}); using cached CDN URL from enqueue"
+                    );
+                    cached
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     } else {
         job.direct_url.unwrap_or(job.url.clone())
     };
@@ -469,9 +482,16 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         .filter(|t| *t > 0)
         .unwrap_or(default_threads)
         .clamp(1, 64);
-    // Direct/CDN hosts already have known Range behavior — skip auto-tune probe
-    // so time-to-first-byte stays low. Keep auto-tune for social/CDN adaptive hosts.
     let page_source = formats::detect_source(&job.url);
+    // MediaFire CDN often requires Referer = the file page. Prefer stored referer,
+    // else fall back to the page URL we scraped.
+    let referer = referer.or_else(|| {
+        if page_source == formats::MediaSource::MediaFire {
+            Some(job.url.clone())
+        } else {
+            None
+        }
+    });
     let auto_tune = config.engine_auto_tune
         && !matches!(
             page_source,
@@ -711,7 +731,8 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
         .map_err(|e| format!("DB error: {}", e))?
         .ok_or_else(|| "Download not found".to_string())?;
 
-    if !["paused", "error", "queued"].contains(&row.status.as_str()) {
+    // Extension UI uses "error"; desktop DB uses "failed" — both must be retryable.
+    if !["paused", "error", "failed", "queued", "cancelled"].contains(&row.status.as_str()) {
         return Err(format!("Cannot resume download in status {}", row.status));
     }
 
@@ -722,12 +743,29 @@ pub async fn resume_download_job(state: Arc<AppState>, id: &str) -> Result<(), S
         }
     }
 
+    // Drop stale in-memory failure so UI flips back to queued immediately.
+    {
+        let mut progress = state.progress.lock().await;
+        if let Some(entry) = progress.get_mut(id) {
+            entry.status = "queued".to_string();
+            entry.error = None;
+        }
+    }
     state.ws_clients.broadcast_ack(id, &row.file_name, "queued");
+    state
+        .emit_download_added(
+            id,
+            &row.url,
+            &row.file_name,
+            &row.save_path,
+            "queued",
+        );
 
     enqueue_download_job(
         state,
         StartDownloadRequest {
             url: row.url.clone(),
+            // Clear stale CDN tokens — MediaFire / signed URLs are re-resolved in resolve + engine start.
             direct_url: None,
             file_name: row.file_name.clone(),
             referer: row.referer.clone(),

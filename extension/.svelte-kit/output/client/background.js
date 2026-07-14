@@ -323,13 +323,16 @@ function handleWsMessage(data) {
 		case 'DOWNLOAD_SNAPSHOT':
 			if (Array.isArray(data.downloads)) {
 				for (const d of data.downloads) {
+					const raw = d.status ?? 'queued';
+					const status = raw === 'failed' || raw === 'cancelled' ? 'error' : raw;
 					upsertDownload(d.downloadId, {
 						fileName: d.fileName ?? 'Unknown file',
-						status: d.status ?? 'queued',
+						status,
 						downloaded: d.downloaded ?? 0,
 						total: d.total ?? 0,
 						speedBps: 0,
 						etaSecs: 0,
+						error: d.error || (status === 'error' ? 'Download failed — click Retry' : undefined),
 						isPlaylist: d.isPlaylist === true
 					});
 				}
@@ -658,6 +661,18 @@ async function enrichDownloadPayload(payload, tabId) {
 	if (pageUrl) {
 		out.pageUrl = pageUrl;
 		out.referer = out.referer || pageUrl;
+	}
+
+	// Prefer in-memory directory from SETTINGS / DIRECTORY_SELECTED — avoids a
+	// chrome.storage round-trip on every badge click before NEW_DOWNLOAD.
+	if (!out.baseDirectory) {
+		out.baseDirectory = selectedDirectory
+			|| settings?.baseDirectory
+			|| settings?.base_dir
+			|| undefined;
+	}
+	if (!out.threads && settings?.defaultThreads) {
+		out.threads = settings.defaultThreads;
 	}
 
 	if (out.directUrl && BROWSER_ONLY_URL.test(out.directUrl)) {

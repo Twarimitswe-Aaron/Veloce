@@ -75,9 +75,9 @@ function _page($$renderer, $$props) {
 			for (let $$index = 0, $$length = each_array.length; $$index < $$length; $$index++) {
 				let d = each_array[$$index];
 				$$renderer.push(`<div class="border border-white/20 p-2 flex flex-col gap-1.5"><div class="flex justify-between gap-2 items-start"><span class="text-xs truncate flex-1"${attr("title", d.fileName)}>${escape_html(d.fileName)}</span> <span class="text-[9px] uppercase tracking-wider opacity-70 shrink-0">${escape_html(d.status)}</span></div> `);
-				if (d.status === "error") {
+				if (d.status === "error" || d.status === "failed") {
 					$$renderer.push("<!--[0-->");
-					$$renderer.push(`<p class="text-[11px] opacity-80">${escape_html(d.error)}</p>`);
+					$$renderer.push(`<p class="text-[11px] opacity-80">${escape_html(d.error || "Download failed")}</p>`);
 				} else {
 					$$renderer.push("<!--[-1-->");
 					$$renderer.push(`<div class="h-1 w-full bg-white/15"><div class="h-full bg-white transition-[width] duration-200"${attr_style(`width: ${stringify(d.status === "completed" ? 100 : pct(d))}%`)}></div></div> <div class="flex justify-between text-[10px] opacity-60"><span>${escape_html(formatBytes(d.downloaded))}${escape_html(d.total ? ` / ${formatBytes(d.total)}` : "")}</span> `);
@@ -97,7 +97,7 @@ function _page($$renderer, $$props) {
 				} else if (d.status === "paused") {
 					$$renderer.push("<!--[1-->");
 					$$renderer.push(`<button type="button" class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Resume</button> <button type="button" class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Cancel</button>`);
-				} else if (d.status === "error") {
+				} else if (d.status === "error" || d.status === "failed") {
 					$$renderer.push("<!--[2-->");
 					if (d.isPlaylist) {
 						$$renderer.push("<!--[0-->");

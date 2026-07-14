@@ -323,13 +323,16 @@ function handleWsMessage(data) {
 		case 'DOWNLOAD_SNAPSHOT':
 			if (Array.isArray(data.downloads)) {
 				for (const d of data.downloads) {
+					const raw = d.status ?? 'queued';
+					const status = raw === 'failed' || raw === 'cancelled' ? 'error' : raw;
 					upsertDownload(d.downloadId, {
 						fileName: d.fileName ?? 'Unknown file',
-						status: d.status ?? 'queued',
+						status,
 						downloaded: d.downloaded ?? 0,
 						total: d.total ?? 0,
 						speedBps: 0,
 						etaSecs: 0,
+						error: d.error || (status === 'error' ? 'Download failed — click Retry' : undefined),
 						isPlaylist: d.isPlaylist === true
 					});
 				}

@@ -288,6 +288,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     forward_task.abort();
 }
 
+fn snapshot_status(status: &str) -> &str {
+    // Extension popup only shows Retry for status === 'error'.
+    match status {
+        "failed" | "cancelled" => "error",
+        other => other,
+    }
+}
+
 fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
     // Register the extension device so foreign-key constraints don't fail on download inserts.
     let _ = app.db.upsert_device("extension");
@@ -321,28 +329,39 @@ fn send_initial_state(app: &AppState, tx: &tokio::sync::mpsc::UnboundedSender<St
         .to_string(),
     );
 
-    if let Ok(recent) = app.db.list_recent_downloads("extension", 20) {
-        let snapshot: Vec<serde_json::Value> = recent
-            .iter()
-            .map(|d| {
-                serde_json::json!({
+    // Snapshot recent downloads from both extension and desktop so the popup
+    // queue matches what the Tauri UI shows after reconnect.
+    let mut snapshot: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for device in ["extension", "desktop"] {
+        if let Ok(recent) = app.db.list_recent_downloads(device, 30) {
+            for d in recent {
+                if !seen.insert(d.id.clone()) {
+                    continue;
+                }
+                snapshot.push(serde_json::json!({
                     "downloadId": d.id,
                     "fileName": d.file_name,
-                    "status": d.status,
+                    "status": snapshot_status(&d.status),
                     "downloaded": d.downloaded_bytes.unwrap_or(0),
                     "total": d.total_bytes.unwrap_or(0),
-                })
-            })
-            .collect();
-        if !snapshot.is_empty() {
-            let _ = tx.send(
-                serde_json::json!({
-                    "type": "DOWNLOAD_SNAPSHOT",
-                    "downloads": snapshot,
-                })
-                .to_string(),
-            );
+                    "error": if d.status == "failed" || d.status == "error" {
+                        serde_json::Value::String("Download failed — click Retry".into())
+                    } else {
+                        serde_json::Value::Null
+                    },
+                }));
+            }
         }
+    }
+    if !snapshot.is_empty() {
+        let _ = tx.send(
+            serde_json::json!({
+                "type": "DOWNLOAD_SNAPSHOT",
+                "downloads": snapshot,
+            })
+            .to_string(),
+        );
     }
 }
 
@@ -681,9 +700,20 @@ async fn handle_message(
                 } else {
                     let app = state.app.clone();
                     let id = id.to_string();
+                    let task_tx = tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = download::resume_download_job(app, &id).await {
+                        if let Err(e) = download::resume_download_job(app.clone(), &id).await {
                             log::error!("RESUME_DOWNLOAD failed: {}", e);
+                            let _ = app.db.update_download_status(&id, "failed");
+                            app.ws_clients.broadcast_error(&id, &e);
+                            let _ = task_tx.send(
+                                serde_json::json!({
+                                    "type": "DOWNLOAD_ERROR",
+                                    "downloadId": id,
+                                    "error": e,
+                                })
+                                .to_string(),
+                            );
                         }
                     });
                 }

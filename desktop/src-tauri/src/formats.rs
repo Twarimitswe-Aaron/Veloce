@@ -352,59 +352,89 @@ fn extract_youtube_id(url: &str) -> Option<String> {
 pub async fn resolve_mediafire(url: &str) -> Result<MediaFireInfo, String> {
     log::info!("[MediaFire] Step 1: Building HTTP client for URL: {}", url);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .gzip(true)
+        .brotli(true)
+        .redirect(reqwest::redirect::Policy::limited(8))
         .build()
         .map_err(|e| {
             log::error!("[MediaFire] Failed to build HTTP client: {}", e);
             format!("Failed to build HTTP client: {}", e)
         })?;
 
-    log::info!("[MediaFire] Step 2: Fetching page HTML");
-    let resp = client.get(url).send().await
-        .map_err(|e| {
-            log::error!("[MediaFire] HTTP GET failed: {}", e);
-            format!("Failed to fetch MediaFire page: {}", e)
-        })?;
-        
-    let html = resp.text().await
-        .map_err(|e| {
-            log::error!("[MediaFire] Failed to read response body: {}", e);
-            format!("Failed to read MediaFire page: {}", e)
-        })?;
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        log::info!("[MediaFire] Step 2: Fetching page HTML (attempt {attempt}/3)");
+        match fetch_mediafire_html(&client, url).await {
+            Ok(html) => {
+                log::info!(
+                    "[MediaFire] Step 3: Page fetched successfully ({} bytes). Extracting title...",
+                    html.len()
+                );
 
-    log::info!("[MediaFire] Step 3: Page fetched successfully ({} bytes). Extracting title...", html.len());
+                let file_name = extract_meta_content(&html, "og:title")
+                    .or_else(|| extract_title(&html))
+                    .unwrap_or_else(|| {
+                        log::warn!("[MediaFire] Could not extract title, using fallback");
+                        "mediafire_file".to_string()
+                    });
 
-    // Extract file name from og:title or title
-    let file_name = extract_meta_content(&html, "og:title")
-        .or_else(|| extract_title(&html))
-        .unwrap_or_else(|| {
-            log::warn!("[MediaFire] Could not extract title, using fallback");
-            "mediafire_file".to_string()
-        });
-        
-    log::info!("[MediaFire] Step 4: Title extracted: {}", file_name);
-    log::info!("[MediaFire] Step 5: Extracting direct download URL");
+                log::info!("[MediaFire] Step 4: Title extracted: {}", file_name);
+                log::info!("[MediaFire] Step 5: Extracting direct download URL");
 
-    // Extract download URL from the download button or link
-    let direct_url = extract_mediafire_download_url(&html)
-        .ok_or_else(|| {
-            log::error!("[MediaFire] Failed to find direct CDN download URL in HTML");
-            "Could not find download link on MediaFire page".to_string()
-        })?;
+                let direct_url = extract_mediafire_download_url(&html).ok_or_else(|| {
+                    log::error!("[MediaFire] Failed to find direct CDN download URL in HTML");
+                    "Could not find download link on MediaFire page".to_string()
+                })?;
 
-    log::info!("[MediaFire] Step 6: Extracted direct URL: {}", direct_url);
-    log::info!("[MediaFire] Step 7: Extracting file size");
+                log::info!("[MediaFire] Step 6: Extracted direct URL: {}", direct_url);
+                log::info!("[MediaFire] Step 7: Extracting file size");
 
-    // Extract file size from the info section
-    let size_bytes = extract_mediafire_size(&html);
-    log::info!("[MediaFire] Step 8: File size extracted: {:?}", size_bytes);
+                let size_bytes = extract_mediafire_size(&html);
+                log::info!("[MediaFire] Step 8: File size extracted: {:?}", size_bytes);
 
-    Ok(MediaFireInfo {
-        file_name,
-        direct_url,
-        size_bytes,
-    })
+                return Ok(MediaFireInfo {
+                    file_name,
+                    direct_url,
+                    size_bytes,
+                });
+            }
+            Err(e) => {
+                last_err = e;
+                log::warn!("[MediaFire] Attempt {attempt} failed: {last_err}");
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+async fn fetch_mediafire_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client
+        .get(url)
+        .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch MediaFire page: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("MediaFire HTTP {}", resp.status()));
+    }
+
+    // Prefer bytes → UTF-8 so a partial decode still yields scrapeable HTML.
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read MediaFire page: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn extract_meta_content(html: &str, property: &str) -> Option<String> {

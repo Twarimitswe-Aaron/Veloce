@@ -690,7 +690,7 @@
                 {/if}
               </div>
               <div class="dl-actions">
-                {#if dl.status === "downloading"}
+                {#if dl.status === "downloading" || dl.status === "queued"}
                   <button onclick={() => pauseDownload(dl.id)}>Pause</button>
                   <button class="btn-cancel" onclick={() => cancelDownload(dl.id)}>Cancel</button>
                 {:else if dl.status === "paused"}
@@ -700,7 +700,7 @@
                   <button onclick={() => openFile(dl.save_path)}>Open File</button>
                   <button onclick={() => openFolder(dl.save_path)}>Open Folder</button>
                   <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
-                {:else if dl.status === "failed"}
+                {:else if dl.status === "failed" || dl.status === "error" || dl.status === "cancelled"}
                   <button onclick={() => resumeDownload(dl.id)}>Retry</button>
                   <button class="btn-cancel" onclick={() => clearDownload(dl.id)}>Clear</button>
                 {/if}
@@ -845,62 +845,69 @@
     <!-- Settings Tab -->
     <section class="settings-tab">
       <h2>Settings</h2>
-      <div class="settings-group">
-        <label>
-          <span>Base Directory</span>
-          <div class="dir-row">
-            <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
-            <button type="button" class="btn-browse" onclick={browseDirectory} disabled={pickerBusy}>
-              {pickerBusy ? "…" : "Browse"}
-            </button>
+      <div class="settings-columns">
+        <div class="settings-col">
+          <h3>General</h3>
+          <div class="settings-group">
+            <label>
+              <span>Base Directory</span>
+              <div class="dir-row">
+                <input type="text" bind:value={baseDir} placeholder="~/Downloads/Veloce" />
+                <button type="button" class="btn-browse" onclick={browseDirectory} disabled={pickerBusy}>
+                  {pickerBusy ? "…" : "Browse"}
+                </button>
+              </div>
+              {#if pickerError}
+                <span class="picker-error">{pickerError}</span>
+              {/if}
+            </label>
+            <label>
+              <span>Max Concurrent Downloads (Queue)</span>
+              <input type="number" bind:value={maxConcurrent} min="1" max="64" />
+            </label>
+            <label>
+              <span>Default Threads Per Download</span>
+              <input type="number" bind:value={defaultThreads} min="1" max="64" />
+            </label>
+            <label>
+              <span>Speed cap (MB/s, 0 = unlimited)</span>
+              <input type="number" bind:value={maxRateMBps} min="0" max="1000" />
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" bind:checked={engineQuiet} />
+              Quiet engine (less diagnostic output)
+            </label>
           </div>
-          {#if pickerError}
-            <span class="picker-error">{pickerError}</span>
-          {/if}
-        </label>
-        <label>
-          <span>Max Concurrent Downloads (Queue)</span>
-          <input type="number" bind:value={maxConcurrent} min="1" max="64" />
-        </label>
-        <label>
-          <span>Default Threads Per Download</span>
-          <input type="number" bind:value={defaultThreads} min="1" max="64" />
-        </label>
-        <label>
-          <span>Speed cap (MB/s, 0 = unlimited)</span>
-          <input type="number" bind:value={maxRateMBps} min="0" max="1000" />
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" bind:checked={engineQuiet} />
-          Quiet engine (less diagnostic output)
-        </label>
-      </div>
-      <h3>Playlist downloads</h3>
-      <div class="settings-group">
-        <label>
-          <span>Media type</span>
-          <select bind:value={plMediaType}>
-            <option value="audio">Audio</option>
-            <option value="video">Video</option>
-          </select>
-        </label>
-        <label>
-          <span>Video quality (when video / audio fallback)</span>
-          <select bind:value={plVideoQuality}>
-            <option value="1080">1080p</option>
-            <option value="720">720p</option>
-            <option value="480">480p</option>
-            <option value="360">360p</option>
-            <option value="best">Best</option>
-          </select>
-        </label>
-        <label>
-          <span>If audio missing</span>
-          <select bind:value={plAudioFallback}>
-            <option value="video">Fall back to video</option>
-            <option value="skip">Skip track</option>
-          </select>
-        </label>
+        </div>
+        <div class="settings-col">
+          <h3>Playlist downloads</h3>
+          <div class="settings-group">
+            <label>
+              <span>Media type</span>
+              <select bind:value={plMediaType}>
+                <option value="audio">Audio</option>
+                <option value="video">Video</option>
+              </select>
+            </label>
+            <label>
+              <span>Video quality (when video / audio fallback)</span>
+              <select bind:value={plVideoQuality}>
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="480">480p</option>
+                <option value="360">360p</option>
+                <option value="best">Best</option>
+              </select>
+            </label>
+            <label>
+              <span>If audio missing</span>
+              <select bind:value={plAudioFallback}>
+                <option value="video">Fall back to video</option>
+                <option value="skip">Skip track</option>
+              </select>
+            </label>
+          </div>
+        </div>
       </div>
       <p class="settings-note">Settings sync to the extension popup. New downloads use the folder immediately; concurrency applies to the next queued jobs.</p>
     </section>
@@ -1476,7 +1483,8 @@
   .settings-tab {
     flex: 1;
     overflow-y: auto;
-    padding: 10px 16px;
+    padding: 10px 16px 20px;
+    color-scheme: dark;
   }
 
   .settings-tab h2 {
@@ -1485,6 +1493,33 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     margin: 0 0 12px;
+    color: var(--veloce-muted);
+  }
+
+  .settings-columns {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  @media (min-width: 720px) {
+    .settings-columns {
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+      align-items: start;
+    }
+  }
+
+  .settings-col {
+    min-width: 0;
+  }
+
+  .settings-tab h3,
+  .settings-col h3 {
+    margin: 0 0 10px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     color: var(--veloce-muted);
   }
 
@@ -1506,28 +1541,26 @@
     font-weight: 500;
   }
 
-  .settings-group input {
+  .settings-group input,
+  .settings-group select {
     padding: 7px 10px;
-    background: #000d1f;
+    background: #0f1f35;
     border: 1px solid var(--veloce-border);
-    color: var(--veloce-white);
+    color: #e8edf5;
     font-size: 13px;
     border-radius: 4px;
     outline: none;
+    color-scheme: dark;
   }
 
-  .settings-group input:focus {
+  .settings-group input:focus,
+  .settings-group select:focus {
     border-color: var(--veloce-green);
   }
 
-  .settings-group select {
-    padding: 7px 10px;
-    background: #000d1f;
-    border: 1px solid var(--veloce-border);
-    color: var(--veloce-white);
-    font-size: 13px;
-    border-radius: 4px;
-    outline: none;
+  .settings-group select option {
+    background-color: #0f1f35;
+    color: #e8edf5;
   }
 
   .dir-row {
@@ -1574,16 +1607,8 @@
     color: var(--veloce-white);
   }
 
-  .settings-tab h3 {
-    margin: 18px 0 8px;
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--veloce-muted);
-  }
-
   .settings-note {
-    margin-top: 12px;
+    margin-top: 16px;
     font-size: 11px;
     color: var(--veloce-muted);
     line-height: 1.5;

@@ -4,6 +4,57 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 use serde_json;
 
+/// Flags supported by the on-disk `core_engine` binary (probed via `--help`).
+#[derive(Debug, Clone, Copy)]
+struct EngineCaps {
+    quiet: bool,
+    referer: bool,
+    origin: bool,
+    read_buffer_bytes: bool,
+    no_auto_tune: bool,
+    base_dir: bool,
+}
+
+fn engine_caps(engine_path: &PathBuf) -> EngineCaps {
+    static CACHE: Mutex<Option<(PathBuf, EngineCaps)>> = Mutex::new(None);
+    {
+        let guard = CACHE.lock().unwrap();
+        if let Some((path, caps)) = guard.as_ref() {
+            if path == engine_path {
+                return *caps;
+            }
+        }
+    }
+    let help = Command::new(engine_path)
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()
+        .map(|o| {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        })
+        .unwrap_or_default();
+    let caps = EngineCaps {
+        quiet: help.contains("--quiet"),
+        referer: help.contains("--referer"),
+        origin: help.contains("--origin"),
+        read_buffer_bytes: help.contains("--read-buffer-bytes"),
+        no_auto_tune: help.contains("--no-auto-tune"),
+        base_dir: help.contains("--base-dir"),
+    };
+    *CACHE.lock().unwrap() = Some((engine_path.clone(), caps));
+    if !caps.base_dir {
+        log::warn!(
+            "core_engine at {:?} lacks --base-dir — rebuild with: cd core_engine && cargo build --release",
+            engine_path
+        );
+    }
+    caps
+}
+
 /// Represents a running core_engine process.
 pub struct EngineProcess {
     download_id: String,
@@ -49,6 +100,9 @@ impl EngineProcess {
         // Clamp threads at the spawn boundary (engine also clamps).
         let threads = threads.clamp(1, 64);
         let engine_path = Self::find_engine();
+        let caps = engine_caps(&engine_path);
+        log::info!("[Engine] Using binary {:?} (base-dir={})", engine_path, caps.base_dir);
+
         let mut args = vec![
             "--id".to_string(),
             download_id.clone(),
@@ -60,30 +114,39 @@ impl EngineProcess {
             threads.to_string(),
             "--max-rate".to_string(),
             max_rate.to_string(),
-            "--read-buffer-bytes".to_string(),
-            read_buffer_bytes.to_string(),
         ];
-        if quiet {
+        if caps.read_buffer_bytes {
+            args.push("--read-buffer-bytes".to_string());
+            args.push(read_buffer_bytes.to_string());
+        }
+        if quiet && caps.quiet {
             args.push("--quiet".to_string());
         }
-        if !auto_tune {
+        if !auto_tune && caps.no_auto_tune {
             args.push("--no-auto-tune".to_string());
         }
         if let Some(ref_) = referer {
-            args.push("--referer".to_string());
-            args.push(ref_.to_string());
-            // Match backend engineCli — googlevideo-style CDNs often need Origin.
-            if let Ok(parsed) = url::Url::parse(ref_) {
-                let origin = parsed.origin().ascii_serialization();
-                if origin != "null" {
-                    args.push("--origin".to_string());
-                    args.push(origin);
+            if caps.referer {
+                args.push("--referer".to_string());
+                args.push(ref_.to_string());
+            }
+            // Match backend engineCli — googlevideo / CDN hosts often need Origin.
+            if caps.origin {
+                if let Ok(parsed) = url::Url::parse(ref_) {
+                    let origin = parsed.origin().ascii_serialization();
+                    if origin != "null" {
+                        args.push("--origin".to_string());
+                        args.push(origin);
+                    }
                 }
             }
         }
-        if let Some(dir) = base_dir.filter(|d| !d.is_empty()) {
-            args.push("--base-dir".to_string());
-            args.push(dir.to_string());
+        // Only pass --base-dir when the binary understands it (older builds exit 2 otherwise).
+        if caps.base_dir {
+            if let Some(dir) = base_dir.filter(|d| !d.is_empty()) {
+                args.push("--base-dir".to_string());
+                args.push(dir.to_string());
+            }
         }
 
         let mut child = Command::new(&engine_path)

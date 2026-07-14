@@ -322,12 +322,10 @@
 			try {
 				if (!/instagram\.com/i.test(new URL(url).hostname)) return null;
 			} catch { return null; }
-			if (isReelsViewerPage() || isPostPage()) {
-				return !!canonicalPostUrl(url);
-			}
-			if (isStoriesPage()) {
-				return !!canonicalStoryUrl();
-			}
+			// Prefetch any resolvable post/reel URL — including feed cards — so badge
+			// clicks hit warm cache. Concurrency stays capped (PREFETCH_LIMIT=2).
+			if (canonicalPostUrl(url)) return true;
+			if (isStoriesPage()) return !!canonicalStoryUrl();
 			return false;
 		}
 

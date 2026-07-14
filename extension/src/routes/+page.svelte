@@ -281,8 +281,8 @@
 						<span class="text-[9px] uppercase tracking-wider opacity-70 shrink-0">{d.status}</span>
 					</div>
 
-					{#if d.status === 'error'}
-						<p class="text-[11px] opacity-80">{d.error}</p>
+					{#if d.status === 'error' || d.status === 'failed'}
+						<p class="text-[11px] opacity-80">{d.error || 'Download failed'}</p>
 					{:else}
 						<div class="h-1 w-full bg-white/15">
 							<div
@@ -311,7 +311,7 @@
 								class="text-[10px] px-2 py-0.5 border border-white hover:bg-[#002a55] cursor-pointer">Resume</button>
 							<button type="button" onclick={() => wsClient.cancelDownload(d.id)}
 								class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Cancel</button>
-						{:else if d.status === 'error'}
+						{:else if d.status === 'error' || d.status === 'failed'}
 							{#if d.isPlaylist}
 								<button type="button" onclick={() => wsClient.removeDownload(d.id)}
 									class="text-[10px] px-2 py-0.5 border border-white/25 hover:bg-[#002a55] cursor-pointer">Remove</button>

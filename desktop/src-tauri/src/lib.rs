@@ -89,7 +89,54 @@ async fn resume_download(id: String, state: State<'_, Arc<AppState>>) -> Result<
 
 #[tauri::command]
 async fn get_statuses(state: State<'_, Arc<AppState>>) -> Result<Vec<DownloadStatus>, String> {
-    Ok(state.all_statuses().await)
+    let mut by_id: std::collections::HashMap<String, DownloadStatus> = std::collections::HashMap::new();
+
+    // Live in-memory jobs first.
+    for s in state.all_statuses().await {
+        by_id.insert(s.id.clone(), s);
+    }
+
+    // Hydrate recent DB rows (extension + desktop) so failed/completed match the popup queue.
+    for device in ["extension", "desktop"] {
+        if let Ok(rows) = state.db.list_recent_downloads(device, 40) {
+            for r in rows {
+                let downloaded = r.downloaded_bytes.unwrap_or(0) as u64;
+                let total = r.total_bytes.unwrap_or(0) as u64;
+                let failed = r.status == "failed" || r.status == "error";
+                let status = if r.status == "error" {
+                    "failed".to_string()
+                } else {
+                    r.status.clone()
+                };
+                by_id.entry(r.id.clone()).or_insert_with(|| DownloadStatus {
+                    id: r.id,
+                    url: r.url,
+                    file_name: r.file_name,
+                    save_path: r.save_path,
+                    status,
+                    downloaded,
+                    total,
+                    speed_bps: 0,
+                    eta_secs: 0,
+                    progress_pct: if total > 0 {
+                        (downloaded as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                    error: if failed {
+                        Some("Download failed — click Retry".into())
+                    } else {
+                        None
+                    },
+                    source: None,
+                });
+            }
+        }
+    }
+
+    let mut out: Vec<_> = by_id.into_values().collect();
+    out.sort_by(|a, b| b.id.cmp(&a.id));
+    Ok(out)
 }
 
 #[tauri::command]
