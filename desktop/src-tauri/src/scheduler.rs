@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use crate::config::Config;
-use crate::formats::{detect_source, MediaSource};
 
 /// State of a single download job.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -24,40 +23,17 @@ pub struct JobState {
     pub threads: Option<u32>,
 }
 
-/// CDNs that collapse when several multi-connection jobs share the uplink.
-fn is_exclusive_cdn_job(job: &JobState) -> bool {
-    let probe = job
-        .direct_url
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .unwrap_or(job.url.as_str());
-    is_exclusive_cdn_url(probe) || is_exclusive_cdn_url(&job.url)
-}
-
-fn is_exclusive_cdn_url(url: &str) -> bool {
-    if detect_source(url) == MediaSource::MediaFire {
-        return true;
-    }
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    let host = parsed.host_str().unwrap_or("").to_lowercase();
-    host.contains("mediafire.com")
-        || host.contains("hakunaymatata.com")
-        || host.contains("aoneroom.com")
-        || host.ends_with("googlevideo.com")
-}
-
 /// The download scheduler with a FIFO queue and concurrency cap.
+/// Each job is an independent engine process; parallelism is controlled only by
+/// `max_concurrent` (Settings), not by forcing CDN hosts one-at-a-time.
 #[allow(dead_code)]
 pub struct Scheduler {
     config: Config,
     /// Live concurrency cap (updated from Settings UI / extension SET_SETTINGS).
     max_concurrent: AtomicU32,
     queue: Mutex<VecDeque<JobState>>,
-    /// Active jobs: (id, exclusive_cdn). Exclusive CDNs run one-at-a-time so
-    /// MediaFire + OmniSave don't starve each other to ~KB/s.
-    active: Mutex<Vec<(String, bool)>>,
+    /// Active job ids currently running an engine.
+    active: Mutex<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -93,38 +69,27 @@ impl Scheduler {
     }
 
     /// Dequeue and mark as active. Returns None if queue is empty or cap reached.
-    /// Skips exclusive-CDN jobs while another exclusive CDN download is active
-    /// (other jobs may still start if slots remain).
     pub fn dequeue(&self) -> Option<JobState> {
         let mut active = self.active.lock().unwrap();
         if active.len() >= self.max_concurrent() as usize {
             return None;
         }
-        let exclusive_busy = active.iter().any(|(_, ex)| *ex);
         let mut queue = self.queue.lock().unwrap();
-        let idx = queue.iter().position(|j| {
-            if exclusive_busy && is_exclusive_cdn_job(j) {
-                false
-            } else {
-                true
-            }
-        })?;
-        let job = queue.remove(idx).expect("index from position");
-        let exclusive = is_exclusive_cdn_job(&job);
-        if exclusive {
-            log::info!(
-                "Dequeued exclusive-CDN job {} (serialized: one CDN-heavy download at a time)",
-                job.id
-            );
-        }
-        active.push((job.id.clone(), exclusive));
+        let job = queue.pop_front()?;
+        log::info!(
+            "Dequeued download {} (active {}/{})",
+            job.id,
+            active.len() + 1,
+            self.max_concurrent()
+        );
+        active.push(job.id.clone());
         Some(job)
     }
 
     /// Mark a download as completed/removed from active.
     pub fn finish(&self, id: &str) {
         let mut active = self.active.lock().unwrap();
-        active.retain(|(a, _)| a != id);
+        active.retain(|a| a != id);
     }
 
     /// Remove a queued job by ID. Returns true if it was in the queue.
@@ -284,8 +249,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mediafire_serialized() {
-        let sched = new_scheduler(4);
+    fn test_mediafire_respects_concurrent_cap_only() {
+        let sched = new_scheduler(2);
         {
             let mut q = sched.queue.lock().unwrap();
             q.push_back(JobState {
@@ -319,11 +284,11 @@ mod tests {
                 threads: None,
             });
             q.push_back(JobState {
-                id: "yt".into(),
-                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                id: "mf3".into(),
+                url: "https://www.mediafire.com/file/ccc/c.mp4/file".into(),
                 direct_url: None,
-                file_name: "yt.mp4".into(),
-                save_path: "/tmp/yt.mp4".into(),
+                file_name: "c.mp4".into(),
+                save_path: "/tmp/c.mp4".into(),
                 status: "queued".into(),
                 downloaded: 0,
                 total: 0,
@@ -335,15 +300,15 @@ mod tests {
             });
         }
 
+        // MediaFire jobs run in parallel up to the Settings concurrent cap.
         let j1 = sched.dequeue().expect("mf1");
         assert_eq!(j1.id, "mf1");
-        // Second MediaFire blocked while mf1 active, but YouTube can start
-        let j2 = sched.dequeue().expect("yt while mf busy");
-        assert_eq!(j2.id, "yt");
-        assert!(sched.dequeue().is_none(), "mf2 must wait");
+        let j2 = sched.dequeue().expect("mf2");
+        assert_eq!(j2.id, "mf2");
+        assert!(sched.dequeue().is_none(), "mf3 waits on concurrent cap");
         sched.finish("mf1");
-        let j3 = sched.dequeue().expect("mf2 after mf1 done");
-        assert_eq!(j3.id, "mf2");
+        let j3 = sched.dequeue().expect("mf3 after slot free");
+        assert_eq!(j3.id, "mf3");
     }
 
     #[test]

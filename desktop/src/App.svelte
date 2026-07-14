@@ -940,7 +940,7 @@
               <span>Max Concurrent Downloads (Queue)</span>
               <input type="number" bind:value={maxConcurrent} min="1" max="64" />
               <p class="hint dir-hint">
-                Jobs are separate processes, but they still share your internet link. Keep this at 1–2 on slow/CDN hosts (MediaFire, OmniSave) or speeds collapse to KB/s.
+                How many downloads run at once (each is its own engine). Raise this to start more files in parallel; they still share your uplink, so very high values can slow every job.
               </p>
             </label>
             <label>
