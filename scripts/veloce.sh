@@ -63,6 +63,74 @@ print_status() {
     printf "\n"
 }
 
+check_port() {
+    local starting="$1"
+    
+    # 1. Check if the other managed service is active
+    if [ "$starting" = "backend" ] && svc_active "veloce-desktop"; then
+        if [ -t 1 ] || [ -t 0 ]; then
+            printf "${YELLOW}⚠ Desktop app is already running on port 14921.${RESET}\n"
+            printf "  Stop it and start the backend coordinator instead? [y/N] "
+            read -r reply </dev/tty || reply="N"
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                cmd_stop "veloce-desktop" "Desktop app"
+                sleep 1
+            else
+                err "Aborted."
+                exit 1
+            fi
+        else
+            err "Desktop app is already running and using port 14921."
+            err "Stop it first: veloce stop --desktop"
+            exit 1
+        fi
+    elif [ "$starting" = "desktop" ] && svc_active "veloce"; then
+        if [ -t 1 ] || [ -t 0 ]; then
+            printf "${YELLOW}⚠ Backend coordinator is already running on port 14921.${RESET}\n"
+            printf "  Stop it and start the desktop app instead? [y/N] "
+            read -r reply </dev/tty || reply="N"
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                cmd_stop "veloce" "Backend coordinator"
+                sleep 1
+            else
+                err "Aborted."
+                exit 1
+            fi
+        else
+            err "Backend coordinator is already running and using port 14921."
+            err "Stop it first: veloce stop"
+            exit 1
+        fi
+    fi
+    
+    # 2. Check for unknown processes on 14921
+    local port_in_use=0
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 'sport = :14921' 2>/dev/null | grep -q '14921' && port_in_use=1
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:14921 -sTCP:LISTEN >/dev/null 2>&1 && port_in_use=1
+    fi
+    
+    if [ $port_in_use -eq 1 ]; then
+        err "Port 14921 is occupied by an unknown process (or manually run Veloce instance)."
+        if command -v fuser >/dev/null 2>&1 && { [ -t 1 ] || [ -t 0 ]; }; then
+            printf "  Would you like to forcefully kill the process on port 14921? [y/N] "
+            read -r reply </dev/tty || reply="N"
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                info "Killing process on port 14921..."
+                fuser -k -9 14921/tcp >/dev/null 2>&1 || true
+                sleep 1
+            else
+                err "Aborted. Please stop the process and try again."
+                exit 1
+            fi
+        else
+            err "Please stop it before starting the managed service."
+            exit 1
+        fi
+    fi
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 cmd_status() {
     if ! have_systemd; then
@@ -74,7 +142,7 @@ cmd_status() {
     print_status "desktop"  "veloce-desktop" "Tauri desktop app"
     printf "\n"
     printf "  Logs (backend):  journalctl --user -u veloce.service -f\n"
-    printf "  Logs (desktop):  journalctl --user -u veloce-desktop.service -f\n\n"
+    printf "  Logs (desktop):  journalctl --user -u veloce-desktop.service -f\n"
 }
 
 cmd_start_backend() {
@@ -84,6 +152,7 @@ cmd_start_backend() {
         ok "Dashboard: http://localhost:14921"
         return
     fi
+    check_port "backend"
     info "Starting backend coordinator..."
     svc_action start veloce
     sleep 1
@@ -108,6 +177,7 @@ cmd_start_desktop() {
         ok "Desktop app is already running."
         return
     fi
+    check_port "desktop"
     info "Starting Tauri desktop app..."
     svc_action start veloce-desktop
     sleep 2
@@ -217,7 +287,12 @@ case "$CMD" in
             ""|--backend|backend) cmd_logs "veloce" ;;
             *) err "Unknown target '$TARGET'. Use: veloce logs [--desktop]"; usage; exit 1 ;;
         esac ;;
-    status) cmd_status ;;
+    status)
+        cmd_status
+        if [ "$#" -eq 0 ] || [ -z "${2:-}" ]; then
+            printf "\n  (Run '${BOLD}veloce --help${RESET}' to see all commands)\n\n"
+        fi
+        ;;
     kill)   cmd_kill_all ;;
     help|--help|-h) usage ;;
     *) err "Unknown command '$CMD'."; usage; exit 1 ;;
