@@ -1,8 +1,40 @@
 {
   "id": "AbCd123",
-  "title": "Reel",
-  "url": "https://cdninstagram.com/reel/AbCd123.mp4",
+  "title": "Video by cool_creator",
+  "uploader": "cool_creator",
+  "description": "Sunset over the bay #travel\nSecond line ignored",
+  "url": "https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m367/AQMX70NUR9EEdgYdbx9bXNE.mp4?efg=eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmlnd3d3LUMzLmRhc2hfcjJldmV2cDktcjFnZW4ydnA5X3E5MCIsInZpZGVvX2lkIjpudWxsfQ",
   "ext": "mp4",
+  "vcodec": "vp09",
+  "acodec": "mp4a.40.5",
   "filesize": 5000000,
-  "formats": []
+  "formats": [
+    {
+      "format_id": "dash-v",
+      "url": "https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m367/video_only.mp4?efg=eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmlnd3d3LUMzLmRhc2hfcjJldmV2cDktcjFnZW4ydnA5X3E5MCIsInZpZGVvX2lkIjpudWxsfQ",
+      "ext": "mp4",
+      "vcodec": "avc1",
+      "acodec": "none",
+      "resolution": "1080x1920",
+      "filesize": 8000000
+    },
+    {
+      "format_id": "dash-a",
+      "url": "https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m367/audio.m4a",
+      "ext": "m4a",
+      "vcodec": "none",
+      "acodec": "mp4a",
+      "resolution": "audio only",
+      "filesize": 200000
+    },
+    {
+      "format_id": "progressive",
+      "url": "https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m86/combined.mp4",
+      "ext": "mp4",
+      "vcodec": "avc1",
+      "acodec": "mp4a",
+      "resolution": "720x1280",
+      "filesize": 3000000
+    }
+  ]
 }

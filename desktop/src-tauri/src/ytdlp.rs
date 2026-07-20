@@ -408,19 +408,28 @@ pub fn list_instagram_formats(url: &str, force: bool) -> Result<Vec<MediaFormat>
             err
         });
     }
-    Ok(formats)
+    // Prefer progressive video+audio — Instagram DASH video-only rows are silent.
+    Ok(finalize_combined_av_picker(formats, "instagram"))
 }
 
-/// YouTube picker: hide silent video-only DASH; add merged "Best" row (backend parity).
+/// Hide silent video-only DASH; add merged "Best" row (YouTube + Instagram parity).
 ///
 /// Best used to ship with an empty `url`, which forced a second yt-dlp (`-f b -g`)
 /// on download. We seed Best with the top progressive video+audio URL from the same
 /// `-J` pass so the extension can pass `directUrl` and skip that second extract.
-pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
+pub fn finalize_combined_av_picker(formats: Vec<MediaFormat>, source: &str) -> Vec<MediaFormat> {
     let mut combined: Vec<MediaFormat> = formats
-        .into_iter()
-        .filter(|f| f.label.contains("video+audio"))
+        .iter()
+        .filter(|f| is_combined_av_label(&f.label) && !is_instagram_silent_dash_url(&f.url))
+        .cloned()
         .collect();
+
+    if combined.is_empty() {
+        combined = formats
+            .into_iter()
+            .filter(|f| !f.label.to_lowercase().contains("audio only"))
+            .collect();
+    }
 
     combined.sort_by(|a, b| {
         let hb = parse_height(&b.label);
@@ -433,7 +442,6 @@ pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
         .map(|f| f.label.split(" — ").next().unwrap_or("video").to_string())
         .unwrap_or_else(|| "video".to_string());
 
-    // Highest progressive row after sort — same quality the menu would offer first.
     let best_url = combined
         .first()
         .map(|f| f.url.clone())
@@ -450,13 +458,27 @@ pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
         url: best_url,
         ext: best_ext,
         filesize: best_size,
-        source: Some("youtube".to_string()),
+        source: Some(source.to_string()),
         kind: Some("progressive".to_string()),
     };
 
     let mut out = vec![best];
     out.extend(combined.into_iter().take(23));
     out
+}
+
+fn is_combined_av_label(label: &str) -> bool {
+    let l = label.to_lowercase();
+    if l.contains("video only") || l.contains("audio only") {
+        return false;
+    }
+    // Explicit muxed rows, or unlabeled progressive (Instagram single-URL / top-level url).
+    true
+}
+
+/// YouTube picker wrapper — same combined A/V logic as Instagram.
+pub fn finalize_youtube_picker(formats: Vec<MediaFormat>) -> Vec<MediaFormat> {
+    finalize_combined_av_picker(formats, "youtube")
 }
 
 fn parse_height(label: &str) -> u32 {
@@ -601,12 +623,7 @@ fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, 
     // into labeled format rows so the menu can offer every slide.
     if info["_type"] == "playlist" {
         if let Some(entries) = info["entries"].as_array() {
-            let base_title = info["title"].as_str().unwrap_or("post");
-            let safe_base: String = base_title
-                .chars()
-                .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
-                .take(100)
-                .collect();
+            let base_title = get_smart_title(&info);
             let total = entries.len();
             let mut merged = Vec::new();
             for (i, entry) in entries.iter().enumerate() {
@@ -615,15 +632,15 @@ fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, 
                 } else {
                     String::new()
                 };
-                let titled = format!("{safe_base}{suffix}");
-                let mut entry_json = entry.clone();
-                if entry_json.get("title").and_then(|t| t.as_str()).unwrap_or("").is_empty() {
-                    entry_json["title"] = serde_json::Value::String(titled.clone());
+                let mut slide = entry.clone();
+                let slide_title = get_smart_title(&slide);
+                let titled = if slide_title != "video" && slide_title != "post" {
+                    format!("{slide_title}{suffix}")
                 } else {
-                    // Prefer carousel slide label for the menu stem.
-                    entry_json["title"] = serde_json::Value::String(titled);
-                }
-                if let Ok(part) = parse_formats_single(&entry_json) {
+                    format!("{base_title}{suffix}")
+                };
+                slide["title"] = serde_json::Value::String(titled);
+                if let Ok(part) = parse_formats_single(&slide) {
                     merged.extend(part);
                 }
             }
@@ -637,21 +654,91 @@ fn parse_formats(output: &str, _original_url: &str) -> Result<Vec<MediaFormat>, 
     parse_formats_single(&info)
 }
 
-fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, String> {
-    let title = info["title"].as_str().unwrap_or("video");
-    let safe_title: String = title
-        .chars()
+/// Prefer caption / uploader over Instagram's generic "Video by …" / "Reel" titles.
+fn get_smart_title(info: &serde_json::Value) -> String {
+    let uploader = info["uploader"]
+        .as_str()
+        .or_else(|| info["creator"].as_str())
+        .or_else(|| info["channel"].as_str())
+        .or_else(|| info["uploader_id"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut t = info["title"].as_str().unwrap_or("").trim().to_string();
+    let lower = t.to_lowercase();
+    let by_user = ["video by ", "photo by ", "reel by "]
+        .iter()
+        .find_map(|prefix| {
+            if !lower.starts_with(prefix) {
+                return None;
+            }
+            let rest = t[prefix.len()..].trim().to_string();
+            if rest.is_empty() {
+                None
+            } else {
+                Some(rest)
+            }
+        });
+    let generic = t.is_empty()
+        || lower == "post"
+        || lower == "reel"
+        || lower == "instagram"
+        || by_user.is_some();
+
+    if generic {
+        let desc = info["description"].as_str().unwrap_or("").trim();
+        if !desc.is_empty() {
+            let first = desc.lines().next().unwrap_or(desc).chars().take(80).collect::<String>();
+            let first = first.trim().to_string();
+            t = if !uploader.is_empty() && !first.to_lowercase().contains(&uploader.to_lowercase()) {
+                format!("{uploader} - {first}")
+            } else {
+                first
+            };
+        } else if let Some(user) = by_user {
+            t = user;
+        } else if !uploader.is_empty() {
+            t = uploader.clone();
+        } else {
+            t.clear();
+        }
+    }
+
+    let raw = if t.is_empty() {
+        if uploader.is_empty() {
+            "video".to_string()
+        } else {
+            uploader
+        }
+    } else {
+        t
+    };
+
+    raw.chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
-        .collect();
+        .take(120)
+        .collect()
+}
+
+fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, String> {
+    let safe_title = get_smart_title(info);
 
     let mut formats: Vec<MediaFormat> = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
 
-    if info["url"].is_string() && info["formats"].as_array().map_or(true, |a| a.is_empty()) {
+    // Progressive / default URL — only treat as video+audio when codecs / CDN heuristics agree.
+    // Instagram often puts a silent DASH rendition in `url` alongside real formats[].
+    if let Some(direct) = info["url"].as_str() {
         let ext = info["ext"].as_str().unwrap_or("mp4");
+        seen_urls.insert(direct.to_string());
+        let av = av_from_codecs(info.get("vcodec"), info.get("acodec"), direct)
+            .unwrap_or(AvKind::Both);
+        let av_tag = av.label();
         formats.push(MediaFormat {
             id: "0".to_string(),
-            label: format!("{safe_title} — {ext}"),
-            url: info["url"].as_str().unwrap().to_string(),
+            label: format!("{safe_title} — {av_tag} {ext}"),
+            url: direct.to_string(),
             ext: format!(".{}", ext.trim_start_matches('.')),
             filesize: info["filesize"]
                 .as_u64()
@@ -659,7 +746,9 @@ fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, St
             source: None,
             kind: Some("progressive".to_string()),
         });
-        return Ok(formats);
+        if info["formats"].as_array().map_or(true, |a| a.is_empty()) {
+            return Ok(formats);
+        }
     }
 
     if let Some(raw) = info["formats"].as_array() {
@@ -667,24 +756,19 @@ fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, St
             if !f["url"].is_string() {
                 continue;
             }
+            let format_url = f["url"].as_str().unwrap();
+            if seen_urls.contains(format_url) {
+                continue;
+            }
             let format_id = f["format_id"].as_str().unwrap_or("");
             if f["ext"] == "mhtml" || f["format_note"] == "storyboard" || format_id.starts_with("sb")
             {
                 continue;
             }
-            let has_video = f["vcodec"].as_str().map(|c| c != "none").unwrap_or(false);
-            let has_audio = f["acodec"].as_str().map(|c| c != "none").unwrap_or(false);
-            if !has_video && !has_audio {
+            let Some(av) = av_from_codecs(f.get("vcodec"), f.get("acodec"), format_url) else {
                 continue;
-            }
-
-            let av_tag = if has_video && has_audio {
-                "video+audio"
-            } else if has_video {
-                "video only"
-            } else {
-                "audio only"
             };
+            let av_tag = av.label();
             let resolution = f["resolution"].as_str().unwrap_or("");
             let filesize = f["filesize"]
                 .as_u64()
@@ -693,7 +777,19 @@ fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, St
             let size_str = filesize
                 .map(|s| format!(" · {}", crate::util::format_bytes(s)))
                 .unwrap_or_default();
-            let label = format!("{safe_title} — {} {}{}", resolution, av_tag, size_str);
+
+            let mut parts: Vec<&str> = Vec::new();
+            if !resolution.is_empty() && resolution != "audio only" {
+                parts.push(resolution);
+            }
+            parts.push(av_tag);
+            parts.push(ext);
+            let body = parts.join(" ");
+            let label = if size_str.is_empty() {
+                format!("{safe_title} — {body}")
+            } else {
+                format!("{safe_title} — {body}{size_str}")
+            };
 
             let kind = if f["protocol"]
                 .as_str()
@@ -705,10 +801,11 @@ fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, St
                 "progressive"
             };
 
+            seen_urls.insert(format_url.to_string());
             formats.push(MediaFormat {
                 id: format_id.to_string(),
                 label: label.trim().to_string(),
-                url: f["url"].as_str().unwrap().to_string(),
+                url: format_url.to_string(),
                 ext: format!(".{}", ext.trim_start_matches('.')),
                 filesize,
                 source: None,
@@ -719,6 +816,82 @@ fn parse_formats_single(info: &serde_json::Value) -> Result<Vec<MediaFormat>, St
 
     formats.sort_by(|a, b| b.filesize.unwrap_or(0).cmp(&a.filesize.unwrap_or(0)));
     Ok(formats)
+}
+
+#[derive(Clone, Copy)]
+enum AvKind {
+    Both,
+    Video,
+    Audio,
+}
+
+impl AvKind {
+    fn label(self) -> &'static str {
+        match self {
+            AvKind::Both => "video+audio",
+            AvKind::Video => "video only",
+            AvKind::Audio => "audio only",
+        }
+    }
+}
+
+/// Instagram CDN: `efg` embeds vencode_tag with `dash_…` for silent video-only DASH.
+pub fn is_instagram_silent_dash_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if !(host.contains("instagram.") || host.contains("fbcdn.net") || host.contains("cdninstagram"))
+    {
+        return false;
+    }
+    if parsed.path().to_lowercase().contains(".m4a") {
+        return false;
+    }
+    let Some(efg) = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "efg")
+        .map(|(_, v)| v.into_owned())
+    else {
+        return false;
+    };
+    use base64::Engine as _;
+    let padded = {
+        let pad = (4 - (efg.len() % 4)) % 4;
+        format!("{efg}{}", "=".repeat(pad))
+    };
+    let std = padded.replace('-', "+").replace('_', "/");
+    base64::engine::general_purpose::STANDARD
+        .decode(std.as_bytes())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| s.to_lowercase().contains("dash_"))
+        .unwrap_or(false)
+}
+
+fn av_from_codecs(
+    vcodec: Option<&serde_json::Value>,
+    acodec: Option<&serde_json::Value>,
+    url: &str,
+) -> Option<AvKind> {
+    let has_video = vcodec.and_then(|v| v.as_str()).map(|c| c != "none").unwrap_or(false);
+    let has_audio = acodec.and_then(|v| v.as_str()).map(|c| c != "none").unwrap_or(false);
+    if has_video || has_audio {
+        if has_video && has_audio && is_instagram_silent_dash_url(url) {
+            return Some(AvKind::Video);
+        }
+        return Some(if has_video && has_audio {
+            AvKind::Both
+        } else if has_video {
+            AvKind::Video
+        } else {
+            AvKind::Audio
+        });
+    }
+    if is_instagram_silent_dash_url(url) {
+        return Some(AvKind::Video);
+    }
+    None
 }
 
 #[allow(dead_code)]
@@ -802,14 +975,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_instagram_direct_single_url() {
+    fn parse_instagram_prefers_caption_title_and_keeps_progressive() {
         let formats =
             parse_formats(INSTAGRAM_DIRECT, "https://www.instagram.com/reel/AbCd/").unwrap();
-        assert_eq!(formats.len(), 1);
-        assert_eq!(formats[0].ext, ".mp4");
-        assert!(formats[0].url.starts_with("https://"));
-        assert!(formats[0].label.contains("Reel"));
-        assert_eq!(formats[0].filesize, Some(5_000_000));
+        // Top-level silent dash (reclassified) + dash-v + dash-a + progressive
+        assert!(formats.len() >= 3);
+        assert!(formats.iter().any(|f| f.label.contains("cool_creator")));
+        assert!(formats.iter().any(|f| f.label.contains("Sunset over the bay")));
+        let progressive = formats.iter().find(|f| f.id == "progressive").unwrap();
+        assert!(progressive.url.contains("combined.mp4"));
+        assert!(progressive.label.contains("video+audio"));
+        // Top-level url has dash_ in efg — must not be offered as video+audio.
+        let top = formats.iter().find(|f| f.id == "0").unwrap();
+        assert!(top.label.contains("video only"));
+        assert!(is_instagram_silent_dash_url(&top.url));
+    }
+
+    #[test]
+    fn finalize_instagram_picker_hides_silent_dash() {
+        let formats =
+            parse_formats(INSTAGRAM_DIRECT, "https://www.instagram.com/reel/AbCd/").unwrap();
+        let out = finalize_combined_av_picker(formats, "instagram");
+        assert_eq!(out[0].id, "best");
+        assert!(out[0].url.contains("combined.mp4"));
+        assert_eq!(out[0].source.as_deref(), Some("instagram"));
+        assert!(out.iter().any(|f| f.id == "progressive"));
+        assert!(!out.iter().any(|f| f.label.contains("video only")));
+        assert!(!out.iter().any(|f| f.label.contains("audio only")));
+        assert!(!out.iter().any(|f| is_instagram_silent_dash_url(&f.url)));
     }
 
     #[test]

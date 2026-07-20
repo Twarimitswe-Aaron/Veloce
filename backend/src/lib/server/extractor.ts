@@ -635,15 +635,37 @@ function runYtDlpJson(
 	return { promise, kill, getError };
 }
 
+/** Prefer caption / uploader over Instagram's generic "Video by …" / "Reel" titles. */
 function getSmartTitle(info: Record<string, unknown>): string {
-	let t = (info.title as string) || '';
-	if (t.startsWith('Video by ') || t === 'post' || !t) {
-		const desc = (info.description as string) || '';
-		if (desc.trim().length > 0) {
-			t = desc.trim().split('\n')[0].slice(0, 80).trim();
+	const uploader = String(
+		info.uploader || info.creator || info.channel || info.uploader_id || ''
+	).trim();
+	let t = String(info.title || '').trim();
+	const byMatch = t.match(/^(?:Video|Photo|Reel) by\s+(.+)$/i);
+	const generic =
+		!t ||
+		t === 'post' ||
+		/^reel$/i.test(t) ||
+		/^instagram$/i.test(t) ||
+		!!byMatch;
+
+	if (generic) {
+		const desc = String(info.description || '').trim();
+		if (desc) {
+			t = desc.split('\n')[0].slice(0, 80).trim();
+			if (uploader && !t.toLowerCase().includes(uploader.toLowerCase())) {
+				t = `${uploader} - ${t}`;
+			}
+		} else if (byMatch?.[1]) {
+			t = byMatch[1].trim();
+		} else if (uploader) {
+			t = uploader;
+		} else {
+			t = '';
 		}
 	}
-	return t || 'video';
+
+	return (t || uploader || 'video').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
 }
 
 function parseYtDlpFormats(output: string): MediaFormat[] {
@@ -671,48 +693,91 @@ function parseYtDlpFormats(output: string): MediaFormat[] {
 	return dedupeFormats(formatsFromInfo(info, getSmartTitle(info)));
 }
 
+/**
+ * Instagram CDN: `efg` embeds vencode_tag with `dash_…` for silent video-only DASH.
+ * Progressive muxed clips do not use that tag — catching it avoids labeling those as video+audio.
+ */
+export function isInstagramSilentDashUrl(url: string): boolean {
+	try {
+		const u = new URL(url);
+		if (!/instagram\.|fbcdn\.net|cdninstagram/i.test(u.hostname)) return false;
+		if (/\.m4a(\?|$)/i.test(u.pathname)) return false;
+		const efg = u.searchParams.get('efg');
+		if (!efg) return false;
+		const pad = '='.repeat((4 - (efg.length % 4)) % 4);
+		const raw = Buffer.from(efg.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64').toString('utf8');
+		return /dash_/i.test(raw);
+	} catch {
+		return false;
+	}
+}
+
+function avFromCodecs(
+	vcodec: unknown,
+	acodec: unknown,
+	url: string
+): AvStream | null {
+	const hasVideo = typeof vcodec === 'string' && vcodec !== 'none';
+	const hasAudio = typeof acodec === 'string' && acodec !== 'none';
+	if (hasVideo || hasAudio) {
+		if (hasVideo && hasAudio && isInstagramSilentDashUrl(url)) return 'video';
+		return hasVideo && hasAudio ? 'both' : hasVideo ? 'video' : 'audio';
+	}
+	if (isInstagramSilentDashUrl(url)) return 'video';
+	return null;
+}
+
 function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFormat[] {
-	const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
+	const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || 'video';
 	const raw = (info.formats as Record<string, unknown>[]) ?? [];
 	const out: MediaFormat[] = [];
+	const seenUrls = new Set<string>();
 
-	// Single direct URL (some extractors skip the formats array).
+	// Progressive / default URL — only treat as video+audio when codecs (or CDN heuristics) say so.
+	// Instagram often puts a silent DASH rendition in `url` alongside real formats[].
 	const directUrl = info.url as string | undefined;
 	const directExt = (info.ext as string) || 'mp4';
-	if (directUrl && raw.length === 0) {
+	if (directUrl) {
+		seenUrls.add(directUrl);
+		const av = avFromCodecs(info.vcodec, info.acodec, directUrl) ?? 'both';
+		const avTag = av === 'video' ? 'video only' : av === 'audio' ? 'audio only' : 'video+audio';
 		out.push({
 			id: '0',
-			label: `${safeTitle} — ${directExt}`,
+			label: `${safeTitle} — ${avTag} ${directExt}`,
 			url: directUrl,
-			ext: directExt.startsWith('.') ? directExt : `.${directExt}`
+			ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
+			filesize: (info.filesize || info.filesize_approx) as number | undefined,
+			av,
+			kind: 'progressive'
 		});
 	}
 
 	for (const f of raw) {
 		if (!f.url) continue;
+		const formatUrl = f.url as string;
+		if (seenUrls.has(formatUrl)) continue;
 		const formatId = String(f.format_id ?? '');
 		if (f.ext === 'mhtml' || f.format_note === 'storyboard' || formatId.startsWith('sb')) continue;
-		const hasVideo = f.vcodec && f.vcodec !== 'none';
-		const hasAudio = f.acodec && f.acodec !== 'none';
-		if (!hasVideo && !hasAudio) continue;
+		const av = avFromCodecs(f.vcodec, f.acodec, formatUrl);
+		if (!av) continue;
 
-		const av: AvStream = hasVideo && hasAudio ? 'both' : hasVideo ? 'video' : 'audio';
 		const res = f.resolution && f.resolution !== 'audio only' ? f.resolution : '';
 		const avTag = av === 'video' ? 'video only' : av === 'audio' ? 'audio only' : 'video+audio';
 		const size = (f.filesize || f.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const ext = (f.ext as string) || 'mp4';
-		const labelParts = [res, av === 'both' ? '' : avTag, ext, sizeStr].filter(Boolean);
+		const labelParts = [res, avTag, ext, sizeStr].filter(Boolean);
 		const label = labelParts.join(' ');
 
+		seenUrls.add(formatUrl);
 		out.push({
 			id: String(f.format_id),
 			label: `${safeTitle} — ${label}`.trim(),
-			url: f.url as string,
+			url: formatUrl,
 			ext: ext.startsWith('.') ? ext : `.${ext}`,
 			filesize: size,
 			av,
-			kind: inferFormatKind(f.url as string, f.protocol as string | undefined)
+			kind: inferFormatKind(formatUrl, f.protocol as string | undefined)
 		});
 	}
 
@@ -861,12 +926,26 @@ function parseFormatHeight(label: string): number {
 	return 0;
 }
 
-/** YouTube picker: hide silent video-only DASH streams; offer a merged "best" row.
+/** True for progressive / muxed rows the range engine can download with sound. */
+function isCombinedAvFormat(f: MediaFormat): boolean {
+	if (isInstagramSilentDashUrl(f.url)) return false;
+	if (f.av === 'both') return true;
+	if (f.av === 'video' || f.av === 'audio') return false;
+	return !/\bvideo only\b|\baudio only\b/i.test(f.label);
+}
+
+/** Hide silent video-only DASH; offer a merged "Best" row (YouTube + Instagram).
  * Seed Best.url from the top progressive so Best clicks pass directUrl and skip
  * a second yt-dlp `-f b -g` (that used to double latency after listing).
  */
-function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
-	const combined = dedupeFormats(formats.filter((f) => f.av === 'both'));
+function combinedAvPickerFormats(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
+	let combined = dedupeFormats(formats.filter(isCombinedAvFormat));
+	// Last resort: still hide pure audio-only so the menu stays video-first.
+	if (combined.length === 0) {
+		combined = dedupeFormats(
+			formats.filter((f) => f.av !== 'audio' && !/\baudio only\b/i.test(f.label))
+		);
+	}
 	combined.sort((a, b) => {
 		const hb = parseFormatHeight(b.label);
 		const ha = parseFormatHeight(a.label);
@@ -881,7 +960,7 @@ function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
 		url: top?.url || '',
 		ext: top?.ext || '.mp4',
 		filesize: top?.filesize,
-		source: 'youtube',
+		source,
 		kind: 'progressive',
 		av: 'both'
 	};
@@ -889,7 +968,9 @@ function youtubePickerFormats(formats: MediaFormat[]): MediaFormat[] {
 }
 
 export function finalizeFormatsForPicker(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
-	if (source === 'youtube') return youtubePickerFormats(formats);
+	if (source === 'youtube' || source === 'instagram') {
+		return combinedAvPickerFormats(formats, source);
+	}
 	const sorted = dedupeFormats([...formats]);
 	sorted.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
 	return sorted.slice(0, 40);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isDirectFileUrl, isExtractorDomain, normalizeFormatUrl, finalizeFormatsForPicker, type MediaFormat } from '../src/lib/server/extractor';
+import { isDirectFileUrl, isExtractorDomain, normalizeFormatUrl, finalizeFormatsForPicker, isInstagramSilentDashUrl, type MediaFormat } from '../src/lib/server/extractor';
 
 describe('isDirectFileUrl', () => {
 	it('detects direct media/file links by extension', () => {
@@ -80,5 +80,75 @@ describe('finalizeFormatsForPicker', () => {
 		expect(out.some((f) => f.id === '137')).toBe(false);
 		expect(out.some((f) => f.id === '18')).toBe(true);
 		expect(out.some((f) => f.id === '140')).toBe(false);
+	});
+
+	it('hides Instagram video-only DASH and prefers video+audio', () => {
+		const raw: MediaFormat[] = [
+			{
+				id: 'dash-v',
+				label: 'Clip — 1080x1920 video only mp4 · 8 MB',
+				url: 'https://cdn.example/v.mp4',
+				ext: '.mp4',
+				av: 'video',
+				filesize: 8_000_000
+			},
+			{
+				id: 'dash-a',
+				label: 'Clip — audio only m4a',
+				url: 'https://cdn.example/a.m4a',
+				ext: '.m4a',
+				av: 'audio'
+			},
+			{
+				id: '0',
+				label: 'Clip — video+audio mp4 · 3 MB',
+				url: 'https://cdn.example/combined.mp4',
+				ext: '.mp4',
+				av: 'both',
+				filesize: 3_000_000
+			}
+		];
+		const out = finalizeFormatsForPicker(raw, 'instagram');
+		expect(out[0]?.id).toBe('best');
+		expect(out[0]?.url).toBe('https://cdn.example/combined.mp4');
+		expect(out[0]?.source).toBe('instagram');
+		expect(out.some((f) => f.id === '0')).toBe(true);
+		expect(out.some((f) => f.id === 'dash-v')).toBe(false);
+		expect(out.some((f) => f.id === 'dash-a')).toBe(false);
+	});
+
+	it('rejects Instagram CDN URLs whose efg marks silent DASH', () => {
+		const dashEfg =
+			'eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmlnd3d3LUMzLmRhc2hfcjJldmV2cDktcjFnZW4ydnA5X3E5MCIsInZpZGVvX2lkIjpudWxsfQ';
+		const dashUrl = `https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m367/x.mp4?efg=${dashEfg}`;
+		expect(isInstagramSilentDashUrl(dashUrl)).toBe(true);
+		expect(isInstagramSilentDashUrl('https://cdn.example.com/x.mp4')).toBe(false);
+		expect(
+			isInstagramSilentDashUrl(
+				'https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m367/x.m4a?efg=' + dashEfg
+			)
+		).toBe(false);
+
+		const out = finalizeFormatsForPicker(
+			[
+				{
+					id: '0',
+					label: 'Throwback — video+audio mp4',
+					url: dashUrl,
+					ext: '.mp4',
+					av: 'both'
+				},
+				{
+					id: '18',
+					label: 'Throwback — video+audio mp4',
+					url: 'https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m86/combined.mp4',
+					ext: '.mp4',
+					av: 'both'
+				}
+			],
+			'instagram'
+		);
+		expect(out[0]?.url).toContain('combined.mp4');
+		expect(out.some((f) => f.url === dashUrl)).toBe(false);
 	});
 });
