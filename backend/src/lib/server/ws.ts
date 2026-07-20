@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
-import { db } from './db';
+import { db, dbInit } from './db';
 import { downloads, devices, playlistJobs } from './db/schema';
 import { getMacAddress } from './identity';
 import { eq, sql, inArray } from 'drizzle-orm';
@@ -11,6 +11,17 @@ import { statfs, unlink, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
+
+const origLog = console.log;
+const origError = console.error;
+const origWarn = console.warn;
+function logWithTime(orig: any, ...args: any[]) {
+	orig(`[${new Date().toISOString()}]`, ...args);
+}
+console.log = (...args) => logWithTime(origLog, ...args);
+console.error = (...args) => logWithTime(origError, ...args);
+console.warn = (...args) => logWithTime(origWarn, ...args);
+
 import { extractMediaUrl, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl } from './extractor';
 import {
 	defaultPlaylistFormatSettings,
@@ -850,11 +861,11 @@ export function setupWebSocketServer(server: Server) {
 
 	if (!reconciled) {
 		reconciled = true;
-		void reconcileInterrupted();
+		dbInit.then(() => reconcileInterrupted());
 	}
 	if (!dbCleaned) {
 		dbCleaned = true;
-		void runDatabaseCleanup();
+		dbInit.then(() => runDatabaseCleanup());
 	}
 
 	wss.on('connection', async (ws, req) => {
@@ -864,6 +875,7 @@ export function setupWebSocketServer(server: Server) {
 		const macAddress = getMacAddress();
 
 		try {
+			await dbInit;
 			const deviceResult = await db.select().from(devices).where(eq(devices.id, macAddress));
 			if (deviceResult.length === 0) {
 				await db.insert(devices).values({ id: macAddress, createdAt: new Date(), lastActive: new Date(), settings: {} });

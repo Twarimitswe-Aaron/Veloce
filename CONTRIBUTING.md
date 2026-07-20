@@ -7,7 +7,7 @@ Thanks for helping improve Veloce. Most real-world issues are **site-specific** 
 ## What you need running locally
 
 ```bash
-./scripts/setup.sh
+./scripts/linux/setup.sh
 
 # Terminal 1 — coordinator + dashboard
 cd backend && npm run dev

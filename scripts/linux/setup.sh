@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Veloce one-command setup: installs all prerequisites, builds the Rust engine,
 # installs JS deps, and builds the browser extension.
-# Run from anywhere: ./scripts/setup.sh
+# Run from anywhere: ./scripts/linux/setup.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 info()  { printf '\033[1;36m[veloce]\033[0m %s\n' "$*"; }
@@ -212,15 +212,15 @@ if [ ! -f backend/.env ] && [ -f backend/.env.example ]; then
 fi
 
 # ── Auto-install systemd user services and CLI manager ────────────────────────
-SVC_SRC="$ROOT/scripts/veloce.service"
+SVC_SRC="$ROOT/scripts/linux/veloce.service"
 SVC_DEST="$HOME/.config/systemd/user/veloce.service"
-SVC_DESKTOP_SRC="$ROOT/scripts/veloce-desktop.service"
+SVC_DESKTOP_SRC="$ROOT/scripts/linux/veloce-desktop.service"
 SVC_DESKTOP_DEST="$HOME/.config/systemd/user/veloce-desktop.service"
 PM_BIN="$(command -v "$PM")"   # absolute path to pnpm/npm
 
 install_cli_manager() {
 	mkdir -p "$HOME/.local/bin"
-	cp "$ROOT/scripts/veloce.sh" "$HOME/.local/bin/veloce"
+	cp "$ROOT/scripts/linux/veloce.sh" "$HOME/.local/bin/veloce"
 	chmod +x "$HOME/.local/bin/veloce"
 	info "Installed 'veloce' CLI tool to $HOME/.local/bin/veloce"
 }

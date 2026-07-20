@@ -18,7 +18,7 @@ Everything runs on **your PC** — no cloud queue, no account, no subscription.
 
 ## Getting Started
 
-1. **Install:** Run `./scripts/setup.sh` to install dependencies, build the core engine, and set up the systemd services.
+1. **Install:** Run `./scripts/linux/setup.sh` to install dependencies, build the core engine, and set up the systemd services.
 2. **Manage Processes:** Use the installed `veloce` CLI to control the background services:
 
 ```bash
@@ -81,7 +81,7 @@ We need help when:
 
 **Quick start for contributors:**
 
-1. Fork / clone, run `./scripts/setup.sh`
+1. Fork / clone, run `./scripts/linux/setup.sh`
 2. Read **[CONTRIBUTING.md](./CONTRIBUTING.md)** — reporting bugs, which file to edit, site handler patterns
 3. For format/extraction deep dives, see **[AGENTS.md](./AGENTS.md)** — platform signatures, cache rules, DOM tables
 4. Open a PR with a test URL, before/after notes, and tests if you touch `backend/` or `core_engine/`
@@ -335,23 +335,13 @@ These are the failure modes that bite naive downloaders. Each is handled so the 
 
 ## 🛠️ Setup
 
-One command builds the engine, installs dependencies and builds the extension:
+One command builds the engine, installs dependencies, builds the extension, and automatically installs the Linux systemd services:
 
 ```bash
-./scripts/setup.sh
+./scripts/linux/setup.sh
 ```
 
-It checks prerequisites (`cargo`, `node`, `pnpm`/`npm`, and warns if `yt-dlp` is missing), builds `core_engine`, installs the backend + extension deps, builds the extension into `extension/build`, and scaffolds `backend/.env`.
-
-**Run the coordinator on login** (Linux, systemd user service):
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp scripts/veloce.service ~/.config/systemd/user/veloce.service
-# edit WorkingDirectory / ExecStart paths inside, then:
-systemctl --user daemon-reload
-systemctl --user enable --now veloce.service
-```
+It checks prerequisites (`cargo`, `node`, `pnpm`/`npm`, and warns if `yt-dlp` is missing), builds `core_engine`, installs the backend + extension deps, builds the extension into `extension/build`, scaffolds `backend/.env`, and sets up `veloce` CLI and `veloce.service` user services.
 
 ## 🧪 Testing
 

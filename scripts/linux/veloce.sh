@@ -171,7 +171,7 @@ cmd_start_desktop() {
     have_systemd || die "systemd required for managed start."
     # Check if the desktop service unit is installed
     if ! systemctl --user cat veloce-desktop.service >/dev/null 2>&1; then
-        die "veloce-desktop.service is not installed. Re-run: ./scripts/setup.sh"
+        die "veloce-desktop.service is not installed. Re-run: ./scripts/linux/setup.sh"
     fi
     if svc_active "veloce-desktop"; then
         ok "Desktop app is already running."

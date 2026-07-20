@@ -254,6 +254,9 @@ Agents working on a site should **inspect the live DOM** (DevTools → Elements,
 
 ## Desktop Native App (Phase 3 — Tauri 2 + Rust coordinator)
 
+> **CRITICAL RULE**: Any logic change made in the `backend/` (Node.js) MUST also be replicated and tested in the `desktop/` (Tauri/Rust) app so that both coordinators stay perfectly in sync. Always test changes thoroughly in both environments!
+
+
 ### Architecture (`desktop/`)
 
 ```

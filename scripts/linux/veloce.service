@@ -2,7 +2,7 @@
 #
 # Install (Linux):
 #   mkdir -p ~/.config/systemd/user
-#   cp scripts/veloce.service ~/.config/systemd/user/veloce.service
+#   cp scripts/linux/veloce.service ~/.config/systemd/user/veloce.service
 #   # Edit WorkingDirectory + ExecStart below to match your install path and
 #   # package manager, then:
 #   systemctl --user daemon-reload
@@ -19,7 +19,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Paths below are stamped automatically by scripts/setup.sh — do not edit manually.
+# Paths below are stamped automatically by scripts/linux/setup.sh — do not edit manually.
 WorkingDirectory=__VELOCE_WORKDIR__
 ExecStart=__VELOCE_EXECSTART__
 Restart=on-failure

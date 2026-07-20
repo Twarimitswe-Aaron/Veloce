@@ -571,7 +571,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
 
             let mut last_tune = Instant::now();
             let mut last_tune_speed: f64 = 0.0;
-            let mut probing_up = false;
+            let mut max_speed_reached: f64 = 0.0;
+            let mut locked_optimum_speed: f64 = 0.0;
+            let mut locked = false;
+            let mut consecutive_drops: u8 = 0;
+            let mut re_probe_ticks: u8 = 0;
 
             loop {
                 ticker.tick().await;
@@ -648,7 +652,11 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     let limit = adaptive.current_limit();
                     let ceiling = adaptive.ceiling();
 
-                    if probing_up {
+                    if smoothed_speed > max_speed_reached {
+                        max_speed_reached = smoothed_speed;
+                    }
+
+                    if !locked {
                         if smoothed_speed > (last_tune_speed * 1.05) && last_tune_speed > 1024.0 {
                             if limit < ceiling {
                                 adaptive.set_limit(limit + 1);
@@ -659,14 +667,40 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                             if limit > 1 {
                                 adaptive.set_limit(limit - 1);
                             }
-                            probing_up = false;
-                            eprintln!("   🛑 Auto-tune: Bandwidth ceiling reached at {:.1} MB/s. Stepping back to {} connections.", smoothed_speed / 1_048_576.0, limit.saturating_sub(1).max(1));
+                            locked = true;
+                            locked_optimum_speed = smoothed_speed.max(last_tune_speed);
+                            consecutive_drops = 0;
+                            re_probe_ticks = 0;
+                            eprintln!("   🔒 Auto-tune: Locked optimal connections at {} (Speed: {:.1} MB/s).", limit.saturating_sub(1).max(1), locked_optimum_speed / 1_048_576.0);
                         }
-                    } else if limit < ceiling {
-                        probing_up = true;
-                        adaptive.set_limit(limit + 1);
-                        slot_notify.notify_waiters();
-                        eprintln!("   🔍 Auto-tune: Probing for more bandwidth ({} -> {} connections).", limit, limit + 1);
+                    } else {
+                        if smoothed_speed < (locked_optimum_speed * 0.85) && locked_optimum_speed > 1024.0 {
+                            consecutive_drops += 1;
+                        } else {
+                            consecutive_drops = 0;
+                        }
+
+                        if consecutive_drops >= 2 {
+                            if limit > 1 {
+                                adaptive.set_limit(limit - 1);
+                                locked_optimum_speed = smoothed_speed;
+                                consecutive_drops = 0;
+                                re_probe_ticks = 0;
+                                eprintln!("   📉 Auto-tune: Speed degraded to {:.1} MB/s. Reducing to {} connections.", smoothed_speed / 1_048_576.0, limit - 1);
+                            } else {
+                                locked_optimum_speed = smoothed_speed;
+                                consecutive_drops = 0;
+                            }
+                        } else {
+                            re_probe_ticks += 1;
+                            if re_probe_ticks >= 15 && limit < ceiling {
+                                if smoothed_speed < (max_speed_reached * 0.90) {
+                                    eprintln!("   🔍 Auto-tune: Re-probing for more bandwidth to reach historic max {:.1} MB/s...", max_speed_reached / 1_048_576.0);
+                                    locked = false;
+                                }
+                                re_probe_ticks = 0;
+                            }
+                        }
                     }
 
                     last_tune = Instant::now();

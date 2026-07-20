@@ -8,7 +8,7 @@ Native desktop app with an embedded Rust coordinator and WebSocket server for th
 
 **Primary method (managed background service):**
 
-The easiest way to run the desktop app is using the `veloce` process manager installed by `scripts/setup.sh`:
+The easiest way to run the desktop app is using the `veloce` process manager installed by `scripts/linux/setup.sh`:
 
 ```bash
 veloce start --desktop

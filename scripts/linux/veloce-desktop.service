@@ -1,6 +1,6 @@
 # Veloce Desktop App — systemd *user* service.
 #
-# Installed automatically by scripts/setup.sh
+# Installed automatically by scripts/linux/setup.sh
 # Paths below are stamped by setup.sh — do not edit manually.
 
 [Unit]
@@ -11,7 +11,7 @@ Wants=veloce.service
 
 [Service]
 Type=simple
-# Paths stamped by scripts/setup.sh
+# Paths stamped by scripts/linux/setup.sh
 WorkingDirectory=__VELOCE_DESKTOP_WORKDIR__
 ExecStart=__VELOCE_DESKTOP_EXECSTART__
 Restart=on-failure
