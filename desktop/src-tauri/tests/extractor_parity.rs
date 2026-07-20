@@ -60,7 +60,7 @@ fn backend_parity_youtube_picker() {
     let raw = vec![
         MediaFormat {
             id: "137".into(),
-            label: "Song — 1920x1080 webm · 200 MB".into(),
+            label: "Song — 1920x1080 video only webm · 200 MB".into(),
             url: "https://v.example/v".into(),
             ext: ".webm".into(),
             filesize: Some(200_000_000),
@@ -69,7 +69,7 @@ fn backend_parity_youtube_picker() {
         },
         MediaFormat {
             id: "18".into(),
-            label: "Song — 640x360 video+audio mp4 · 11 MB".into(),
+            label: "Song — 640x360 mp4 · 11 MB".into(),
             url: "https://v.example/p".into(),
             ext: ".mp4".into(),
             filesize: Some(11_000_000),
@@ -88,6 +88,7 @@ fn backend_parity_youtube_picker() {
     ];
     let out = ytdlp::finalize_youtube_picker(raw);
     assert_eq!(out[0].id, "best");
+    assert_eq!(out[0].label, "Song — Best");
     assert_eq!(out[0].url, "https://v.example/p");
     assert!(out.iter().any(|f| f.id == "18"));
     assert!(!out.iter().any(|f| f.id == "137"));

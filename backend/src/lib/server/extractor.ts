@@ -733,23 +733,25 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 	const out: MediaFormat[] = [];
 	const seenUrls = new Set<string>();
 
-	// Progressive / default URL — only treat as video+audio when codecs (or CDN heuristics) say so.
-	// Instagram often puts a silent DASH rendition in `url` alongside real formats[].
+	// Progressive / default URL — only list muxed A/V (never silent DASH / audio-only).
 	const directUrl = info.url as string | undefined;
 	const directExt = (info.ext as string) || 'mp4';
 	if (directUrl) {
 		seenUrls.add(directUrl);
 		const av = avFromCodecs(info.vcodec, info.acodec, directUrl) ?? 'both';
-		const avTag = av === 'video' ? 'video only' : av === 'audio' ? 'audio only' : 'video+audio';
-		out.push({
-			id: '0',
-			label: `${safeTitle} — ${avTag} ${directExt}`,
-			url: directUrl,
-			ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
-			filesize: (info.filesize || info.filesize_approx) as number | undefined,
-			av,
-			kind: 'progressive'
-		});
+		if (av === 'both') {
+			const size = (info.filesize || info.filesize_approx) as number | undefined;
+			const sizeStr = size ? ` · ${formatBytes(size)}` : '';
+			out.push({
+				id: '0',
+				label: `${safeTitle} — ${directExt}${sizeStr}`.trim(),
+				url: directUrl,
+				ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
+				filesize: size,
+				av: 'both',
+				kind: 'progressive'
+			});
+		}
 	}
 
 	for (const f of raw) {
@@ -759,14 +761,13 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 		const formatId = String(f.format_id ?? '');
 		if (f.ext === 'mhtml' || f.format_note === 'storyboard' || formatId.startsWith('sb')) continue;
 		const av = avFromCodecs(f.vcodec, f.acodec, formatUrl);
-		if (!av) continue;
+		if (av !== 'both') continue;
 
-		const res = f.resolution && f.resolution !== 'audio only' ? f.resolution : '';
-		const avTag = av === 'video' ? 'video only' : av === 'audio' ? 'audio only' : 'video+audio';
+		const res = f.resolution && f.resolution !== 'audio only' ? String(f.resolution) : '';
 		const size = (f.filesize || f.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const ext = (f.ext as string) || 'mp4';
-		const labelParts = [res, avTag, ext, sizeStr].filter(Boolean);
+		const labelParts = [res, ext, sizeStr].filter(Boolean);
 		const label = labelParts.join(' ');
 
 		seenUrls.add(formatUrl);
@@ -776,7 +777,7 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 			url: formatUrl,
 			ext: ext.startsWith('.') ? ext : `.${ext}`,
 			filesize: size,
-			av,
+			av: 'both',
 			kind: inferFormatKind(formatUrl, f.protocol as string | undefined)
 		});
 	}
@@ -934,29 +935,25 @@ function isCombinedAvFormat(f: MediaFormat): boolean {
 	return !/\bvideo only\b|\baudio only\b/i.test(f.label);
 }
 
-/** Hide silent video-only DASH; offer a merged "Best" row (YouTube + Instagram).
+/** Hide silent video-only / audio-only streams; offer a "Best" row (YouTube + Instagram).
  * Seed Best.url from the top progressive so Best clicks pass directUrl and skip
  * a second yt-dlp `-f b -g` (that used to double latency after listing).
+ * Never falls back to video-only — those downloads have no sound.
  */
 function combinedAvPickerFormats(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
-	let combined = dedupeFormats(formats.filter(isCombinedAvFormat));
-	// Last resort: still hide pure audio-only so the menu stays video-first.
-	if (combined.length === 0) {
-		combined = dedupeFormats(
-			formats.filter((f) => f.av !== 'audio' && !/\baudio only\b/i.test(f.label))
-		);
-	}
+	const combined = dedupeFormats(formats.filter(isCombinedAvFormat));
 	combined.sort((a, b) => {
 		const hb = parseFormatHeight(b.label);
 		const ha = parseFormatHeight(a.label);
 		if (hb !== ha) return hb - ha;
 		return (b.filesize ?? 0) - (a.filesize ?? 0);
 	});
+	if (combined.length === 0) return [];
 	const titleStem = combined[0]?.label.split(' — ')[0] || 'video';
 	const top = combined[0];
 	const best: MediaFormat = {
 		id: 'best',
-		label: `${titleStem} — Best (video + audio)`,
+		label: `${titleStem} — Best`,
 		url: top?.url || '',
 		ext: top?.ext || '.mp4',
 		filesize: top?.filesize,

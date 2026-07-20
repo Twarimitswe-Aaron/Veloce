@@ -75,6 +75,7 @@ describe('finalizeFormatsForPicker', () => {
 		];
 		const out = finalizeFormatsForPicker(raw, 'youtube');
 		expect(out[0]?.id).toBe('best');
+		expect(out[0]?.label).toBe('Song — Best');
 		// Best is seeded from the top progressive URL so download can skip a second yt-dlp.
 		expect(out[0]?.url).toBe('https://v.example/p');
 		expect(out.some((f) => f.id === '137')).toBe(false);
@@ -82,7 +83,7 @@ describe('finalizeFormatsForPicker', () => {
 		expect(out.some((f) => f.id === '140')).toBe(false);
 	});
 
-	it('hides Instagram video-only DASH and prefers video+audio', () => {
+	it('hides Instagram video-only DASH and prefers muxed video', () => {
 		const raw: MediaFormat[] = [
 			{
 				id: 'dash-v',
@@ -101,7 +102,7 @@ describe('finalizeFormatsForPicker', () => {
 			},
 			{
 				id: '0',
-				label: 'Clip — video+audio mp4 · 3 MB',
+				label: 'Clip — 720x1280 mp4 · 3 MB',
 				url: 'https://cdn.example/combined.mp4',
 				ext: '.mp4',
 				av: 'both',
@@ -110,11 +111,13 @@ describe('finalizeFormatsForPicker', () => {
 		];
 		const out = finalizeFormatsForPicker(raw, 'instagram');
 		expect(out[0]?.id).toBe('best');
+		expect(out[0]?.label).toBe('Clip — Best');
 		expect(out[0]?.url).toBe('https://cdn.example/combined.mp4');
 		expect(out[0]?.source).toBe('instagram');
 		expect(out.some((f) => f.id === '0')).toBe(true);
 		expect(out.some((f) => f.id === 'dash-v')).toBe(false);
 		expect(out.some((f) => f.id === 'dash-a')).toBe(false);
+		expect(out.every((f) => !/video\+audio|video only|audio only/i.test(f.label))).toBe(true);
 	});
 
 	it('rejects Instagram CDN URLs whose efg marks silent DASH', () => {
@@ -133,14 +136,14 @@ describe('finalizeFormatsForPicker', () => {
 			[
 				{
 					id: '0',
-					label: 'Throwback — video+audio mp4',
+					label: 'Throwback — mp4',
 					url: dashUrl,
 					ext: '.mp4',
 					av: 'both'
 				},
 				{
 					id: '18',
-					label: 'Throwback — video+audio mp4',
+					label: 'Throwback — 720x1280 mp4',
 					url: 'https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m86/combined.mp4',
 					ext: '.mp4',
 					av: 'both'
@@ -148,7 +151,24 @@ describe('finalizeFormatsForPicker', () => {
 			],
 			'instagram'
 		);
+		expect(out[0]?.label).toBe('Throwback — Best');
 		expect(out[0]?.url).toContain('combined.mp4');
 		expect(out.some((f) => f.url === dashUrl)).toBe(false);
+	});
+
+	it('returns empty when only silent video-only formats exist', () => {
+		const out = finalizeFormatsForPicker(
+			[
+				{
+					id: 'dash-v',
+					label: 'Clip — video only mp4',
+					url: 'https://cdn.example/v.mp4',
+					ext: '.mp4',
+					av: 'video'
+				}
+			],
+			'instagram'
+		);
+		expect(out).toEqual([]);
 	});
 });
