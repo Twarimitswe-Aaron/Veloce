@@ -34,7 +34,8 @@ Coordinators must still re-validate **post-extract** URLs (yt-dlp / MediaFire) b
 | Feature | Notes |
 |---------|--------|
 | Multi-range workers | Host profiles cap threads / piece size |
-| Auto-tune | Sequential probe with early exit (better TTFB than all-at-once) |
+| Auto-tune Memory | Tracks historic max speed and aggressively re-probes instead of permanent decay on throttling |
+| Sequential Probe | Early exit on optimum connection count (better TTFB than all-at-once) |
 | `--quiet` | Suppresses diagnostic `eprintln`; JSON progress stays on stdout |
 | `--origin` | Set from referer by desktop + backend (CDN parity) |
 | Linux io_uring | Batched positioned writes; `write_at_owned` avoids extra buffer copy |

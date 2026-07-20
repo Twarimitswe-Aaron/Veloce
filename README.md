@@ -19,7 +19,7 @@ Everything runs on **your PC** — no cloud queue, no account, no subscription.
 ## Getting Started
 
 1. **Install:** Run `./scripts/linux/setup.sh` to install dependencies, build the core engine, and set up the systemd services.
-2. **Manage Processes:** Use the installed `veloce` CLI to control the background services:
+2. **Manage Processes:** Use the installed `veloce` CLI to control the background services. The CLI includes smart port-checking to prevent conflicts between the desktop and backend coordinators, and will prompt you to resolve blocked ports.
 
 ```bash
 veloce start            # Start backend coordinator (auto-starts on login)
@@ -139,9 +139,9 @@ The Rust engine first probes whether the server honors HTTP range requests. If i
 *   **Tuned transport** — HTTP/1.1-only, no gzip, TCP nodelay, keep-alive, per-host pool sized to the connection count, configurable read buffer (default 256 KiB).
 *   **Shared file + positioned writes** — one preallocated file; cross-platform `pwrite` / `seek_write` (Unix/Windows) instead of open+seek per piece.
 *   **Adaptive piece size** — 1–16 MiB based on file size and host profile (MediaFire 8 MiB, googlevideo 4 MiB, etc.).
-*   **Auto-tune connections** — short probe picks 2–16 threads before the main download (`--no-auto-tune` to disable).
+*   **Auto-tune connections** — short probe picks 2–16 threads before the main download (`--no-auto-tune` to disable), and remembers the historic maximum speed to aggressively recover from throttled connections.
 *   **Per-host profiles** — built-in + optional JSON (`--profiles-path`); see `core_engine/host_profiles.example.json`.
-*   **AIMD adaptive concurrency** — additive increase on success, multiplicative decrease on transient errors; permanent errors drop to 1 connection.
+*   **AIMD adaptive concurrency** — additive increase on success, multiplicative decrease on transient errors; tracks optimal max speed and re-probes instead of permanent decay.
 *   **Staggered worker start** — 75 ms between connections to avoid burst throttling (`--no-stagger`).
 *   **Binary resume state** — compact bitmap in `.veloce_state` (legacy JSON still loads); persisted every 2 s or on piece completion.
 *   **Release profile** — thin LTO + `codegen-units = 1` for faster binary.

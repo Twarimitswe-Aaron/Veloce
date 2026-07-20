@@ -338,7 +338,7 @@ Range downloader binary spawned by desktop + Node. Full notes: [`core_engine/REA
 | `--base-dir` | Save path must resolve under download root |
 | Sidecar / resume | Hidden `{parent}/.veloce/{name}.state|.done` (legacy adjacent files migrated); soft ETag/LM (tokenized CDNs); delete state on complete |
 | Quiet / origin | `--quiet` via `elog!`; `--origin` from referer (desktop + backend) |
-| Auto-tune | Sequential probe + early exit (TTFB); skip for MediaFire/Direct/GitHub at coordinator |
+| Auto-tune | Sequential probe + historic max speed memory (no permanent decay); skip for MediaFire/Direct/GitHub at coordinator |
 
 **Key modules:** `safety.rs`, `logutil.rs`, `discover.rs`, `probe.rs`, `download.rs`, `resume.rs`, `io_uring_writer.rs`
 

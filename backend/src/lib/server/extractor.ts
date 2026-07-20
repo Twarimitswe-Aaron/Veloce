@@ -635,6 +635,17 @@ function runYtDlpJson(
 	return { promise, kill, getError };
 }
 
+function getSmartTitle(info: Record<string, unknown>): string {
+	let t = (info.title as string) || '';
+	if (t.startsWith('Video by ') || t === 'post' || !t) {
+		const desc = (info.description as string) || '';
+		if (desc.trim().length > 0) {
+			t = desc.trim().split('\n')[0].slice(0, 80).trim();
+		}
+	}
+	return t || 'video';
+}
+
 function parseYtDlpFormats(output: string): MediaFormat[] {
 	let info: Record<string, unknown> | null;
 	try {
@@ -646,7 +657,7 @@ function parseYtDlpFormats(output: string): MediaFormat[] {
 
 	if (info._type === 'playlist' && Array.isArray(info.entries)) {
 		const merged: MediaFormat[] = [];
-		const baseTitle = ((info.title as string) || 'post').replace(/[\\/:*?"<>|]/g, '_').slice(0, 100);
+		const baseTitle = getSmartTitle(info).replace(/[\\/:*?"<>|]/g, '_').slice(0, 100);
 		const total = info.entries.length;
 		for (let i = 0; i < info.entries.length; i++) {
 			const entry = info.entries[i];
@@ -657,7 +668,7 @@ function parseYtDlpFormats(output: string): MediaFormat[] {
 		if (merged.length > 0) return dedupeFormats(merged).slice(0, 40);
 	}
 
-	return dedupeFormats(formatsFromInfo(info, (info.title as string) || 'video'));
+	return dedupeFormats(formatsFromInfo(info, getSmartTitle(info)));
 }
 
 function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFormat[] {
@@ -691,7 +702,8 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 		const size = (f.filesize || f.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const ext = (f.ext as string) || 'mp4';
-		const label = [res || avTag, ext, sizeStr].filter(Boolean).join(' ');
+		const labelParts = [res, av === 'both' ? '' : avTag, ext, sizeStr].filter(Boolean);
+		const label = labelParts.join(' ');
 
 		out.push({
 			id: String(f.format_id),
@@ -833,13 +845,12 @@ async function resolveMediafireDownload(url: string): Promise<string | null> {
 }
 
 function dedupeFormats(out: MediaFormat[]): MediaFormat[] {
-	const seen = new Set<string>();
-	return out.filter((f) => {
-		const key = `${f.id}|${f.label}|${f.ext}`;
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
+	const map = new Map<string, MediaFormat>();
+	for (const f of out) {
+		const key = `${f.label}|${f.ext}`;
+		map.set(key, f);
+	}
+	return Array.from(map.values());
 }
 
 function parseFormatHeight(label: string): number {
@@ -897,7 +908,7 @@ export interface ResolvedPlaylist {
 	entries: PlaylistEntry[];
 }
 
-const YTDLP_BEST_FORMAT = 'b';
+const YTDLP_BEST_FORMAT = 'best[vcodec!=none][acodec!=none]/b';
 
 function extFromMediaUrl(mediaUrl: string, fallback: string): string {
 	try {

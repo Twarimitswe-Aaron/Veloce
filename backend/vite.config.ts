@@ -20,6 +20,7 @@ const webSocketServer: Plugin = {
 export default defineConfig({
 	plugins: [sveltekit(), webSocketServer],
 	server: {
+		host: '127.0.0.1',
 		port: config.port,
 		strictPort: true, // Fail if port is already in use
 	}

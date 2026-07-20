@@ -1573,8 +1573,10 @@
 					e.stopPropagation();
 					menuDownloadChosen = true;
 					closeMenu({ resume: false });
-					const stem = fmt.label.split(' — ')[0] || 'download';
-					const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
+					const parts = fmt.label.split(' — ');
+					const stem = parts[0] || 'download';
+					const qualifier = parts[1] && (parts[1].includes('video only') || parts[1].includes('audio only')) ? ` [${parts[1].replace(/mp4|webm|m4a|mp3/g, '').trim()}]` : '';
+					const fileName = (fmt.fileName || `${stem}${qualifier}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
 					const pageUrl = location.href.split('#')[0];
 					const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 					const manifest = isManifestFormat(fmt);

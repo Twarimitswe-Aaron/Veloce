@@ -734,7 +734,8 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	}
 
 	let rawName = sanitizeFileName(opts.fileName || 'download_file');
-	if (directUrl) {
+	const isGenericName = !opts.fileName || opts.fileName === 'download_file' || opts.fileName.startsWith('file');
+	if (directUrl && isGenericName) {
 		try {
 			const du = new URL(directUrl);
 			const fromPath = path.basename(du.pathname);
