@@ -48,13 +48,23 @@ export function failReasonForSource(source: MediaSource, lastErr?: string): stri
 	const err = (lastErr || '').toLowerCase();
 
 	if (source === 'instagram') {
+		if (err.includes('secretstorage') || err.includes('failed to decrypt')) {
+			// yt-dlp (bundled Python tool) decrypts Chrome cookies — not Veloce TS/Rust.
+			return 'Cannot read Chrome login cookies for Instagram (yt-dlp). Log in to Instagram in Firefox and retry the badge.';
+		}
+		if (err.includes('cookies database') || err.includes('could not find')) {
+			return 'Could not read browser cookies for Instagram. Log in to Instagram in Firefox, then retry the Veloce badge.';
+		}
 		if (err.includes('empty media')) {
-			return 'Instagram blocked yt-dlp for this post. Stay logged in to Instagram in Chrome (not only Chromium), reload the post, then click the Veloce badge again. Image-only posts have no video.';
+			return 'Instagram blocked yt-dlp for this post. Stay logged in to Instagram in Firefox or Chrome, reload the post, then click the Veloce badge again. Image-only posts have no video.';
 		}
 		if (err.includes('story') || err.includes('stories')) {
-			return 'Instagram story extraction failed. Stay logged in to Chrome, open the video story, then click the Veloce badge. Photo-only stories have no video stream.';
+			return 'Instagram story extraction failed. Stay logged in, open the video story, then click the Veloce badge. Photo-only stories have no video stream.';
 		}
-		return 'Instagram returned no formats. Log in to Instagram in Chrome, reload the page, and retry.';
+		if (err.includes('video-with-audio') || err.includes('dash-only') || err.includes('silent')) {
+			return 'Instagram only offered silent video streams for this post. Stay logged in, reload, and retry — or try another reel.';
+		}
+		return 'Instagram returned no formats. Log in to Instagram in Firefox, reload the page, and retry.';
 	}
 
 	if (source === 'youtube') {

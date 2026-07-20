@@ -690,6 +690,142 @@
 				(isDedicatedMediaPage() ? canonicalPostUrl(location.href) : null);
 		}
 
+		/** Sanitize a filename stem (no extension). */
+		function sanitizeStem(name) {
+			return String(name || '')
+				.replace(/[\\/:*?"<>|]/g, '_')
+				.replace(/\s+/g, ' ')
+				.trim()
+				.slice(0, 100);
+		}
+
+		function metaContent(property, name) {
+			if (property) {
+				const el = document.querySelector(`meta[property="${property}"]`);
+				const v = el?.getAttribute('content')?.trim();
+				if (v) return v;
+			}
+			if (name) {
+				const el = document.querySelector(`meta[name="${name}"]`);
+				const v = el?.getAttribute('content')?.trim();
+				if (v) return v;
+			}
+			return '';
+		}
+
+		/** Username from canonical paths: /user/reel/ID, /user/p/ID, /stories/user/ID */
+		function usernameFromUrl(href) {
+			try {
+				const u = new URL(href, location.origin);
+				const m = u.pathname.match(/^\/([A-Za-z0-9._]+)\/(reel|reels|p|tv)\//i);
+				if (m && !/^(reel|reels|p|tv|stories|explore|accounts|direct|about)$/i.test(m[1])) {
+					return m[1];
+				}
+				const s = u.pathname.match(/^\/stories\/([A-Za-z0-9._]+)/i);
+				if (s) return s[1];
+			} catch { /* ignore */ }
+			return '';
+		}
+
+		function usernameFromArticle(article) {
+			if (!article?.querySelectorAll) return '';
+			for (const a of article.querySelectorAll('header a[href^="/"], a[role="link"][href^="/"]')) {
+				const href = a.getAttribute('href') || '';
+				const m = href.match(/^\/([A-Za-z0-9._]+)\/?$/);
+				if (m && !/^(p|reel|reels|tv|stories|explore|accounts|direct|about)$/i.test(m[1])) {
+					return m[1];
+				}
+			}
+			return '';
+		}
+
+		/**
+		 * Caption inside a feed/post `article` — longest dir=auto span that is not a handle.
+		 * Interception already scopes badges to `main article` / viewer `video`.
+		 */
+		function captionFromArticle(article) {
+			if (!article?.querySelectorAll) return '';
+			let best = '';
+			for (const span of article.querySelectorAll('h1 span[dir="auto"], span[dir="auto"]')) {
+				const t = (span.textContent || '').replace(/\s+/g, ' ').trim();
+				if (t.length < 12 || t.length > 240) continue;
+				if (/^@?[A-Za-z0-9._]+$/.test(t)) continue;
+				if (/^(Follow|Following|Like|Comment|Share|Save|View all|Liked by)/i.test(t)) continue;
+				if (t.length > best.length) best = t;
+			}
+			return best;
+		}
+
+		/**
+		 * Build a download stem from page signals (same surfaces the badge already sits on).
+		 *
+		 * Priority (logged-in Chrome has these; plain curl does not):
+		 * 1. og:title → `Name on Instagram: "caption…"`
+		 * 2. twitter:title → `Name (@user) • Instagram reel`
+		 * 3. meta description → `… - user on DATE: "caption"`
+		 * 4. article DOM → header /user/ + caption span[dir=auto]
+		 * 5. URL path username / shortcode fallback
+		 */
+		function extractMediaName(postUrl, anchorEl) {
+			const url = postUrl || location.href;
+			let username = usernameFromUrl(url);
+			let display = '';
+			let caption = '';
+
+			const og = metaContent('og:title');
+			if (og) {
+				const m =
+					og.match(/^(.+?) on Instagram:\s*[\u201c"'](.+?)[\u201d"']\s*$/) ||
+					og.match(/^(.+?) on Instagram:\s*(.+)$/);
+				if (m) {
+					display = m[1].trim();
+					caption = m[2].trim();
+				}
+			}
+
+			const tw = metaContent('twitter:title');
+			if (tw) {
+				const m = tw.match(/^(.+?)\s*\(@([A-Za-z0-9._]+)\)/);
+				if (m) {
+					if (!display) display = m[1].trim();
+					if (!username) username = m[2];
+				}
+			}
+
+			if (!caption) {
+				const desc = metaContent('og:description') || metaContent('description');
+				const dm =
+					desc.match(/:\s*[\u201c"'](.+?)[\u201d"']/) ||
+					desc.match(/:\s*[\u201c"']?(.{20,200})$/);
+				if (dm) caption = dm[1].replace(/^[\u201c"']|[\u201d"']$/g, '').trim();
+			}
+
+			const article =
+				anchorEl?.closest?.('article') ||
+				document.querySelector('main article, [role="main"] article, article');
+			if (!username) username = usernameFromArticle(article);
+			if (!caption) caption = captionFromArticle(article);
+
+			if (/\/stories\//i.test(url)) {
+				const who = username || display || 'instagram';
+				return sanitizeStem(`${who} story`) || 'instagram_story';
+			}
+
+			caption = caption.split('\n')[0].trim().slice(0, 80);
+			const who = username || display || '';
+			if (who && caption && !/^video by /i.test(caption) && !/^photo by /i.test(caption)) {
+				return sanitizeStem(`${who} - ${caption}`) || who;
+			}
+			if (who) return sanitizeStem(who);
+			if (caption) return sanitizeStem(caption);
+
+			try {
+				const code = new URL(url, location.origin).pathname.split('/').filter(Boolean).pop();
+				if (code && code.length >= 5) return sanitizeStem(`instagram_${code}`);
+			} catch { /* ignore */ }
+			return 'instagram';
+		}
+
 		function scan(watchBudgetRef) {
 			if (!isHost()) return false;
 			if (isPostPage()) {
@@ -780,6 +916,7 @@
 			shouldCullOnOverlay,
 			processMediaElement,
 			resolveVideoPageUrl,
+			extractMediaName,
 			scan,
 			scanSubtree,
 			handleMutationNodes,

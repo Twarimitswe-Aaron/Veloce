@@ -65,6 +65,37 @@ function availableCookieBrowsers(): (typeof COOKIE_BROWSER_ORDER)[number][] {
 	return out.length ? out : ['chrome'];
 }
 
+/** Chrome cookie decrypt often fails on Linux without a keyring helper yt-dlp uses.
+ * Skip that browser for the rest of this process after one hard fail. */
+const cookieBrowserSkip = new Set<string>();
+
+function markCookieBrowserBad(browser: string, reason: string) {
+	if (!browser || cookieBrowserSkip.has(browser)) return;
+	if (
+		/secretstorage/i.test(reason) ||
+		/could not find .* cookies database/i.test(reason) ||
+		/failed to decrypt/i.test(reason) ||
+		/Could not copy Chrome cookie/i.test(reason)
+	) {
+		cookieBrowserSkip.add(browser);
+		console.warn(
+			`[Extractor] cookie browser "${browser}" unusable — will not retry this process. Reason: ${reason.slice(0, 160)}`
+		);
+	}
+}
+
+/** Prefer Firefox first: Chrome cookie decrypt on Linux often fails inside yt-dlp (Python). */
+function cookieBrowsersForAttempt(force: boolean): string[] {
+	const available = availableCookieBrowsers().filter((b) => !cookieBrowserSkip.has(b));
+	const preferred = [
+		...available.filter((b) => b === 'firefox'),
+		...available.filter((b) => b !== 'firefox')
+	];
+	const list = preferred.length ? preferred : ['firefox'];
+	if (force) return list.slice(0, 4);
+	return list.slice(0, 2);
+}
+
 /**
  * YouTube requires solving JS challenges (n-parameter / signatures). yt-dlp needs a JS runtime.
  * @see https://github.com/yt-dlp/yt-dlp/wiki/EJS
@@ -309,16 +340,32 @@ async function listFormatsUncached(
 	}
 
 	const { formats, lastErr } = await listFormatsBySource(url, source, opts);
+	console.log(
+		`[Extractor] listFormats source=${source} raw=${formats.length} force=${opts?.force === true}`
+	);
 	const pickerFormats = finalizeFormatsForPicker(formats, source);
+	console.log(
+		`[Extractor] listFormats picker=${pickerFormats.length} (after muxed-only filter)`
+	);
 	if (pickerFormats.length > 0) {
 		setCached(cacheKey, pickerFormats);
 		seedBestUrlFromFormats(cacheKey, pickerFormats);
 	} else {
+		// Prefer the real reason: yt-dlp often still returns silent DASH-only rows.
+		// Don't blame Chrome cookies when raw formats existed but were filtered out.
+		const reason =
+			formats.length > 0 && source === 'instagram'
+				? failReasonForSource(
+						source,
+						'No video-with-audio format found (silent DASH-only). Instagram served separate video/audio streams only.'
+					)
+				: failReasonForSource(source, lastErr);
 		failCache.set(cacheKey, {
-			reason: failReasonForSource(source, lastErr),
+			reason,
 			ts: Date.now(),
 			source
 		});
+		console.warn(`[Extractor] listFormats FAIL source=${source}: ${reason.slice(0, 160)}`);
 	}
 	return pickerFormats;
 }
@@ -350,66 +397,103 @@ async function listFormatsBySource(
 
 async function raceInstagramFormats(url: string, force: boolean): Promise<FormatListResult> {
 	const urls = instagramUrlVariants(url);
-	const browsers = force
-		? (['chrome', 'chromium', 'brave', 'firefox'] as const)
-		: (['chrome', 'chromium'] as const);
-	const timeoutMs = force ? 24_000 : 14_000;
+	const timeoutMs = force ? 18_000 : 12_000;
+	const primaryUrl = urls[0] ?? url;
 
-	// Flatten variant×browser into jobs, then primary + parallel fallbacks (same as YouTube).
-	// Serial nested loops used to wait for chrome+/p then chromium+/p then … before /reel/.
-	const jobs: { pageUrl: string; browser: string }[] = [];
-	for (const pageUrl of urls) {
-		for (const browser of browsers) {
-			jobs.push({ pageUrl, browser });
+	console.log(
+		`[Extractor] Instagram list start force=${force} variants=${urls.length} url=${primaryUrl}`
+	);
+
+	const tryOne = async (
+		pageUrl: string,
+		browser: string
+	): Promise<{ formats: MediaFormat[]; err: string }> => {
+		if (browser && cookieBrowserSkip.has(browser)) {
+			console.log(`[Extractor] Instagram skip ${browser} (already marked bad)`);
+			return { formats: [], err: '' };
 		}
-	}
-	if (!jobs.length) return { formats: [], lastErr: '' };
-
-	let lastErr = '';
-	const primary = jobs[0];
-	{
-		const run = runYtDlpJson(primary.pageUrl, ['--cookies-from-browser', primary.browser], timeoutMs, {
+		const label = browser || 'no-cookies';
+		const cookieArgs = browser ? ['--cookies-from-browser', browser] : [];
+		console.log(`[Extractor] Instagram try ${label} → ${pageUrl}`);
+		const run = runYtDlpJson(pageUrl, cookieArgs, timeoutMs, {
 			allowPlaylist: true,
-			label: `instagram/${primary.browser}`
+			label: `instagram/${label}`
 		});
 		const formats = tagFormats(await run.promise, 'instagram');
 		run.kill();
-		if (formats.length) return { formats, lastErr: '' };
-		lastErr = run.getError() || lastErr;
+		const err = run.getError();
+		if (err && browser) markCookieBrowserBad(browser, err);
+		console.log(
+			`[Extractor] Instagram done ${label}: formats=${formats.length}${err ? ` err=${err.slice(0, 100)}` : ''}`
+		);
+		return { formats, err: err || '' };
+	};
+
+	// Primary first; rebuild fallbacks AFTER skip so Chrome is not spawned twice.
+	const browsers = cookieBrowsersForAttempt(force);
+	console.log(`[Extractor] Instagram cookie browsers: ${browsers.join(', ') || '(none)'}`);
+
+	let lastErr = '';
+	const primaryBrowser = browsers[0] ?? '';
+	{
+		const { formats, err } = await tryOne(primaryUrl, primaryBrowser);
+		if (formats.length) {
+			console.log(`[Extractor] Instagram OK via ${primaryBrowser || 'no-cookies'} (${formats.length} raw)`);
+			return { formats, lastErr: '' };
+		}
+		lastErr = err || lastErr;
 	}
 
-	const fallbacks = jobs.slice(1, 5);
-	if (!fallbacks.length) return { formats: [], lastErr };
+	const fallbackJobs: { pageUrl: string; browser: string }[] = [];
+	const browsersNow = cookieBrowsersForAttempt(force);
+	for (const browser of browsersNow) {
+		if (browser === primaryBrowser) continue;
+		fallbackJobs.push({ pageUrl: primaryUrl, browser });
+	}
+	for (const pageUrl of urls.slice(1)) {
+		for (const browser of browsersNow.slice(0, 2)) {
+			fallbackJobs.push({ pageUrl, browser });
+		}
+	}
+	fallbackJobs.push({ pageUrl: primaryUrl, browser: '' });
 
-	const runners = fallbacks.map((job) =>
-		runYtDlpJson(job.pageUrl, ['--cookies-from-browser', job.browser], timeoutMs, {
-			allowPlaylist: true,
-			label: `instagram/${job.browser}`
-		})
+	const capped = fallbackJobs.slice(0, 5);
+	console.log(
+		`[Extractor] Instagram fallbacks (${capped.length}): ${capped
+			.map((j) => `${j.browser || 'no-cookies'}@${j.pageUrl.includes('/reel/') ? 'reel' : 'p'}`)
+			.join(', ')}`
 	);
+
+	if (!capped.length) return { formats: [], lastErr };
+
+	const runners = capped.map((job) => ({
+		job,
+		promise: tryOne(job.pageUrl, job.browser)
+	}));
 
 	return new Promise((resolve) => {
 		let finished = 0;
 		let resolved = false;
 		let bestErr = lastErr;
 
-		const finishAll = (formats: MediaFormat[]) => {
-			if (!resolved) {
-				resolved = true;
-				for (const r of runners) r.kill();
-				resolve({ formats: tagFormats(formats, 'instagram'), lastErr: bestErr });
-			}
+		const finishAll = (formats: MediaFormat[], via: string) => {
+			if (resolved) return;
+			resolved = true;
+			console.log(
+				`[Extractor] Instagram race end via=${via} formats=${formats.length} lastErr=${(bestErr || '').slice(0, 80)}`
+			);
+			resolve({ formats, lastErr: bestErr });
 		};
 
-		for (const r of runners) {
-			r.promise.then((formats) => {
+		for (const { job, promise } of runners) {
+			promise.then(({ formats, err }) => {
+				if (err) bestErr = err || bestErr;
 				if (!resolved && formats.length > 0) {
-					finishAll(formats);
+					finishAll(formats, job.browser || 'no-cookies');
 					return;
 				}
-				bestErr = r.getError() || bestErr;
 				finished++;
-				if (finished === runners.length && !resolved) finishAll([]);
+				if (finished === runners.length && !resolved) finishAll([], 'exhausted');
 			});
 		}
 	});
@@ -418,7 +502,7 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 function youtubeAttempts(force: boolean): YtDlpAttempt[] {
 	const out: YtDlpAttempt[] = [];
 	const timeout = force ? 28_000 : 18_000;
-	for (const browser of availableCookieBrowsers()) {
+	for (const browser of cookieBrowsersForAttempt(force)) {
 		out.push({
 			cookieArgs: ['--cookies-from-browser', browser],
 			timeoutMs: timeout,
@@ -427,7 +511,7 @@ function youtubeAttempts(force: boolean): YtDlpAttempt[] {
 	}
 	for (const client of ['android', 'web', 'ios'] as const) {
 		out.push({
-			cookieArgs: ['--cookies-from-browser', 'chrome'],
+			cookieArgs: cookieBrowserSkip.has('chrome') ? [] : ['--cookies-from-browser', 'chrome'],
 			extraArgs: ['--extractor-args', `youtube:player_client=${client}`],
 			timeoutMs: force ? 24_000 : 14_000,
 			label: `youtube/chrome/${client}`
@@ -558,11 +642,19 @@ function runYtDlpJson(
 ): { promise: Promise<MediaFormat[]>; kill: () => void; getError: () => string } {
 	let proc: ChildProcess | null = null;
 	let lastErr = '';
+	let killTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const kill = () => {
 		try {
 			proc?.kill('SIGTERM');
 		} catch { /* ignore */ }
+		// Cookie-decrypt hangs ignore SIGTERM — escalate quickly.
+		if (killTimer) clearTimeout(killTimer);
+		killTimer = setTimeout(() => {
+			try {
+				proc?.kill('SIGKILL');
+			} catch { /* ignore */ }
+		}, 800);
 	};
 
 	const getError = () => lastErr;
@@ -593,6 +685,10 @@ function runYtDlpJson(
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
+			if (killTimer) {
+				clearTimeout(killTimer);
+				killTimer = null;
+			}
 			if (!result.length && lastErr && opts.label) {
 				const logKey = `${opts.label}:${url}`;
 				if (!ytDlpErrorLogged.has(logKey)) {
@@ -611,8 +707,20 @@ function runYtDlpJson(
 
 		proc.stdout?.on('data', (data) => { output += data.toString(); });
 		proc.stderr?.on('data', (data) => {
-			const line = data.toString().trim();
-			if (line.startsWith('ERROR:')) lastErr = line.replace(/^ERROR:\s*/, '');
+			const text = data.toString();
+			for (const rawLine of text.split('\n')) {
+				const line = rawLine.trim();
+				if (!line) continue;
+				if (line.startsWith('ERROR:')) {
+					lastErr = line.replace(/^ERROR:\s*/, '');
+				} else if (/secretstorage/i.test(line) || /could not find .* cookies database/i.test(line)) {
+					lastErr = line;
+					// Fail this attempt immediately — waiting the full timeout feels "infinite".
+					kill();
+					done([]);
+					return;
+				}
+			}
 		});
 
 		proc.on('close', () => {
@@ -733,25 +841,28 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 	const out: MediaFormat[] = [];
 	const seenUrls = new Set<string>();
 
-	// Progressive / default URL — only list muxed A/V (never silent DASH / audio-only).
+	// Keep all streams internally (av tagged). The picker drops video-only / audio-only
+	// so the menu never offers silent files — but race still knows yt-dlp succeeded.
 	const directUrl = info.url as string | undefined;
 	const directExt = (info.ext as string) || 'mp4';
 	if (directUrl) {
 		seenUrls.add(directUrl);
 		const av = avFromCodecs(info.vcodec, info.acodec, directUrl) ?? 'both';
-		if (av === 'both') {
-			const size = (info.filesize || info.filesize_approx) as number | undefined;
-			const sizeStr = size ? ` · ${formatBytes(size)}` : '';
-			out.push({
-				id: '0',
-				label: `${safeTitle} — ${directExt}${sizeStr}`.trim(),
-				url: directUrl,
-				ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
-				filesize: size,
-				av: 'both',
-				kind: 'progressive'
-			});
-		}
+		const size = (info.filesize || info.filesize_approx) as number | undefined;
+		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
+		const label =
+			av === 'both'
+				? `${safeTitle} — ${directExt}${sizeStr}`.trim()
+				: `${safeTitle} — ${av === 'video' ? 'video only' : 'audio only'} ${directExt}${sizeStr}`.trim();
+		out.push({
+			id: '0',
+			label,
+			url: directUrl,
+			ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
+			filesize: size,
+			av,
+			kind: 'progressive'
+		});
 	}
 
 	for (const f of raw) {
@@ -761,14 +872,18 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 		const formatId = String(f.format_id ?? '');
 		if (f.ext === 'mhtml' || f.format_note === 'storyboard' || formatId.startsWith('sb')) continue;
 		const av = avFromCodecs(f.vcodec, f.acodec, formatUrl);
-		if (av !== 'both') continue;
+		if (!av) continue;
 
 		const res = f.resolution && f.resolution !== 'audio only' ? String(f.resolution) : '';
 		const size = (f.filesize || f.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const ext = (f.ext as string) || 'mp4';
-		const labelParts = [res, ext, sizeStr].filter(Boolean);
-		const label = labelParts.join(' ');
+		// Muxed rows: no "video+audio" wording. Split rows keep tags so picker can drop them.
+		const labelParts =
+			av === 'both'
+				? [res, ext, sizeStr]
+				: [res, av === 'video' ? 'video only' : 'audio only', ext, sizeStr];
+		const label = labelParts.filter(Boolean).join(' ');
 
 		seenUrls.add(formatUrl);
 		out.push({
@@ -777,7 +892,7 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 			url: formatUrl,
 			ext: ext.startsWith('.') ? ext : `.${ext}`,
 			filesize: size,
-			av: 'both',
+			av,
 			kind: inferFormatKind(formatUrl, f.protocol as string | undefined)
 		});
 	}

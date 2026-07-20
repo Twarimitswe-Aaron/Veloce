@@ -797,7 +797,8 @@ async function listFormats(url, sendResponse, sender, force = false) {
 	if (force) clearFormatFail(key);
 
 	let cached = getFormatCache(key);
-	if (!cached?.length) {
+	// Badge click (force): do not wait on a stuck prefetch — start a fresh coordinator request.
+	if (!force && !cached?.length) {
 		traceFormats('waiting inflight prefetch', { url: key });
 		cached = await waitForInflightFormats(key);
 	}

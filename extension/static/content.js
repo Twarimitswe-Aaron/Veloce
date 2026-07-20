@@ -1631,8 +1631,31 @@
 	function showFormatsInMenu(menu, closeBtn, formats, url, loading) {
 		if (loading) loading.stop();
 		const pageUrl = location.href.split('#')[0];
+		const named = applyInstagramPageNames(formats, url);
 		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
-		renderFormatButtons(menu, closeBtn, formats, url);
+		renderFormatButtons(menu, closeBtn, named, url);
+	}
+
+	/**
+	 * Instagram badges resolve /p|/reel|/stories URLs (see sites/instagram.js) but yt-dlp
+	 * labels are often "Video by user". Prefer live page name: og:title / twitter /
+	 * description / article caption — same DOM surfaces the badge already uses.
+	 */
+	function applyInstagramPageNames(formats, postUrl) {
+		if (!ig?.extractMediaName || !formats?.length || !isInstagramHost()) return formats;
+		const stem = ig.extractMediaName(postUrl || location.href);
+		if (!stem || stem === 'instagram') return formats;
+		interceptLog('step H0: Instagram page name', { stem, postUrl });
+		return formats.map((fmt) => {
+			const ext = fmt.ext || '.mp4';
+			const parts = String(fmt.label || '').split(' — ');
+			const rest = parts.length > 1 ? parts.slice(1).join(' — ') : ext.replace(/^\./, '');
+			return {
+				...fmt,
+				label: `${stem} — ${rest}`,
+				fileName: `${stem}${ext}`
+			};
+		});
 	}
 
 	/** Playlist pages: settings-driven download only — no per-track format list. */
