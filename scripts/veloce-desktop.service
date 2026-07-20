@@ -1,0 +1,26 @@
+# Veloce Desktop App — systemd *user* service.
+#
+# Installed automatically by scripts/setup.sh
+# Paths below are stamped by setup.sh — do not edit manually.
+
+[Unit]
+Description=Veloce Desktop App (Tauri)
+# Start after the backend coordinator so the desktop can connect to it
+After=veloce.service network-online.target
+Wants=veloce.service
+
+[Service]
+Type=simple
+# Paths stamped by scripts/setup.sh
+WorkingDirectory=__VELOCE_DESKTOP_WORKDIR__
+ExecStart=__VELOCE_DESKTOP_EXECSTART__
+Restart=on-failure
+RestartSec=5
+# Desktop apps need display environment — pass through from the user session
+Environment=DISPLAY=:0
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

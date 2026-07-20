@@ -325,21 +325,33 @@ function handleWsMessage(data) {
 				for (const d of data.downloads) {
 					const raw = d.status ?? 'queued';
 					const status = raw === 'failed' || raw === 'cancelled' ? 'error' : raw;
+					const prev = downloads[d.downloadId];
+					const downloaded = d.downloaded ?? prev?.downloaded ?? 0;
+					const total = d.total ?? prev?.total ?? 0;
 					upsertDownload(d.downloadId, {
-						fileName: d.fileName ?? 'Unknown file',
+						fileName: d.fileName ?? prev?.fileName ?? 'Unknown file',
 						status,
-						downloaded: d.downloaded ?? 0,
-						total: d.total ?? 0,
+						downloaded,
+						total,
 						speedBps: 0,
 						etaSecs: 0,
-						error: d.error || (status === 'error' ? 'Download failed — click Retry' : undefined),
+						error:
+							status === 'error'
+								? d.error || 'Download failed — click Retry'
+								: undefined,
 						isPlaylist: d.isPlaylist === true
 					});
 				}
 			}
 			break;
 		case 'DOWNLOAD_ACK':
-			upsertDownload(data.downloadId, { fileName: data.fileName, status: data.status ?? 'queued' });
+			upsertDownload(data.downloadId, {
+				fileName: data.fileName,
+				status: data.status ?? 'queued',
+				error: undefined,
+				speedBps: 0,
+				etaSecs: 0
+			});
 			break;
 		case 'PROGRESS':
 			upsertDownload(data.downloadId, {
@@ -347,17 +359,32 @@ function handleWsMessage(data) {
 				downloaded: data.downloaded ?? 0,
 				total: data.total ?? 0,
 				speedBps: data.speedBps ?? 0,
+				error: undefined,
 				etaSecs: data.etaSecs ?? 0
 			});
 			break;
 		case 'DOWNLOAD_COMPLETED': {
-			const name = downloads[data.downloadId]?.fileName ?? 'Download';
-			upsertDownload(data.downloadId, { status: data.status ?? 'completed', speedBps: 0, etaSecs: 0 });
+			const prev = downloads[data.downloadId];
+			const tot = Math.max(
+				data.total ?? 0,
+				data.downloaded ?? 0,
+				prev?.total ?? 0,
+				prev?.downloaded ?? 0
+			);
+			const name = prev?.fileName ?? 'Download';
+			upsertDownload(data.downloadId, {
+				status: data.status ?? 'completed',
+				downloaded: tot,
+				total: tot,
+				speedBps: 0,
+				etaSecs: 0,
+				error: undefined
+			});
 			notify(`veloce-done-${data.downloadId}`, 'Download complete', name);
 			break;
 		}
 		case 'DOWNLOAD_PAUSED':
-			upsertDownload(data.downloadId, { status: 'paused', speedBps: 0, etaSecs: 0 });
+			upsertDownload(data.downloadId, { status: 'paused', speedBps: 0, etaSecs: 0, error: undefined });
 			break;
 		case 'DOWNLOAD_CANCELLED': {
 			const name = downloads[data.downloadId]?.fileName ?? 'Download';

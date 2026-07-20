@@ -4,22 +4,27 @@ Native desktop app with an embedded Rust coordinator and WebSocket server for th
 
 **Project docs:** [../README.md](../README.md) · [../SESSION_NEXT_PLAN.md](../SESSION_NEXT_PLAN.md)
 
-## Run (development)
+## Run 
 
-**Coordinator + native UI** (recommended — no separate Vite server):
+**Primary method (managed background service):**
+
+The easiest way to run the desktop app is using the `veloce` process manager installed by `scripts/setup.sh`:
 
 ```bash
-cd desktop && pnpm install && pnpm start
+veloce start --desktop
 ```
 
-This builds the Svelte UI into `dist/`, then runs the Tauri app and WebSocket on `:14921`.
+This launches the Tauri app and WebSocket on `:14921`. You can view logs via `veloce logs --desktop` and stop it via `veloce stop --desktop`.
+
+Do **not** run the backend coordinator (`veloce start`) at the same time as the desktop app — both bind port **14921**. The desktop app **is** the coordinator; it does not start the Node backend.
+
+### Development commands
 
 **Frontend hot-reload** (when editing `src/App.svelte`):
 
 ```bash
 cd desktop && pnpm dev
 ```
-
 Uses Vite on `http://127.0.0.1:1420` via `tauri.dev.conf.json`.
 
 **Manual split** (same as `pnpm start`):
@@ -30,8 +35,6 @@ cd desktop/src-tauri && RUST_LOG=info cargo run
 ```
 
 Do **not** run only `cargo run` without `pnpm build` first — the window needs `desktop/dist/` (otherwise you may see “Could not connect to localhost: Connection refused” from the old Vite dev URL).
-
-Do **not** run `backend npm run dev` at the same time — both bind port **14921**. The desktop app **is** the coordinator; it does not start the Node backend.
 
 ## Shared database
 

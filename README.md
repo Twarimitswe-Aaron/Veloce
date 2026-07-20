@@ -16,6 +16,20 @@ Everything runs on **your PC** — no cloud queue, no account, no subscription.
 
 **Typical flow:** browse → click Veloce badge → pick quality → file lands in `~/Downloads/Veloce` (or your chosen folder) with live speed/ETA in the popup or dashboard.
 
+## Getting Started
+
+1. **Install:** Run `./scripts/setup.sh` to install dependencies, build the core engine, and set up the systemd services.
+2. **Manage Processes:** Use the installed `veloce` CLI to control the background services:
+
+```bash
+veloce start            # Start backend coordinator (auto-starts on login)
+veloce start --desktop  # Start Tauri desktop app
+veloce status           # Check what's running
+veloce stop --all       # Stop everything
+```
+
+3. **Load the Extension:** Go to `chrome://extensions`, enable Developer Mode, click "Load unpacked", and select `extension/build`.
+
 ---
 
 ## Why Veloce vs other download managers
@@ -41,7 +55,7 @@ Veloce is young software. Know these trade-offs before you rely on it for everyt
 
 | Limitation | Detail |
 |------------|--------|
-| **Local setup required** | Run **`desktop/`** (native app) *or* **`backend npm run dev`**. Do not run both — same port 14921. |
+| **Local setup required** | You must run the background coordinator via `veloce start` or the desktop app via `veloce start --desktop`. (They share port 14921, do not run both at once). |
 | **Chrome-first** | The extension targets Chromium Manifest V3. Firefox support is not a primary focus today. |
 | **yt-dlp dependency** | YouTube, Instagram, TikTok, and many social sites need `yt-dlp` installed and occasionally updated when sites change. |
 | **Login-gated content** | Private or age-gated media only works if yt-dlp can use your browser cookies (Chrome profile). |

@@ -19,10 +19,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# ↓↓↓ EDIT THESE to your absolute paths ↓↓↓
-WorkingDirectory=%h/Documents/Notes/Rust/Veloce/backend
-ExecStart=/usr/bin/env pnpm run dev
-# ↑↑↑ EDIT THESE ↑↑↑
+# Paths below are stamped automatically by scripts/setup.sh — do not edit manually.
+WorkingDirectory=__VELOCE_WORKDIR__
+ExecStart=__VELOCE_EXECSTART__
 Restart=on-failure
 RestartSec=3
 # Keep a bounded log; the coordinator is chatty on first connect.

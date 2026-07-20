@@ -80,7 +80,15 @@ function _page($$renderer, $$props) {
 					$$renderer.push(`<p class="text-[11px] opacity-80">${escape_html(d.error || "Download failed")}</p>`);
 				} else {
 					$$renderer.push("<!--[-1-->");
-					$$renderer.push(`<div class="h-1 w-full bg-white/15"><div class="h-full bg-white transition-[width] duration-200"${attr_style(`width: ${stringify(d.status === "completed" ? 100 : pct(d))}%`)}></div></div> <div class="flex justify-between text-[10px] opacity-60"><span>${escape_html(formatBytes(d.downloaded))}${escape_html(d.total ? ` / ${formatBytes(d.total)}` : "")}</span> `);
+					$$renderer.push(`<div class="h-1 w-full bg-white/15"><div class="h-full bg-white transition-[width] duration-200"${attr_style(`width: ${stringify(d.status === "completed" ? 100 : pct(d))}%`)}></div></div> <div class="flex justify-between text-[10px] opacity-60"><span>`);
+					if (d.status === "completed") {
+						$$renderer.push("<!--[0-->");
+						$$renderer.push(`${escape_html(formatBytes(d.total || d.downloaded))}`);
+					} else {
+						$$renderer.push("<!--[-1-->");
+						$$renderer.push(`${escape_html(formatBytes(d.downloaded))}${escape_html(d.total ? ` / ${formatBytes(d.total)}` : "")}`);
+					}
+					$$renderer.push(`<!--]--></span> `);
 					if (d.status === "downloading") {
 						$$renderer.push("<!--[0-->");
 						$$renderer.push(`<span>${escape_html(formatBytes(d.speedBps))}/s · ${escape_html(formatEta(d.etaSecs))}</span>`);
