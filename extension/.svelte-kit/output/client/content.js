@@ -221,7 +221,7 @@
 			const name = decodeURIComponent(new URL(fetchUrl).pathname.split('/').pop() || 'download');
 			const dot = name.lastIndexOf('.');
 			const ext = dot > 0 ? name.slice(dot) : '.bin';
-			return [{ id: 'direct', label: `Direct — ${name}`, url: fetchUrl, ext }];
+			return [{ id: 'direct', label: name, url: fetchUrl, ext, fileName: name }];
 		} catch {
 			return null;
 		}
@@ -1558,8 +1558,48 @@
 
 	function isManifestFormat(fmt) {
 		return fmt.kind === 'manifest' ||
+			fmt.kind === 'adaptive' ||
 			/\.m3u8(\?|$)/i.test(fmt.url || '') ||
 			/\.mpd(\?|$)/i.test(fmt.url || '');
+	}
+
+	/** Build a save name from a format row — never use the "Direct" prefix as the stem. */
+	function fileNameFromFormat(fmt) {
+		if (fmt.fileName && String(fmt.fileName).trim()) {
+			return String(fmt.fileName).trim().replace(/[\\/:*?"<>|]/g, '_');
+		}
+		const label = String(fmt.label || '').trim();
+		const parts = label.split(/\s+[—–-]\s+/); // em dash / en dash / hyphen
+		const looksLikeFile = (s) => /\.[a-z0-9]{2,5}$/i.test(s || '');
+		let raw = '';
+		if (parts.length >= 2 && looksLikeFile(parts[1])) {
+			raw = parts[1];
+		} else if (parts.length >= 2 && /^direct$/i.test(parts[0]) && parts[1]) {
+			// "Direct — Let%2CS+Fight.mp4" or "Direct — name (size)"
+			raw = parts[1].replace(/\s+\([\d.]+\s*[KMG]?B\)\s*$/i, '').trim();
+		} else if (looksLikeFile(parts[0])) {
+			raw = parts[0];
+		} else if (parts[0] && !/^direct$/i.test(parts[0])) {
+			raw = parts[0];
+		} else {
+			raw = 'download';
+		}
+		try {
+			raw = decodeURIComponent(raw.replace(/\+/g, '%20'));
+		} catch {
+			raw = raw.replace(/\+/g, ' ');
+		}
+		const qualifier =
+			parts[1] &&
+			(parts[1].includes('video only') || parts[1].includes('audio only'))
+				? ` [${parts[1].replace(/mp4|webm|m4a|mp3/g, '').trim()}]`
+				: '';
+		let name = `${raw}${qualifier}`;
+		const ext = fmt.ext || '';
+		if (ext && !new RegExp(`${ext.replace('.', '\\.')}$`, 'i').test(name)) {
+			name += ext;
+		}
+		return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim() || 'download.mp4';
 	}
 
 	function renderFormatButtons(menu, closeBtn, formats, url) {
@@ -1573,8 +1613,7 @@
 					e.stopPropagation();
 					menuDownloadChosen = true;
 					closeMenu({ resume: false });
-					const stem = fmt.label.split(' — ')[0] || 'download';
-					const fileName = (fmt.fileName || `${stem}${fmt.ext || '.mp4'}`).replace(/[\\/:*?"<>|]/g, '_');
+					const fileName = fileNameFromFormat(fmt);
 					const pageUrl = location.href.split('#')[0];
 					const sourceUrl = url && url !== fmt.url ? url : pageUrl;
 					const manifest = isManifestFormat(fmt);
@@ -1629,8 +1668,31 @@
 	function showFormatsInMenu(menu, closeBtn, formats, url, loading) {
 		if (loading) loading.stop();
 		const pageUrl = location.href.split('#')[0];
+		const named = applyInstagramPageNames(formats, url);
 		appendPlaylistDownloadOption(menu, closeBtn, pageUrl);
-		renderFormatButtons(menu, closeBtn, formats, url);
+		renderFormatButtons(menu, closeBtn, named, url);
+	}
+
+	/**
+	 * Instagram badges resolve /p|/reel|/stories URLs (see sites/instagram.js) but yt-dlp
+	 * labels are often "Video by user". Prefer live page name: og:title / twitter /
+	 * description / article caption — same DOM surfaces the badge already uses.
+	 */
+	function applyInstagramPageNames(formats, postUrl) {
+		if (!ig?.extractMediaName || !formats?.length || !isInstagramHost()) return formats;
+		const stem = ig.extractMediaName(postUrl || location.href);
+		if (!stem || stem === 'instagram') return formats;
+		interceptLog('step H0: Instagram page name', { stem, postUrl });
+		return formats.map((fmt) => {
+			const ext = fmt.ext || '.mp4';
+			const parts = String(fmt.label || '').split(' — ');
+			const rest = parts.length > 1 ? parts.slice(1).join(' — ') : ext.replace(/^\./, '');
+			return {
+				...fmt,
+				label: `${stem} — ${rest}`,
+				fileName: `${stem}${ext}`
+			};
+		});
 	}
 
 	/** Playlist pages: settings-driven download only — no per-track format list. */

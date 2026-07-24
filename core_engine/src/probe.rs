@@ -18,15 +18,25 @@ pub async fn probe_optimal_threads(
     url: &str,
     ceiling: usize,
     piece_size: u64,
+    download_start: Instant,
 ) -> usize {
     let ceiling = ceiling.max(1);
+    let elapsed = || download_start.elapsed();
     crate::elog!("   📊 Running auto-tune probe (sequential, early-exit)...");
+    crate::atune_log!(
+        elapsed(),
+        "PROBE_START ceiling={} piece_size={} candidates_filter=[2,4,8,12,16]",
+        ceiling,
+        piece_size
+    );
     if ceiling == 1 {
         crate::elog!("   → Ceiling is 1, using single connection");
+        crate::atune_log!(elapsed(), "PROBE_RESULT selected=1 reason=ceiling_is_1");
         return 1;
     }
     if !supports_ranges(client, url).await {
         crate::elog!("   → No range support, using single connection");
+        crate::atune_log!(elapsed(), "PROBE_RESULT selected=1 reason=no_range_support");
         return 1;
     }
 
@@ -36,10 +46,21 @@ pub async fn probe_optimal_threads(
         .collect();
 
     crate::elog!("   Testing candidates: {:?} connections", candidates);
+    crate::atune_log!(
+        elapsed(),
+        "PROBE_CANDIDATES {:?} (ceiling={})",
+        candidates,
+        ceiling
+    );
 
     if candidates.len() <= 1 {
         let result = candidates.first().copied().unwrap_or(2).max(1).min(ceiling);
         crate::elog!("   → Only one candidate: {} connection(s)", result);
+        crate::atune_log!(
+            elapsed(),
+            "PROBE_RESULT selected={} reason=only_one_candidate_under_ceiling",
+            result
+        );
         return result;
     }
 
@@ -53,15 +74,33 @@ pub async fn probe_optimal_threads(
             try_threads,
             bps as f64 / 1_048_576.0
         );
+        crate::atune_log!(
+            elapsed(),
+            "PROBE_SAMPLE conns={} throughput={}",
+            try_threads,
+            crate::logutil::fmt_speed(bps as f64)
+        );
 
         if bps > best_bps {
             if best_bps == 0 || bps > best_bps * 11 / 10 {
                 best_bps = bps;
                 best_threads = try_threads;
+                crate::atune_log!(
+                    elapsed(),
+                    "PROBE_BEST_SO_FAR conns={} {}",
+                    best_threads,
+                    crate::logutil::fmt_speed(best_bps as f64)
+                );
             } else {
                 crate::elog!(
                     "   → Diminishing returns at {} connections (≤10% improvement)",
                     try_threads
+                );
+                crate::atune_log!(
+                    elapsed(),
+                    "PROBE_STOP reason=diminishing_returns at={} best={}",
+                    try_threads,
+                    best_threads
                 );
                 break;
             }
@@ -69,6 +108,12 @@ pub async fn probe_optimal_threads(
             crate::elog!(
                 "   → Performance dropped at {} connections",
                 try_threads
+            );
+            crate::atune_log!(
+                elapsed(),
+                "PROBE_STOP reason=performance_dropped at={} best={}",
+                try_threads,
+                best_threads
             );
             break;
         }
@@ -79,7 +124,15 @@ pub async fn probe_optimal_threads(
         best_threads,
         best_bps as f64 / 1_048_576.0
     );
-    best_threads.max(1).min(ceiling)
+    let selected = best_threads.max(1).min(ceiling);
+    crate::atune_log!(
+        elapsed(),
+        "PROBE_RESULT selected={} best_bps={} below_ceiling={}",
+        selected,
+        crate::logutil::fmt_speed(best_bps as f64),
+        selected < ceiling
+    );
+    selected
 }
 
 async fn measure_parallel_throughput(
@@ -151,7 +204,14 @@ mod tests {
             .redirect(crate::safety::safe_redirect_policy())
             .build()
             .unwrap();
-        let n = probe_optimal_threads(&client, "http://127.0.0.1:1/nope", 8, 1024 * 1024).await;
+        let n = probe_optimal_threads(
+            &client,
+            "http://127.0.0.1:1/nope",
+            8,
+            1024 * 1024,
+            Instant::now(),
+        )
+        .await;
         assert_eq!(n, 1);
     }
 }

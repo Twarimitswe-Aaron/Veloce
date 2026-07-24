@@ -28,8 +28,9 @@ impl ProfileStore {
             "mediafire.com".into(),
             HostProfile {
                 // MediaFire CDN throttles multi-connection / multi-job hard.
-                // 2 keeps throughput steadier than 4–8 (avoids stall → 0 B/s).
-                threads: Some(2),
+                // Keep 1 concurrent connection, but still use 8 MB ranged pieces
+                // for resume (see engine: ranges_ok is independent of threads).
+                threads: Some(1),
                 piece_mb: Some(8),
             },
         );
@@ -113,7 +114,7 @@ mod tests {
     fn matches_subdomain() {
         let store = ProfileStore::builtin();
         let p = store.match_host("https://download123.mediafire.com/x/y");
-        assert_eq!(p.threads, Some(2));
+        assert_eq!(p.threads, Some(1));
     }
 
     #[test]

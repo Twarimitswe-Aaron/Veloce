@@ -15,6 +15,7 @@ pub mod probe;
 pub mod rate_limit;
 pub mod resume;
 pub mod safety;
+pub mod urlutil;
 
 pub use args::EngineArgs;
 pub use engine::run_download;

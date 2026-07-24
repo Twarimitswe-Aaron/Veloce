@@ -1,10 +1,44 @@
 import { config } from './config';
+import { detectMediaSource } from './formatSources';
+import { sanitizeDownloadMediaUrl } from './util';
 import { execSync } from 'child_process';
 import path from 'path';
 
 export function coreEngineBinaryPath(): string {
 	const coreDir = path.resolve(process.cwd(), '../core_engine');
 	return path.join(coreDir, 'target', 'release', 'core_engine');
+}
+
+/**
+ * MediaFire / direct files / GitHub: skip engine auto-tune (matches desktop).
+ * CDN hosts throttle multi-connection churn; historic-max re-probes make it worse.
+ */
+export function engineAutoTuneEnabled(...urls: Array<string | undefined | null>): boolean {
+	if (!config.engineAutoTune) return false;
+	for (const raw of urls) {
+		if (!raw) continue;
+		const lower = raw.toLowerCase();
+		if (detectMediaSource(raw) === 'mediafire') return false;
+		if (
+			lower.includes('raw.githubusercontent.com') ||
+			(lower.includes('github.com') && lower.includes('/blob/'))
+		) {
+			return false;
+		}
+		try {
+			const pathOnly = new URL(raw).pathname.split(/[?#]/)[0] ?? '';
+			if (
+				/\.(mp4|mkv|webm|avi|mov|m4v|mp3|wav|flac|ogg|m4a|zip|rar|7z|tar|gz|pdf|png|jpe?g|gif|webp|iso)(?:$)/i.test(
+					pathOnly
+				)
+			) {
+				return false;
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+	return true;
 }
 
 export type EngineCapabilities = {
@@ -59,6 +93,10 @@ export type EngineCliOpts = {
 	maxRateBytes: number;
 	engineQuiet: boolean;
 	referer?: string;
+	/** Page / canonical URL — used with `url` to decide MediaFire/direct auto-tune skip. */
+	pageUrl?: string;
+	/** Explicit override; default derives from config + MediaFire/direct/GitHub skip. */
+	autoTune?: boolean;
 	caps?: EngineCapabilities;
 };
 
@@ -66,9 +104,12 @@ export type EngineCliOpts = {
 export function buildEngineCliArgs(opts: EngineCliOpts): string[] {
 	const caps = opts.caps ?? getCoreEngineCapabilities();
 	const threads = Math.min(64, Math.max(1, opts.threads || 8));
+	const url = sanitizeDownloadMediaUrl(opts.url);
+	const autoTune =
+		opts.autoTune ?? engineAutoTuneEnabled(url, opts.pageUrl);
 	const args = [
 		'--id', opts.id,
-		'--url', opts.url,
+		'--url', url,
 		'--save-path', opts.savePath,
 		'--threads', String(threads),
 		'--max-rate', String(opts.maxRateBytes)
@@ -77,7 +118,7 @@ export function buildEngineCliArgs(opts: EngineCliOpts): string[] {
 		args.push('--read-buffer-bytes', String(config.engineReadBufferBytes));
 	}
 	if (caps.pieceSizeBytes) args.push('--piece-size-bytes', '0');
-	if (caps.noAutoTune && !config.engineAutoTune) args.push('--no-auto-tune');
+	if (caps.noAutoTune && !autoTune) args.push('--no-auto-tune');
 	if (opts.engineQuiet && caps.quiet) args.push('--quiet');
 	if (opts.referer) {
 		if (caps.referer) args.push('--referer', opts.referer);

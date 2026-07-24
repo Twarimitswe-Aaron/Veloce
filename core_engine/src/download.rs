@@ -61,6 +61,20 @@ pub fn failure_kind_from_status(code: u16) -> FailureKind {
     }
 }
 
+/// CDN returned 200 for a Range sub-request — token expired / ranges disabled.
+/// Retrying the same URL is almost always useless (MediaFire, signed CDNs).
+pub fn is_range_ignored_error(err: &str) -> bool {
+    err.contains("ignored Range") || err.contains("200 for sub-range")
+}
+
+pub fn failure_kind_from_error(err: &str) -> FailureKind {
+    if err.contains("403") || err.contains("416") || is_range_ignored_error(err) {
+        FailureKind::Permanent
+    } else {
+        FailureKind::Transient
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn download_piece(
     client: &Client,
@@ -149,12 +163,18 @@ pub async fn download_piece(
     let mut next_milestone_at = ((already_done / next_milestone.max(1)) + 1) * next_milestone.max(1);
     let mut milestone_printed = false;
 
+    let mut total_net_wait = Duration::default();
+    let mut total_limit_wait = Duration::default();
+    let mut total_disk_wait = Duration::default();
+
     loop {
+        let t_net = Instant::now();
         match time::timeout(idle_timeout, stream.next()).await {
             Err(_) => anyhow::bail!("stalled: no data for {:?}", idle_timeout),
             Ok(None) => break,
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(bytes))) => {
+                total_net_wait += t_net.elapsed();
                 let _ = t_first_byte.get_or_insert_with(Instant::now);
                 let remaining = piece_len.saturating_sub(piece_done);
                 if remaining == 0 {
@@ -164,11 +184,16 @@ pub async fn download_piece(
                 let take = (bytes.len() as u64).min(remaining) as usize;
                 let chunk = &bytes[..take];
                 let n = take as u64;
+                
+                let t_limit = Instant::now();
                 limiter.acquire(n).await;
+                total_limit_wait += t_limit.elapsed();
+                
                 buf.extend_from_slice(chunk);
 
                 if buf.len() >= read_buffer_bytes {
                     let wrote = buf.len() as u64;
+                    let t_disk = Instant::now();
                     flush_piece_buf(
                         output,
                         file_offset,
@@ -177,6 +202,7 @@ pub async fn download_piece(
                         #[cfg(target_os = "linux")]
                         &mut uring,
                     )?;
+                    total_disk_wait += t_disk.elapsed();
                     file_offset += wrote;
                 }
 
@@ -188,11 +214,12 @@ pub async fn download_piece(
                 while piece_done >= next_milestone_at && next_milestone > 0 {
                     let pct = (piece_done as f64 / piece_len as f64) * 100.0;
                     if !crate::logutil::is_quiet() {
-                        eprint!(
-                            "   \r📦 Chunk progress: {:.0}% ({:.1} MB / {:.1} MB)  ",
-                            pct,
+                        crate::elog!(
+                            "   📦 Piece {} progress: {:.0}% ({:.1} MB / {:.1} MB) | net_wait: {:?}, limit_wait: {:?}, disk_wait: {:?}",
+                            piece_idx, pct,
                             piece_done as f64 / 1_048_576.0,
-                            piece_len as f64 / 1_048_576.0
+                            piece_len as f64 / 1_048_576.0,
+                            total_net_wait, total_limit_wait, total_disk_wait
                         );
                     }
                     milestone_printed = true;
@@ -308,5 +335,16 @@ mod tests {
     fn status_failure_classification() {
         assert_eq!(failure_kind_from_status(403), FailureKind::Permanent);
         assert_eq!(failure_kind_from_status(503), FailureKind::Transient);
+    }
+
+    #[test]
+    fn range_ignored_is_permanent() {
+        assert!(is_range_ignored_error(
+            "server ignored Range (200 for sub-range)"
+        ));
+        assert_eq!(
+            failure_kind_from_error("server ignored Range (200 for sub-range)"),
+            FailureKind::Permanent
+        );
     }
 }

@@ -44,8 +44,24 @@ export function isSafeDownloadUrl(raw: string): { ok: true } | { ok: false; reas
 /** Strip any directory components / control chars so a filename can't escape its folder. */
 export function sanitizeFileName(name: string): string {
 	let base = path.basename(name || '').replace(/[\\/\x00-\x1f]/g, '_').trim();
+	base = decodeRemoteFileName(base);
+	base = base.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
 	if (!base || base === '.' || base === '..') base = `download_${Date.now()}`;
 	return base.slice(0, 200);
+}
+
+/**
+ * Decode CDN / MediaFire path names: `Let%2CS+Fight.mp4` → `Let,S Fight.mp4`.
+ */
+export function decodeRemoteFileName(raw: string): string {
+	let s = (raw || '').trim();
+	if (!s) return '';
+	try {
+		s = decodeURIComponent(s.replace(/\+/g, '%20'));
+	} catch {
+		s = s.replace(/\+/g, ' ');
+	}
+	return s.replace(/\s+/g, ' ').trim();
 }
 
 /** Playlist folder names — allow spaces; strip illegal path chars. */
@@ -87,4 +103,27 @@ export function categoryForExt(ext: string): string {
 /** True when a download finished and the bytes (or done sidecar) are still on disk. */
 export function completedFileStillExists(savePath: string): boolean {
 	return isMarkedComplete(savePath) || existsSync(savePath);
+}
+
+/**
+ * Strip CDN `range=` query params that pin a URL to a byte slice.
+ * YouTube googlevideo URLs from yt-dlp often include `range=0-N`; discovering
+ * against that URL makes Content-Length = N+1 and the engine "completes" early.
+ */
+export function sanitizeDownloadMediaUrl(url: string): string {
+	try {
+		const u = new URL(url);
+		if (!u.searchParams.has('range')) return url;
+		const pairs: Array<[string, string]> = [];
+		u.searchParams.forEach((v, k) => {
+			if (k.toLowerCase() !== 'range') pairs.push([k, v]);
+		});
+		// Rebuild query preserving remaining param order (URLSearchParams iteration order).
+		const next = new URL(u.toString());
+		next.search = '';
+		for (const [k, v] of pairs) next.searchParams.append(k, v);
+		return next.toString();
+	} catch {
+		return url;
+	}
 }

@@ -69,6 +69,9 @@ desktop.ini
 *.log
 *.trace
 
+# Vendored ffmpeg (large static binary; install via @ffmpeg-installer/ffmpeg)
+backend/bin/ffmpeg
+
 # ── Generated icons (can regenerate from SVG) ────────────────────────────────
 desktop/src-tauri/icons/32x32.png
 desktop/src-tauri/icons/128x128.png

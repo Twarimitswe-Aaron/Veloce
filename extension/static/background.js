@@ -713,7 +713,14 @@ async function enrichDownloadPayload(payload, tabId) {
 	if (!out.playlist && mediaUrl && out.url === mediaUrl && out.pageUrl) {
 		out.url = out.pageUrl;
 	}
-	if (!out.playlist && out.directUrl == null && mediaUrl && out.url !== mediaUrl) {
+	// Do not promote page URLs (Instagram/YouTube watch) into directUrl — that
+	// sends HTML to core_engine and fails size discovery.
+	const looksLikePage =
+		!!mediaUrl &&
+		/(?:youtube\.com\/watch|youtu\.be\/|instagram\.com\/(?:p|reel|reels|tv|stories)\/)/i.test(
+			mediaUrl
+		);
+	if (!out.playlist && out.directUrl == null && mediaUrl && out.url !== mediaUrl && !looksLikePage) {
 		out.directUrl = mediaUrl;
 	}
 

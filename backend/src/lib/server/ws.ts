@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
 import { statfs, unlink, writeFile, mkdir } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
 
@@ -22,7 +22,8 @@ console.log = (...args) => logWithTime(origLog, ...args);
 console.error = (...args) => logWithTime(origError, ...args);
 console.warn = (...args) => logWithTime(origWarn, ...args);
 
-import { extractMediaUrl, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl } from './extractor';
+import { extractMediaUrl, extractMediaWithFormat, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl, startMergedYtDlpDownload, isInstagramSilentDashUrl } from './extractor';
+import { detectMediaSource } from './formatSources';
 import {
 	defaultPlaylistFormatSettings,
 	parsePlaylistFormatSettings,
@@ -42,7 +43,7 @@ import {
 import { config } from './config';
 import { buildEngineCliArgs, coreEngineBinaryPath } from './engineCli';
 import { resolveGithubDownloadUrl } from './github';
-import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists } from './util';
+import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt, completedFileStillExists, sanitizeDownloadMediaUrl } from './util';
 import { isOrphanPlaylistDownloadRow, runDatabaseCleanup } from './dbCleanup';
 import {
 	reuseOrUniqueSavePath,
@@ -120,7 +121,13 @@ function refererForDownload(pageUrl: string, mediaUrl: string, explicitReferer?:
 function isSignedCdnUrl(url: string): boolean {
 	try {
 		const u = new URL(url);
-		return u.searchParams.has('sign') || u.searchParams.has('token') || u.searchParams.has('expires');
+		// YouTube googlevideo uses `expire` (no trailing s); many CDNs use expires/sign/token.
+		return (
+			u.searchParams.has('sign') ||
+			u.searchParams.has('token') ||
+			u.searchParams.has('expires') ||
+			u.searchParams.has('expire')
+		);
 	} catch {
 		return false;
 	}
@@ -405,9 +412,35 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 	const { id } = spec;
 	let { savePath, fileName } = spec;
 	try {
-		let finalUrl = spec.directUrl || spec.pageUrl;
+		// Never treat an Instagram/YouTube watch page as a downloadable file URL.
+		const pageSource = detectMediaSource(spec.pageUrl);
+		let directUrl = spec.directUrl;
+		if (
+			directUrl &&
+			(detectMediaSource(directUrl) === 'instagram' ||
+				detectMediaSource(directUrl) === 'youtube' ||
+				/instagram\.com\/(p|reel|reels|tv|stories)\//i.test(directUrl))
+		) {
+			console.warn(`[Veloce] Ignoring page-like directUrl for ${pageSource}: ${directUrl.slice(0, 80)}`);
+			directUrl = undefined;
+		}
+		// Instagram CDN often has no Content-Length — core_engine discovery fails.
+		// Silent DASH / video CDN → merge. Audio-only (.m4a) keeps a direct CDN path.
+		const igCdn =
+			!!directUrl &&
+			/(?:fbcdn\.net|cdninstagram\.com|(?:^|\.)instagram\.)/i.test(directUrl);
+		const igAudioOnly =
+			!!directUrl &&
+			(/\.(?:m4a|aac|mp3|opus|ogg)(?:\?|$)/i.test(directUrl) ||
+				/\baudio only\b/i.test(fileName));
+		const forceIgMerge =
+			pageSource === 'instagram' &&
+			!igAudioOnly &&
+			(!directUrl || igCdn || isInstagramSilentDashUrl(directUrl));
 
-		if (spec.directUrl && isManifestFormatUrl(spec.directUrl)) {
+		let finalUrl = directUrl || spec.pageUrl;
+
+		if (directUrl && isManifestFormatUrl(directUrl)) {
 			const extracted = await extractMediaUrl(spec.pageUrl);
 			if (!extracted) {
 				await markError(
@@ -432,14 +465,119 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				return;
 			}
 			finalUrl = gh.url;
-		} else if (!spec.directUrl && !isDirectFileUrl(spec.pageUrl) && spec.category === VIDEO_CATEGORY) {
-			const directUrl = await extractMediaUrl(spec.pageUrl);
-			if (!directUrl) {
-				console.error(`❌ Could not extract a direct media URL for ${spec.pageUrl}. Aborting.`);
-				await markError(id, 'Could not extract a downloadable media URL (the site may require login, or yt-dlp/cookies failed).');
+		} else if (
+			forceIgMerge ||
+			(!directUrl && !isDirectFileUrl(spec.pageUrl) && spec.category === VIDEO_CATEGORY)
+		) {
+			const source = pageSource;
+			// Instagram: always merge via yt-dlp+ffmpeg when no usable engine URL.
+			if (source === 'instagram' && (forceIgMerge || !directUrl)) {
+				const freeMerge = await freeSpaceFor(path.dirname(savePath));
+				if (freeMerge !== null && freeMerge < MIN_FREE_BYTES) {
+					console.error('❌ Insufficient disk space!');
+					await markError(id, 'Insufficient disk space');
+					return;
+				}
+				await setStatus(id, 'downloading');
+				console.log(`[Veloce] Merge download via yt-dlp (${source}): ${spec.pageUrl}`);
+				const { proc, promise } = startMergedYtDlpDownload(spec.pageUrl, savePath);
+				running.set(id, { proc, intent: 'normal' });
+				const result = await promise;
+				const intent = running.get(id)?.intent ?? 'normal';
+				running.delete(id);
+
+				if (intent === 'cancelled' || (!result.ok && result.error === 'cancelled')) {
+					await cleanupFiles(savePath);
+					await db.delete(downloads).where(eq(downloads.id, id));
+					broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: id });
+					return;
+				}
+				if (intent === 'paused') {
+					await setStatus(id, 'paused');
+					broadcast({ type: 'DOWNLOAD_PAUSED', downloadId: id });
+					return;
+				}
+				if (!result.ok) {
+					await markError(id, result.error);
+					return;
+				}
+				const size = existsSync(savePath) ? statSync(savePath).size : 0;
+				await db
+					.update(downloads)
+					.set({ downloadedBytes: size, totalBytes: size, status: 'completed' })
+					.where(eq(downloads.id, id));
+				await setStatus(id, 'completed');
+				broadcast({
+					type: 'DOWNLOAD_COMPLETED',
+					downloadId: id,
+					status: 'completed',
+					downloaded: size,
+					total: size
+				});
 				return;
 			}
-			finalUrl = directUrl;
+
+			// Prefer a single muxed CDN URL for the range engine (YouTube / others).
+			const muxed = await extractMediaWithFormat(
+				spec.pageUrl,
+				'best[vcodec!=none][acodec!=none]'
+			);
+			if (muxed?.url) {
+				finalUrl = muxed.url;
+			} else if (source === 'youtube') {
+				// DASH split A/V — yt-dlp + ffmpeg merge (core_engine cannot mux two URLs).
+				const freeMerge = await freeSpaceFor(path.dirname(savePath));
+				if (freeMerge !== null && freeMerge < MIN_FREE_BYTES) {
+					console.error('❌ Insufficient disk space!');
+					await markError(id, 'Insufficient disk space');
+					return;
+				}
+				await setStatus(id, 'downloading');
+				console.log(`[Veloce] Merge download via yt-dlp (${source}): ${spec.pageUrl}`);
+				const { proc, promise } = startMergedYtDlpDownload(spec.pageUrl, savePath);
+				running.set(id, { proc, intent: 'normal' });
+				const result = await promise;
+				const intent = running.get(id)?.intent ?? 'normal';
+				running.delete(id);
+
+				if (intent === 'cancelled' || (!result.ok && result.error === 'cancelled')) {
+					await cleanupFiles(savePath);
+					await db.delete(downloads).where(eq(downloads.id, id));
+					broadcast({ type: 'DOWNLOAD_REMOVED', downloadId: id });
+					return;
+				}
+				if (intent === 'paused') {
+					await setStatus(id, 'paused');
+					broadcast({ type: 'DOWNLOAD_PAUSED', downloadId: id });
+					return;
+				}
+				if (!result.ok) {
+					await markError(id, result.error);
+					return;
+				}
+				const size = existsSync(savePath) ? statSync(savePath).size : 0;
+				await db
+					.update(downloads)
+					.set({ downloadedBytes: size, totalBytes: size, status: 'completed' })
+					.where(eq(downloads.id, id));
+				await setStatus(id, 'completed');
+				broadcast({
+					type: 'DOWNLOAD_COMPLETED',
+					downloadId: id,
+					status: 'completed',
+					downloaded: size,
+					total: size
+				});
+				return;
+			} else {
+				const extracted = await extractMediaUrl(spec.pageUrl);
+				if (!extracted) {
+					console.error(`❌ Could not extract a direct media URL for ${spec.pageUrl}. Aborting.`);
+					await markError(id, 'Could not extract a downloadable media URL (the site may require login, or yt-dlp/cookies failed).');
+					return;
+				}
+				finalUrl = extracted;
+			}
 
 			// Improve a generic filename from the resolved URL — only for fresh downloads.
 			if (spec.allowRename && (fileName.startsWith('file') || fileName.startsWith('download_file'))) {
@@ -473,6 +611,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		}
 
 		await setStatus(id, 'downloading');
+		finalUrl = sanitizeDownloadMediaUrl(finalUrl);
 		const referer = refererForDownload(spec.pageUrl, finalUrl, spec.referer);
 		if (!referer && isSignedCdnUrl(finalUrl)) {
 			await markError(
@@ -494,7 +633,8 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			threads: Math.min(64, Math.max(1, spec.threads || runtime.defaultThreads)),
 			maxRateBytes: runtime.maxRateBytes,
 			engineQuiet: runtime.engineQuiet,
-			referer: referer || undefined
+			referer: referer || undefined,
+			pageUrl: spec.pageUrl
 		});
 		const rustProcess = spawn(bin, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
 		running.set(id, { proc: rustProcess, intent: 'normal' });
@@ -506,28 +646,48 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 		const settle = async (status: 'completed' | 'error' | 'paused', errorMsg?: string) => {
 			if (settled) return;
 			settled = true;
-			await setStatus(id, status);
 			if (status === 'completed') {
 				const row = (await db.select().from(downloads).where(eq(downloads.id, id)))[0];
-				const tot = Math.max(row?.totalBytes ?? 0, row?.downloadedBytes ?? 0);
+				const expected = Math.max(row?.totalBytes ?? 0, row?.downloadedBytes ?? 0);
+				const disk = existsSync(savePath) ? statSync(savePath).size : 0;
+				// Guard against engine exit 0 with a truncated file (wrong discovery size /
+				// early close). Require disk to cover ~98% of the last reported total.
+				if (expected > 1_048_576 && disk > 0 && disk < Math.floor(expected * 0.98)) {
+					console.error(
+						`[Veloce] Incomplete file on settle: disk=${disk} expected=${expected} path=${savePath}`
+					);
+					await setStatus(id, 'error');
+					broadcast({
+						type: 'DOWNLOAD_ERROR',
+						downloadId: id,
+						error: `Download incomplete (${disk} / ${expected} bytes). Try again — the CDN size may have been wrong.`
+					});
+					resolveProc();
+					return;
+				}
+				const tot = Math.max(expected, disk);
 				if (tot > 0) {
 					await db
 						.update(downloads)
 						.set({ downloadedBytes: tot, totalBytes: tot })
 						.where(eq(downloads.id, id));
 				}
+				await setStatus(id, 'completed');
 				removeResumeSidecars(savePath);
 				broadcast({
 					type: 'DOWNLOAD_COMPLETED',
 					downloadId: id,
-					status,
+					status: 'completed',
 					downloaded: tot,
 					total: tot
 				});
-			} else if (status === 'paused') {
-				broadcast({ type: 'DOWNLOAD_PAUSED', downloadId: id });
 			} else {
-				broadcast({ type: 'DOWNLOAD_ERROR', downloadId: id, error: errorMsg ?? 'Download failed' });
+				await setStatus(id, status);
+				if (status === 'paused') {
+					broadcast({ type: 'DOWNLOAD_PAUSED', downloadId: id });
+				} else {
+					broadcast({ type: 'DOWNLOAD_ERROR', downloadId: id, error: errorMsg ?? 'Download failed' });
+				}
 			}
 			resolveProc();
 		};
@@ -734,7 +894,12 @@ async function queueDownload(opts: QueueOpts): Promise<{ ok: true; downloadId: s
 	}
 
 	let rawName = sanitizeFileName(opts.fileName || 'download_file');
-	const isGenericName = !opts.fileName || opts.fileName === 'download_file' || opts.fileName.startsWith('file');
+	const isGenericName =
+		!opts.fileName ||
+		opts.fileName === 'download_file' ||
+		opts.fileName.startsWith('file') ||
+		/^direct(\.[a-z0-9]+)?$/i.test(opts.fileName) ||
+		/^download(\.[a-z0-9]+)?$/i.test(opts.fileName);
 	if (directUrl && isGenericName) {
 		try {
 			const du = new URL(directUrl);

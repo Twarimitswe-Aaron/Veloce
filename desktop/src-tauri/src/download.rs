@@ -120,35 +120,62 @@ async fn list_formats_uncached(
     let formats = match source {
         formats::MediaSource::MediaFire => {
             let info = formats::resolve_mediafire(url).await?;
+            let mut file_name = util::sanitize_filename(&info.file_name);
+            let ext_from_cdn = url::Url::parse(&info.direct_url)
+                .ok()
+                .and_then(|u| {
+                    std::path::Path::new(u.path())
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                });
+            let ext = ext_from_cdn
+                .or_else(|| {
+                    std::path::Path::new(&file_name)
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                })
+                .unwrap_or_else(|| ".mp4".to_string());
+            if std::path::Path::new(&file_name).extension().is_none() {
+                file_name = format!("{file_name}{ext}");
+            }
+            let label = if let Some(n) = info.size_bytes.filter(|n| *n > 0) {
+                format!("{} — {}", file_name, formats::format_bytes(n))
+            } else {
+                file_name.clone()
+            };
             vec![formats::MediaFormat {
                 id: "0".to_string(),
-                label: format!(
-                    "{} — {}",
-                    info.file_name,
-                    formats::format_bytes(info.size_bytes.unwrap_or(0))
-                ),
+                label,
                 url: info.direct_url,
-                ext: std::path::Path::new(&info.file_name)
-                    .extension()
-                    .map(|e| format!(".{}", e.to_string_lossy()))
-                    .unwrap_or_else(|| ".mp4".to_string()),
+                ext,
                 filesize: info.size_bytes,
+                file_name: Some(file_name),
                 source: Some("mediafire".to_string()),
                 kind: Some("direct".to_string()),
             }]
         }
         formats::MediaSource::Direct | formats::MediaSource::GitHub => {
             let list_url = formats::resolve_list_url(url);
-            let ext = std::path::Path::new(&list_url)
+            let name = url::Url::parse(&list_url)
+                .ok()
+                .and_then(|u| {
+                    std::path::Path::new(u.path())
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| "download".into());
+            let file_name = util::sanitize_filename(&name);
+            let ext = std::path::Path::new(&file_name)
                 .extension()
                 .map(|e| format!(".{}", e.to_string_lossy()))
                 .unwrap_or_else(|| ".mp4".to_string());
             vec![formats::MediaFormat {
                 id: "0".to_string(),
-                label: format!("Direct — {}", ext),
+                label: file_name.clone(),
                 url: list_url,
                 ext,
                 filesize: None,
+                file_name: Some(file_name),
                 source: Some(if source == formats::MediaSource::GitHub {
                     "github".to_string()
                 } else {
@@ -222,12 +249,21 @@ pub struct StartDownloadRequest {
     pub threads: Option<u32>,
 }
 
+/// How the engine (or yt-dlp) should fetch media after URL resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedFetch {
+    /// Single CDN/progressive URL for core_engine.
+    Url(String),
+    /// Split A/V — download+merge with yt-dlp + ffmpeg.
+    Merge,
+}
+
 /// Resolve the HTTP URL the engine should fetch.
 pub async fn resolve_download_url(
     state: &AppState,
     page_url: &str,
     direct_url: Option<&str>,
-) -> Result<String, String> {
+) -> Result<ResolvedFetch, String> {
     log::info!("[Step 1: Resolve URL] Page URL: {}, Direct URL: {:?}", page_url, direct_url);
     if formats::detect_source(page_url) == formats::MediaSource::MediaFire {
         log::info!(" -> Detected MediaFire, resolving direct link via scrape...");
@@ -235,15 +271,19 @@ pub async fn resolve_download_url(
         if !util::is_safe_download_url(&info.direct_url) {
             return Err("Blocked: MediaFire CDN URL points to a private or local network address".to_string());
         }
-        return Ok(info.direct_url);
+        return Ok(ResolvedFetch::Url(info.direct_url));
     }
 
     if let Some(direct) = direct_url.filter(|u| !u.is_empty()) {
         if !formats::is_manifest_format_url(direct) {
+            if ytdlp::is_instagram_silent_dash_url(direct) {
+                log::info!(" -> Direct URL is silent Instagram DASH; will merge via yt-dlp");
+                return Ok(ResolvedFetch::Merge);
+            }
             if !util::is_safe_download_url(direct) {
                 return Err("Blocked: direct URL points to a private or local network address".to_string());
             }
-            return Ok(direct.to_string());
+            return Ok(ResolvedFetch::Url(direct.to_string()));
         }
     }
 
@@ -252,7 +292,7 @@ pub async fn resolve_download_url(
         if !util::is_safe_download_url(&resolved) {
             return Err("Blocked: URL points to a private or local network address".to_string());
         }
-        return Ok(resolved);
+        return Ok(ResolvedFetch::Url(resolved));
     }
 
     // OmniSave / MovieBox: formats come from the site API (extension intercept), not yt-dlp.
@@ -264,15 +304,42 @@ pub async fn resolve_download_url(
         );
     }
 
+    let source = formats::detect_source(page_url);
     let normalized = formats::normalize_url(page_url);
     if let Some(cached) = state.best_url_cache.get(&normalized) {
-        log::info!(" -> Using cached extraction for {}", normalized);
-        if !util::is_safe_download_url(&cached) {
-            return Err("Blocked: cached media URL points to a private or local network address".to_string());
+        if !ytdlp::is_instagram_silent_dash_url(&cached) && util::is_safe_download_url(&cached) {
+            log::info!(" -> Using cached extraction for {}", normalized);
+            return Ok(ResolvedFetch::Url(cached));
         }
-        return Ok(cached);
     }
 
+    // Prefer a single muxed URL (range engine). Never use bare `b` — Instagram DASH
+    // falls back to silent video-only.
+    let norm_clone = normalized.clone();
+    let muxed = tokio::task::spawn_blocking(move || {
+        ytdlp::extract_url_with_format(&norm_clone, "best[vcodec!=none][acodec!=none]")
+    })
+    .await
+    .map_err(|e| format!("yt-dlp task failed: {}", e))?;
+
+    if let Ok(extracted) = muxed {
+        if !ytdlp::is_instagram_silent_dash_url(&extracted) && util::is_safe_download_url(&extracted)
+        {
+            log::info!(" -> yt-dlp muxed extraction successful");
+            state.best_url_cache.set(&normalized, &extracted);
+            return Ok(ResolvedFetch::Url(extracted));
+        }
+    }
+
+    if matches!(
+        source,
+        formats::MediaSource::Instagram | formats::MediaSource::YouTube
+    ) {
+        log::info!(" -> No muxed URL; will merge via yt-dlp+ffmpeg ({:?})", source);
+        return Ok(ResolvedFetch::Merge);
+    }
+
+    // Other sites: legacy best-URL extract.
     log::info!(" -> Running yt-dlp extraction for {}", normalized);
     let norm_clone = normalized.clone();
     let extracted = tokio::task::spawn_blocking(move || {
@@ -280,12 +347,11 @@ pub async fn resolve_download_url(
     }).await.map_err(|e| format!("yt-dlp task failed: {}", e))??;
 
     log::info!(" -> yt-dlp extraction successful");
-    // Re-validate post-extract — yt-dlp/MediaFire can return unexpected hosts.
     if !util::is_safe_download_url(&extracted) {
         return Err("Blocked: extracted media URL points to a private or local network address".to_string());
     }
     state.best_url_cache.set(&normalized, &extracted);
-    Ok(extracted)
+    Ok(ResolvedFetch::Url(extracted))
 }
 
 /// Enqueue a download job (shared by Tauri IPC and WebSocket).
@@ -361,11 +427,14 @@ pub async fn enqueue_download_job(
     let is_resume = req.save_path.is_some() || req.download_id.is_some();
 
     // MediaFire: scrape ONLY at engine start (tokens expire + saves ~2s on enqueue/resume).
-    let download_url = if page_source == formats::MediaSource::MediaFire {
+    let (download_url, merge_via_ytdlp) = if page_source == formats::MediaSource::MediaFire {
         log::info!(" -> MediaFire: deferring CDN scrape until engine start (fast enqueue)");
-        req.url.clone()
+        (req.url.clone(), false)
     } else {
-        resolve_download_url(&state, &req.url, req.direct_url.as_deref()).await?
+        match resolve_download_url(&state, &req.url, req.direct_url.as_deref()).await? {
+            ResolvedFetch::Url(u) => (u, false),
+            ResolvedFetch::Merge => (req.url.clone(), true),
+        }
     };
 
     let mut safe_name = util::sanitize_filename(&req.file_name);
@@ -456,7 +525,7 @@ pub async fn enqueue_download_job(
             id: download_id.clone(),
             device_id: req.device_id.clone(),
             url: req.url.clone(),
-            direct_url: if page_source == formats::MediaSource::MediaFire {
+            direct_url: if page_source == formats::MediaSource::MediaFire || merge_via_ytdlp {
                 None
             } else {
                 Some(download_url.clone())
@@ -509,7 +578,7 @@ pub async fn enqueue_download_job(
     let job_state = crate::scheduler::JobState {
         id: download_id.clone(),
         url: req.url.clone(),
-        direct_url: if page_source == formats::MediaSource::MediaFire {
+        direct_url: if page_source == formats::MediaSource::MediaFire || merge_via_ytdlp {
             None
         } else {
             Some(download_url.clone())
@@ -524,6 +593,7 @@ pub async fn enqueue_download_job(
         is_playlist: false,
         error: None,
         threads: Some(job_threads),
+        merge_via_ytdlp,
     };
 
     state.scheduler.enqueue(job_state);
@@ -555,7 +625,68 @@ pub fn pump_scheduler(state: Arc<AppState>) {
 
 async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobState, referer: Option<String>) -> Result<(), String> {
     let config = Config::from_env();
-    let download_id = job.id;
+    let download_id = job.id.clone();
+    let save_path_str = job.save_path.clone();
+    let merge_via_ytdlp = job.merge_via_ytdlp;
+
+    // Instagram/YouTube DASH split — yt-dlp + ffmpeg (core_engine cannot mux two URLs).
+    if merge_via_ytdlp {
+        let _ = state.db.update_download_status(&download_id, "downloading");
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut flags = state.cancellation_flags.lock().unwrap();
+            flags.insert(download_id.clone(), cancel_flag.clone());
+        }
+        let page_url = job.url.clone();
+        let save_path = save_path_str.clone();
+        let id = download_id.clone();
+        let state_merge = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err("cancelled".to_string());
+            }
+            ytdlp::download_merged_to_file(&page_url, &save_path)
+        })
+        .await
+        .map_err(|e| format!("yt-dlp merge task failed: {e}"))?;
+
+        {
+            let mut flags = state.cancellation_flags.lock().unwrap();
+            flags.remove(&id);
+        }
+        state.scheduler.finish(&id);
+
+        match result {
+            Ok(()) => {
+                let size = std::fs::metadata(&save_path_str)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let _ = state.db.update_download_progress(&id, size as i64, size as i64);
+                let _ = state.db.update_download_status(&id, "completed");
+                state.emit_progress(&id, size, size, 0, 0, 100.0);
+                state.emit_status(&id, "completed", None).await;
+                state.remove_active(&id).await;
+                pump_scheduler(state.clone());
+                Ok(())
+            }
+            Err(e) if e == "cancelled" => {
+                let _ = std::fs::remove_file(&save_path_str);
+                util::remove_resume_sidecars(std::path::Path::new(&save_path_str));
+                let _ = state.db.update_download_status(&id, "cancelled");
+                state.emit_status(&id, "cancelled", None).await;
+                state.remove_active(&id).await;
+                pump_scheduler(state.clone());
+                Ok(())
+            }
+            Err(e) => {
+                let _ = state.db.update_download_status(&id, "failed");
+                state.emit_status(&id, "failed", Some(e.clone())).await;
+                state.remove_active(&id).await;
+                pump_scheduler(state.clone());
+                Err(e)
+            }
+        }
+    } else {
     // MediaFire CDN tokens expire while jobs wait in the queue — re-scrape at engine
     // start (backend runDownloadJob parity), not only at enqueue time.
     let download_url = if formats::detect_source(&job.url) == formats::MediaSource::MediaFire {
@@ -577,6 +708,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
     } else {
         job.direct_url.unwrap_or(job.url.clone())
     };
+    let download_url = util::sanitize_download_media_url(&download_url);
     let save_path_str = job.save_path;
 
     let _ = state.db.update_download_status(&download_id, "downloading");
@@ -677,6 +809,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
             let id_mon = id_spawn.clone();
             let cancel_mon = cancel_flag.clone();
             let runtime_handle = state_spawn.runtime_handle.clone();
+            let save_path_mon = save_path_str.clone();
 
             std::thread::spawn(move || {
                 let waiter = {
@@ -720,8 +853,41 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                             log::info!("[Step 5: Engine Exit] {} was cancelled", id_mon);
                             ("cancelled".to_string(), None)
                         } else if code == Some(0) {
-                            log::info!("[Step 5: Engine Exit] {} completed successfully", id_mon);
-                            ("completed".to_string(), None)
+                            // Cross-check on-disk size vs last progress total — catches
+                            // rare engine exit-0 with a truncated file.
+                            let expected = state_mon
+                                .db
+                                .get_download(&id_mon)
+                                .ok()
+                                .flatten()
+                                .map(|r| {
+                                    r.total_bytes
+                                        .unwrap_or(0)
+                                        .max(r.downloaded_bytes.unwrap_or(0))
+                                        as u64
+                                })
+                                .unwrap_or(0);
+                            let disk = std::fs::metadata(&save_path_mon)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            if expected > 1_048_576 && disk > 0 && disk < ((expected as f64) * 0.98) as u64
+                            {
+                                log::error!(
+                                    "[Step 5: Engine Exit] {} incomplete on disk: {} / {} bytes",
+                                    id_mon,
+                                    disk,
+                                    expected
+                                );
+                                (
+                                    "failed".to_string(),
+                                    Some(format!(
+                                        "Download incomplete ({disk} / {expected} bytes). Try again."
+                                    )),
+                                )
+                            } else {
+                                log::info!("[Step 5: Engine Exit] {} completed successfully", id_mon);
+                                ("completed".to_string(), None)
+                            }
                         } else {
                             log::error!("[Step 5: Engine Exit] {} failed with code {:?}", id_mon, code);
                             (
@@ -820,6 +986,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
             Err(format!("Failed to start engine: {}", e))
         }
     }
+    } // end else !merge_via_ytdlp
 }
 
 /// Save base64 blob bytes from the extension (blob:/data: intercept).
@@ -1170,7 +1337,7 @@ mod tests {
         )
         .await
         .expect("direct");
-        assert_eq!(url, "https://cdn.example.com/direct.mp4");
+        assert_eq!(url, ResolvedFetch::Url("https://cdn.example.com/direct.mp4".into()));
     }
 
     #[tokio::test]
@@ -1200,7 +1367,7 @@ mod tests {
         )
         .await
         .expect("cdn direct");
-        assert_eq!(url, cdn);
+        assert_eq!(url, ResolvedFetch::Url(cdn.into()));
     }
 
     /// Listing must seed best_url_cache so a Best-style resolve without directUrl
@@ -1219,7 +1386,7 @@ mod tests {
         let resolved = resolve_download_url(&state, url, None)
             .await
             .expect("resolve from seed");
-        assert_eq!(resolved, formats[0].url);
+        assert_eq!(resolved, ResolvedFetch::Url(formats[0].url.clone()));
     }
 
     #[tokio::test]
@@ -1232,7 +1399,7 @@ mod tests {
         )
         .await
         .expect("page direct");
-        assert_eq!(url, "https://cdn.example.com/file.mp4");
+        assert_eq!(url, ResolvedFetch::Url("https://cdn.example.com/file.mp4".into()));
     }
 
     #[tokio::test]

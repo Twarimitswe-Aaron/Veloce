@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
-import { isSafeDownloadUrl, sanitizeFileName, safeJoin, categoryForExt } from '../src/lib/server/util';
+import {
+	isSafeDownloadUrl,
+	sanitizeFileName,
+	safeJoin,
+	categoryForExt,
+	sanitizeDownloadMediaUrl
+} from '../src/lib/server/util';
 
 describe('isSafeDownloadUrl', () => {
 	it('accepts normal http(s) URLs', () => {
@@ -75,5 +81,22 @@ describe('categoryForExt', () => {
 	it('defaults unknown to others', () => {
 		expect(categoryForExt('.xyz')).toBe('others');
 		expect(categoryForExt('')).toBe('others');
+	});
+});
+
+describe('sanitizeDownloadMediaUrl', () => {
+	it('strips range= while keeping other googlevideo params', () => {
+		const raw =
+			'https://rr1---sn-abc.googlevideo.com/videoplayback?id=1&range=0-9999999&clen=500000000&expire=99';
+		const out = sanitizeDownloadMediaUrl(raw);
+		expect(out).not.toContain('range=');
+		expect(out).toContain('clen=500000000');
+		expect(out).toContain('expire=99');
+		expect(out).toContain('id=1');
+	});
+
+	it('leaves URLs without range unchanged', () => {
+		const raw = 'https://example.com/a.mp4?token=abc';
+		expect(sanitizeDownloadMediaUrl(raw)).toBe(raw);
 	});
 });

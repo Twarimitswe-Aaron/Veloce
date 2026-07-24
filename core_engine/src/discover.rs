@@ -159,6 +159,17 @@ pub async fn discover(client: &Client, url: &str) -> anyhow::Result<Discovery> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("discovery failed")))
 }
 
+fn finalize_size(url: &str, header_size: u64) -> u64 {
+    let size = crate::urlutil::resolve_discovered_size(url, header_size);
+    if size > header_size {
+        eprintln!(
+            "   ⚠️  Header size {} B < URL clen {} B — using clen (embedded range slice?)",
+            header_size, size
+        );
+    }
+    size
+}
+
 async fn discover_once(client: &Client, url: &str) -> anyhow::Result<Discovery> {
     let _warmup_start = Instant::now();
 
@@ -167,6 +178,7 @@ async fn discover_once(client: &Client, url: &str) -> anyhow::Result<Discovery> 
     if let Ok(head) = client.head(url).send().await {
         if head.status().is_success() {
             if let Some(len) = parse_content_length(head.headers()) {
+                let len = finalize_size(url, len);
                 let etag = header_string(head.headers(), ETAG);
                 let lm = header_string(head.headers(), LAST_MODIFIED);
                 let ar = head
@@ -210,6 +222,7 @@ async fn discover_once(client: &Client, url: &str) -> anyhow::Result<Discovery> 
 
     if status.as_u16() == 206 {
         if let Some(total) = parse_total_from_content_range(res.headers()) {
+            let total = finalize_size(url, total);
             eprintln!("   ✓ Server supports ranges (206 Partial Content)");
             eprintln!("   📦 Size:       {} bytes ({:.1} MB)", total, total as f64 / 1_048_576.0);
             if let Some(ref e) = etag {
@@ -240,6 +253,7 @@ async fn discover_once(client: &Client, url: &str) -> anyhow::Result<Discovery> 
 
     if full_status.is_success() {
         if let Some(len) = parse_content_length(full.headers()) {
+            let len = finalize_size(url, len);
             eprintln!("   ✓ File size determined from full GET");
             eprintln!("   📦 Size:       {} bytes ({:.1} MB)", len, len as f64 / 1_048_576.0);
             if let Some(ref e) = full_etag {

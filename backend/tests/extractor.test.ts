@@ -83,7 +83,7 @@ describe('finalizeFormatsForPicker', () => {
 		expect(out.some((f) => f.id === '140')).toBe(false);
 	});
 
-	it('hides Instagram video-only DASH and prefers muxed video', () => {
+	it('lists Instagram Best + audio only (hides video-only)', () => {
 		const raw: MediaFormat[] = [
 			{
 				id: 'dash-v',
@@ -98,7 +98,8 @@ describe('finalizeFormatsForPicker', () => {
 				label: 'Clip — audio only m4a',
 				url: 'https://cdn.example/a.m4a',
 				ext: '.m4a',
-				av: 'audio'
+				av: 'audio',
+				filesize: 500_000
 			},
 			{
 				id: '0',
@@ -110,14 +111,9 @@ describe('finalizeFormatsForPicker', () => {
 			}
 		];
 		const out = finalizeFormatsForPicker(raw, 'instagram');
-		expect(out[0]?.id).toBe('best');
-		expect(out[0]?.label).toBe('Clip — Best');
-		expect(out[0]?.url).toBe('https://cdn.example/combined.mp4');
-		expect(out[0]?.source).toBe('instagram');
-		expect(out.some((f) => f.id === '0')).toBe(true);
-		expect(out.some((f) => f.id === 'dash-v')).toBe(false);
-		expect(out.some((f) => f.id === 'dash-a')).toBe(false);
-		expect(out.every((f) => !/video\+audio|video only|audio only/i.test(f.label))).toBe(true);
+		expect(out.map((f) => f.id)).toEqual(['best', 'dash-a']);
+		expect(out[0]?.kind).toBe('adaptive');
+		expect(out.every((f) => !/\bvideo only\b/i.test(f.label))).toBe(true);
 	});
 
 	it('rejects Instagram CDN URLs whose efg marks silent DASH', () => {
@@ -147,16 +143,22 @@ describe('finalizeFormatsForPicker', () => {
 					url: 'https://instagram.fnbo18-1.fna.fbcdn.net/o1/v/t2/f2/m86/combined.mp4',
 					ext: '.mp4',
 					av: 'both'
+				},
+				{
+					id: 'a',
+					label: 'Throwback — audio only m4a',
+					url: 'https://cdn.example/a.m4a',
+					ext: '.m4a',
+					av: 'audio'
 				}
 			],
 			'instagram'
 		);
-		expect(out[0]?.label).toBe('Throwback — Best');
-		expect(out[0]?.url).toContain('combined.mp4');
+		expect(out.map((f) => f.id)).toEqual(['best', 'a']);
 		expect(out.some((f) => f.url === dashUrl)).toBe(false);
 	});
 
-	it('returns empty when only silent video-only formats exist', () => {
+	it('shows only Best when Instagram has video-only and no audio row', () => {
 		const out = finalizeFormatsForPicker(
 			[
 				{
@@ -169,6 +171,61 @@ describe('finalizeFormatsForPicker', () => {
 			],
 			'instagram'
 		);
-		expect(out).toEqual([]);
+		expect(out).toHaveLength(1);
+		expect(out[0]?.id).toBe('best');
+		expect(out[0]?.kind).toBe('adaptive');
+	});
+
+	it('prepends adaptive Best on Instagram when split video+audio exist', () => {
+		const out = finalizeFormatsForPicker(
+			[
+				{
+					id: 'dash-v',
+					label: 'Throwback — video only mp4',
+					url: 'https://cdn.example/v.mp4',
+					ext: '.mp4',
+					av: 'video',
+					filesize: 8_000_000
+				},
+				{
+					id: 'dash-a',
+					label: 'Throwback — audio only m4a',
+					url: 'https://cdn.example/a.m4a',
+					ext: '.m4a',
+					av: 'audio',
+					filesize: 500_000
+				}
+			],
+			'instagram'
+		);
+		expect(out.map((f) => f.id)).toEqual(['best', 'dash-a']);
+		expect(out[0]?.kind).toBe('adaptive');
+		expect(out[0]?.url).toBe('');
+	});
+
+	it('offers adaptive Best on YouTube when only split video+audio streams exist', () => {
+		const out = finalizeFormatsForPicker(
+			[
+				{
+					id: 'dash-v',
+					label: 'Song — video only mp4',
+					url: 'https://cdn.example/v.mp4',
+					ext: '.mp4',
+					av: 'video'
+				},
+				{
+					id: 'dash-a',
+					label: 'Song — audio only m4a',
+					url: 'https://cdn.example/a.m4a',
+					ext: '.m4a',
+					av: 'audio'
+				}
+			],
+			'youtube'
+		);
+		expect(out).toHaveLength(1);
+		expect(out[0]?.id).toBe('best');
+		expect(out[0]?.kind).toBe('adaptive');
+		expect(out[0]?.url).toBe('');
 	});
 });

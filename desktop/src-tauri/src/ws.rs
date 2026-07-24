@@ -174,6 +174,7 @@ pub async fn start_ws_server(app: Arc<AppState>, clients: Arc<WsClients>, port: 
                 is_playlist: false,
                 error: None,
                 threads: None,
+                merge_via_ytdlp: false,
             };
             app.scheduler.enqueue(job);
         }

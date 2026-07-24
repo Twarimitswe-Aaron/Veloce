@@ -1,7 +1,9 @@
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
+import { createRequire } from 'module';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import {
 	detectMediaSource,
 	failCacheTtlMs,
@@ -12,6 +14,20 @@ import {
 	type MediaSource
 } from './formatSources';
 import { githubBlobToRaw, isGithubRawUrl, resolveGithubDownloadUrl } from './github';
+import { decodeRemoteFileName, sanitizeFileName, sanitizeDownloadMediaUrl } from './util';
+
+const requireFromHere = createRequire(import.meta.url);
+const EXTRACTOR_DIR = path.dirname(fileURLToPath(import.meta.url));
+/** backend/ root whether running from src or Vite SSR bundle. */
+function backendRoot(): string {
+	// Prefer process.cwd() when `pnpm dev` is run from backend/
+	const cwd = process.cwd();
+	if (fs.existsSync(path.join(cwd, 'bin', 'yt-dlp')) || fs.existsSync(path.join(cwd, 'package.json'))) {
+		return cwd;
+	}
+	// Fall back from this file: src/lib/server → backend/
+	return path.resolve(EXTRACTOR_DIR, '../../..');
+}
 
 export type { FormatKind, MediaSource };
 
@@ -23,12 +39,55 @@ export interface MediaFormat {
 	url: string;
 	ext: string;
 	filesize?: number;
+	/** Preferred save name (MediaFire / direct). Extension includes this when set. */
+	fileName?: string;
 	/** Platform that produced this format (youtube, instagram, …). */
 	source?: MediaSource;
 	/** How the engine should fetch it. */
 	kind?: FormatKind;
 	/** Whether the stream includes video, audio, or both (YouTube DASH). */
 	av?: AvStream;
+}
+
+function fileNameFromRemoteUrl(url: string): string {
+	try {
+		const raw = path.basename(new URL(url).pathname) || 'download';
+		return sanitizeFileName(decodeRemoteFileName(raw) || 'download');
+	} catch {
+		return 'download';
+	}
+}
+
+function formatBytesShort(n: number): string {
+	if (n >= 1_073_741_824) return `${(n / 1_073_741_824).toFixed(1)} GB`;
+	if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+	if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+	return `${n} B`;
+}
+
+/** Single-file row for MediaFire / CDN / GitHub raw. */
+function directFileFormat(
+	url: string,
+	rawName: string,
+	source: MediaSource,
+	filesize?: number
+): MediaFormat {
+	const fromUrl = fileNameFromRemoteUrl(url);
+	let decoded = sanitizeFileName(decodeRemoteFileName(rawName) || fromUrl);
+	const ext = path.extname(decoded) || path.extname(fromUrl) || '.bin';
+	if (!path.extname(decoded)) decoded = `${decoded}${ext}`;
+	const label =
+		filesize && filesize > 0 ? `${decoded} — ${formatBytesShort(filesize)}` : decoded;
+	return {
+		id: 'direct',
+		label,
+		url,
+		ext,
+		fileName: decoded,
+		filesize,
+		source,
+		kind: 'direct'
+	};
 }
 
 const EXTRACTOR_DOMAINS = [
@@ -277,16 +336,17 @@ async function listFormatsUncached(
 ): Promise<MediaFormat[]> {
 	const source = detectMediaSource(url);
 	if (url.includes('mediafire.com')) {
-		const direct = await resolveMediafireDownload(url);
-		if (!direct) {
+		const info = await resolveMediafireInfo(url);
+		if (!info) {
 			failCache.set(cacheKey, {
 				reason: 'MediaFire link expired or unavailable. Open the MediaFire file page in your browser and try again.',
 				ts: Date.now()
 			});
 			return [];
 		}
-		const name = path.basename(new URL(direct).pathname) || 'download';
-		const formats = [{ id: 'direct', label: `Direct — ${name}`, url: direct, ext: path.extname(name) || '.bin', source: 'mediafire' as MediaSource, kind: 'direct' as FormatKind }];
+		const formats = [
+			directFileFormat(info.url, info.fileName, 'mediafire', info.sizeBytes)
+		];
 		setCached(cacheKey, formats);
 		return formats;
 	}
@@ -298,23 +358,13 @@ async function listFormatsUncached(
 			return [];
 		}
 		const fetchUrl = gh.url;
-		const name = path.basename(new URL(fetchUrl).pathname) || 'download';
-		const ext = path.extname(name) || '.bin';
-		const formats = [{
-			id: 'direct',
-			label: `Direct — ${name}`,
-			url: fetchUrl,
-			ext,
-			source: 'direct' as MediaSource,
-			kind: 'direct' as FormatKind
-		}];
+		const formats = [directFileFormat(fetchUrl, fileNameFromRemoteUrl(fetchUrl), 'direct')];
 		setCached(cacheKey, formats);
 		return formats;
 	}
 
 	if (isDirectFileUrl(url)) {
-		const name = path.basename(new URL(url).pathname) || 'download';
-		const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext: path.extname(name) || '.bin', source: 'direct' as MediaSource, kind: 'direct' as FormatKind }];
+		const formats = [directFileFormat(url, fileNameFromRemoteUrl(url), 'direct')];
 		setCached(cacheKey, formats);
 		return formats;
 	}
@@ -329,9 +379,7 @@ async function listFormatsUncached(
 		}
 		try {
 			const u = new URL(url);
-			const name = path.basename(u.pathname) || 'download';
-			const ext = path.extname(name) || '.bin';
-			const formats = [{ id: 'direct', label: `Direct — ${name}`, url, ext, source: 'direct' as MediaSource, kind: 'direct' as FormatKind }];
+			const formats = [directFileFormat(url, path.basename(u.pathname) || 'download', 'direct')];
 			setCached(cacheKey, formats);
 			return formats;
 		} catch {
@@ -345,21 +393,13 @@ async function listFormatsUncached(
 	);
 	const pickerFormats = finalizeFormatsForPicker(formats, source);
 	console.log(
-		`[Extractor] listFormats picker=${pickerFormats.length} (after muxed-only filter)`
+		`[Extractor] listFormats picker=${pickerFormats.length}`
 	);
 	if (pickerFormats.length > 0) {
 		setCached(cacheKey, pickerFormats);
 		seedBestUrlFromFormats(cacheKey, pickerFormats);
 	} else {
-		// Prefer the real reason: yt-dlp often still returns silent DASH-only rows.
-		// Don't blame Chrome cookies when raw formats existed but were filtered out.
-		const reason =
-			formats.length > 0 && source === 'instagram'
-				? failReasonForSource(
-						source,
-						'No video-with-audio format found (silent DASH-only). Instagram served separate video/audio streams only.'
-					)
-				: failReasonForSource(source, lastErr);
+		const reason = failReasonForSource(source, lastErr);
 		failCache.set(cacheKey, {
 			reason,
 			ts: Date.now(),
@@ -846,8 +886,9 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 	const directUrl = info.url as string | undefined;
 	const directExt = (info.ext as string) || 'mp4';
 	if (directUrl) {
-		seenUrls.add(directUrl);
-		const av = avFromCodecs(info.vcodec, info.acodec, directUrl) ?? 'both';
+		const cleanDirect = sanitizeDownloadMediaUrl(directUrl);
+		seenUrls.add(cleanDirect);
+		const av = avFromCodecs(info.vcodec, info.acodec, cleanDirect) ?? 'both';
 		const size = (info.filesize || info.filesize_approx) as number | undefined;
 		const sizeStr = size ? ` · ${formatBytes(size)}` : '';
 		const label =
@@ -857,7 +898,7 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 		out.push({
 			id: '0',
 			label,
-			url: directUrl,
+			url: cleanDirect,
 			ext: directExt.startsWith('.') ? directExt : `.${directExt}`,
 			filesize: size,
 			av,
@@ -867,7 +908,7 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 
 	for (const f of raw) {
 		if (!f.url) continue;
-		const formatUrl = f.url as string;
+		const formatUrl = sanitizeDownloadMediaUrl(f.url as string);
 		if (seenUrls.has(formatUrl)) continue;
 		const formatId = String(f.format_id ?? '');
 		if (f.ext === 'mhtml' || f.format_note === 'storyboard' || formatId.startsWith('sb')) continue;
@@ -903,7 +944,10 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 const MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 /** Short TTL cache so enqueue + engine-start don't double-scrape (~5s → ~0 on hit). */
-const mediafireCdnCache = new Map<string, { url: string; at: number }>();
+const mediafireCdnCache = new Map<
+	string,
+	{ url: string; at: number; fileName?: string; sizeBytes?: number }
+>();
 const MEDIAFIRE_CDN_TTL_MS = 90_000;
 
 function mediafireCacheKey(url: string): string {
@@ -974,7 +1018,9 @@ async function probeMediafireCdn(url: string): Promise<string | null> {
 	return null;
 }
 
-async function parseMediafirePage(url: string): Promise<string | null> {
+async function parseMediafirePage(
+	url: string
+): Promise<{ cdn: string; fileName?: string; sizeBytes?: number } | null> {
 	try {
 		const res = await fetch(url, {
 			redirect: 'follow',
@@ -984,45 +1030,85 @@ async function parseMediafirePage(url: string): Promise<string | null> {
 		});
 		const ct = res.headers.get('content-type') ?? '';
 		if (ct.includes('video/') || ct.includes('audio/') || ct.includes('application/octet-stream')) {
-			return url;
+			return { cdn: url, fileName: fileNameFromRemoteUrl(url) };
 		}
 		const html = await res.text();
 		const match = html.match(/href="(https?:\/\/download\d+\.mediafire\.com[^"]+)"/i);
-		return match?.[1] ?? null;
+		const cdn = match?.[1];
+		if (!cdn) return null;
+
+		const og =
+			html.match(/property="og:title"\s+content="([^"]+)"/i)?.[1] ||
+			html.match(/content="([^"]+)"\s+property="og:title"/i)?.[1] ||
+			html.match(/<title>([^<]+)<\/title>/i)?.[1];
+		const fromCdn = fileNameFromRemoteUrl(cdn);
+		let fileName = fromCdn;
+		if (og) {
+			const cleaned = sanitizeFileName(
+				decodeRemoteFileName(og.replace(/\s*[|\-–].*$/, '').trim())
+			);
+			if (cleaned && cleaned !== 'mediafire_file') {
+				const ext = path.extname(fromCdn) || path.extname(cleaned) || '.bin';
+				fileName = path.extname(cleaned) ? cleaned : `${cleaned}${ext}`;
+			}
+		}
+		const sizeMatch = html.match(/\((\d+(?:\.\d+)?)\s*(KB|MB|GB)\)/i);
+		let sizeBytes: number | undefined;
+		if (sizeMatch) {
+			const n = parseFloat(sizeMatch[1]);
+			const unit = sizeMatch[2].toUpperCase();
+			const mul = unit === 'GB' ? 1_073_741_824 : unit === 'MB' ? 1_048_576 : 1024;
+			sizeBytes = Math.round(n * mul);
+		}
+		return { cdn, fileName, sizeBytes };
 	} catch (e) {
 		console.error('[Extractor] Failed to parse Mediafire page', e);
 		return null;
 	}
 }
 
-async function resolveMediafireDownload(url: string): Promise<string | null> {
+type MediafireResolved = { url: string; fileName: string; sizeBytes?: number };
+
+async function resolveMediafireInfo(url: string): Promise<MediafireResolved | null> {
 	const key = mediafireCacheKey(url);
 	const hit = mediafireCdnCache.get(key);
 	if (hit && Date.now() - hit.at < MEDIAFIRE_CDN_TTL_MS) {
-		return hit.url;
+		return {
+			url: hit.url,
+			fileName: hit.fileName || fileNameFromRemoteUrl(hit.url),
+			sizeBytes: hit.sizeBytes
+		};
 	}
 
-	let resolved: string | null = null;
+	let parsed: { cdn: string; fileName?: string; sizeBytes?: number } | null = null;
 	if (isMediafireFilePage(url)) {
-		resolved = await parseMediafirePage(url);
+		parsed = await parseMediafirePage(url);
 	} else if (isMediafireCdnHost(new URL(url).hostname)) {
 		const live = await probeMediafireCdn(url);
 		if (live) {
-			resolved = live;
+			parsed = { cdn: live, fileName: fileNameFromRemoteUrl(live) };
 		} else {
 			const filePage = mediafireFilePageFromCdn(url);
-			if (filePage) {
-				resolved = await parseMediafirePage(filePage);
-			}
+			if (filePage) parsed = await parseMediafirePage(filePage);
 		}
 	} else if (url.includes('mediafire.com')) {
-		resolved = await parseMediafirePage(url);
+		parsed = await parseMediafirePage(url);
 	}
 
-	if (resolved) {
-		mediafireCdnCache.set(key, { url: resolved, at: Date.now() });
-	}
-	return resolved;
+	if (!parsed?.cdn) return null;
+	const fileName = sanitizeFileName(parsed.fileName || fileNameFromRemoteUrl(parsed.cdn));
+	mediafireCdnCache.set(key, {
+		url: parsed.cdn,
+		at: Date.now(),
+		fileName,
+		sizeBytes: parsed.sizeBytes
+	});
+	return { url: parsed.cdn, fileName, sizeBytes: parsed.sizeBytes };
+}
+
+async function resolveMediafireDownload(url: string): Promise<string | null> {
+	const info = await resolveMediafireInfo(url);
+	return info?.url ?? null;
 }
 
 function dedupeFormats(out: MediaFormat[]): MediaFormat[] {
@@ -1050,10 +1136,26 @@ function isCombinedAvFormat(f: MediaFormat): boolean {
 	return !/\bvideo only\b|\baudio only\b/i.test(f.label);
 }
 
-/** Hide silent video-only / audio-only streams; offer a "Best" row (YouTube + Instagram).
- * Seed Best.url from the top progressive so Best clicks pass directUrl and skip
- * a second yt-dlp `-f b -g` (that used to double latency after listing).
- * Never falls back to video-only — those downloads have no sound.
+function titleStemFromFormats(formats: MediaFormat[]): string {
+	for (const f of formats) {
+		const stem = f.label.split(' — ')[0]?.trim();
+		if (stem) return stem;
+	}
+	return 'video';
+}
+
+function hasSeparateAvPair(formats: MediaFormat[]): boolean {
+	const hasVideo = formats.some(
+		(f) => f.av === 'video' || /\bvideo only\b/i.test(f.label) || isInstagramSilentDashUrl(f.url)
+	);
+	const hasAudio = formats.some((f) => f.av === 'audio' || /\baudio only\b/i.test(f.label));
+	return hasVideo && hasAudio;
+}
+
+/** YouTube only: hide silent video-only / audio-only; offer a "Best" row.
+ * Instagram stays on the generic picker (pre-b3eb727) — applying this filter
+ * emptied the menu when Instagram only returned DASH split streams.
+ * When only DASH split A/V exists on YouTube, offer adaptive Best for yt-dlp+ffmpeg merge.
  */
 function combinedAvPickerFormats(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
 	const combined = dedupeFormats(formats.filter(isCombinedAvFormat));
@@ -1063,29 +1165,85 @@ function combinedAvPickerFormats(formats: MediaFormat[], source: MediaSource): M
 		if (hb !== ha) return hb - ha;
 		return (b.filesize ?? 0) - (a.filesize ?? 0);
 	});
-	if (combined.length === 0) return [];
-	const titleStem = combined[0]?.label.split(' — ')[0] || 'video';
-	const top = combined[0];
-	const best: MediaFormat = {
-		id: 'best',
-		label: `${titleStem} — Best`,
-		url: top?.url || '',
-		ext: top?.ext || '.mp4',
-		filesize: top?.filesize,
-		source,
-		kind: 'progressive',
-		av: 'both'
-	};
-	return [best, ...combined].slice(0, 24);
+	if (combined.length > 0) {
+		const titleStem = combined[0]?.label.split(' — ')[0] || 'video';
+		const top = combined[0];
+		const best: MediaFormat = {
+			id: 'best',
+			label: `${titleStem} — Best`,
+			url: top?.url || '',
+			ext: top?.ext || '.mp4',
+			filesize: top?.filesize,
+			source,
+			kind: 'progressive',
+			av: 'both'
+		};
+		return [best, ...combined].slice(0, 24);
+	}
+	if (hasSeparateAvPair(formats)) {
+		const titleStem = titleStemFromFormats(formats);
+		return [
+			{
+				id: 'best',
+				label: `${titleStem} — Best`,
+				url: '',
+				ext: '.mp4',
+				source,
+				kind: 'adaptive',
+				av: 'both'
+			}
+		];
+	}
+	return [];
 }
 
 export function finalizeFormatsForPicker(formats: MediaFormat[], source: MediaSource): MediaFormat[] {
-	if (source === 'youtube' || source === 'instagram') {
+	if (source === 'youtube') {
 		return combinedAvPickerFormats(formats, source);
 	}
+
+	if (source === 'instagram') {
+		return instagramPickerFormats(formats);
+	}
+
 	const sorted = dedupeFormats([...formats]);
 	sorted.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
 	return sorted.slice(0, 40);
+}
+
+/** Instagram menu: merged Best (+ yt-dlp/ffmpeg) and audio-only — hide silent video rows. */
+function instagramPickerFormats(formats: MediaFormat[]): MediaFormat[] {
+	const audioOnly = dedupeFormats(
+		formats.filter((f) => f.av === 'audio' || /\baudio only\b/i.test(f.label))
+	);
+	audioOnly.sort((a, b) => (b.filesize ?? 0) - (a.filesize ?? 0));
+
+	const hasVideo = formats.some(
+		(f) =>
+			f.av === 'video' ||
+			f.av === 'both' ||
+			/\bvideo only\b/i.test(f.label) ||
+			isInstagramSilentDashUrl(f.url) ||
+			(!!f.url && !/\baudio only\b/i.test(f.label) && f.av !== 'audio')
+	);
+
+	const out: MediaFormat[] = [];
+	if (hasVideo || audioOnly.length > 0) {
+		const titleStem = titleStemFromFormats(formats);
+		out.push({
+			id: 'best',
+			label: `${titleStem} — Best`,
+			url: '',
+			ext: '.mp4',
+			source: 'instagram',
+			kind: 'adaptive',
+			av: 'both'
+		});
+	}
+	for (const a of audioOnly.slice(0, 8)) {
+		out.push({ ...a, source: 'instagram', kind: a.kind || 'progressive' });
+	}
+	return out.slice(0, 24);
 }
 
 export interface PlaylistEntry {
@@ -1102,6 +1260,8 @@ export interface ResolvedPlaylist {
 }
 
 const YTDLP_BEST_FORMAT = 'best[vcodec!=none][acodec!=none]/b';
+/** Prefer mergeable A/V; never fall back to bare `b` (Instagram DASH video-only). */
+const YTDLP_MERGE_FORMAT = 'bv*+ba/best[vcodec!=none][acodec!=none]';
 
 function extFromMediaUrl(mediaUrl: string, fallback: string): string {
 	try {
@@ -1117,23 +1277,221 @@ function extFromMediaUrl(mediaUrl: string, fallback: string): string {
 	return fallback;
 }
 
+/** Cookie arg lists for downloads — Firefox first (Chrome secretstorage often broken on Linux). */
+function cookieArgStrategies(force = true): string[][] {
+	const browsers = cookieBrowsersForAttempt(force);
+	const out: string[][] = browsers.map((b) => ['--cookies-from-browser', b]);
+	out.push([]);
+	return out;
+}
+
 /** Extract media URL using a specific yt-dlp format selector. */
 export async function extractMediaWithFormat(url: string, format: string): Promise<{ url: string; ext: string } | null> {
 	const pageUrl = normalizeYoutubeWatchUrl(url);
-	const cookieStrategies: string[][] = [
-		['--cookies-from-browser', 'chrome'],
-		['--cookies-from-browser', 'chromium'],
-		['--cookies-from-browser', 'firefox'],
-		[]
-	];
-	for (const cookieArgs of cookieStrategies) {
+	for (const cookieArgs of cookieArgStrategies()) {
+		const browser = cookieArgs[1] || '';
+		if (browser && cookieBrowserSkip.has(browser)) continue;
 		const direct = await runYtDlp(pageUrl, cookieArgs, format);
 		if (direct) {
+			// Reject silent Instagram DASH (single -g line can still be video-only).
+			if (isInstagramSilentDashUrl(direct)) continue;
 			const fallback = format.startsWith('ba') || format.includes('bestaudio') ? '.m4a' : '.mp4';
-			return { url: direct, ext: extFromMediaUrl(direct, fallback) };
+			return { url: sanitizeDownloadMediaUrl(direct), ext: extFromMediaUrl(direct, fallback) };
 		}
 	}
 	return null;
+}
+
+/** Resolve ffmpeg binary: `bin/ffmpeg`, PATH, then pnpm `@ffmpeg-installer/ffmpeg`. */
+export function findFfmpegPath(): string | null {
+	const candidates: string[] = [];
+
+	const bundled = path.join(backendRoot(), 'bin', 'ffmpeg');
+	candidates.push(bundled);
+
+	try {
+		const installer = requireFromHere('@ffmpeg-installer/ffmpeg') as { path?: string };
+		if (installer?.path) candidates.push(installer.path);
+	} catch {
+		/* package not installed / Vite can't resolve — bin/ffmpeg still works */
+	}
+
+	candidates.push('ffmpeg'); // PATH last
+
+	for (const cand of candidates) {
+		try {
+			if (cand !== 'ffmpeg' && !fs.existsSync(cand)) continue;
+			if (cand !== 'ffmpeg') {
+				try {
+					fs.accessSync(cand, fs.constants.X_OK);
+				} catch {
+					try {
+						fs.chmodSync(cand, 0o755);
+					} catch {
+						continue;
+					}
+				}
+			}
+			const check = spawnSync(cand, ['-version'], { stdio: 'ignore' });
+			if (check.status === 0) return cand;
+		} catch {
+			/* try next */
+		}
+	}
+	return null;
+}
+
+/** True when ffmpeg is available (PATH or pnpm installer package). */
+export function ffmpegAvailable(): boolean {
+	return !!findFfmpegPath();
+}
+
+export type MergedDownloadResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * Download + merge split A/V with yt-dlp (Instagram DASH, YouTube adaptive).
+ * Writes to `savePath` via ffmpeg remux. Caller owns cancel via returned `proc`.
+ */
+export function startMergedYtDlpDownload(
+	pageUrl: string,
+	savePath: string,
+	opts?: { timeoutMs?: number }
+): { proc: ChildProcess; promise: Promise<MergedDownloadResult> } {
+	const timeoutMs = opts?.timeoutMs ?? 180_000;
+	const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
+	const strategies = cookieArgStrategies(true);
+
+	let current: ChildProcess | null = null;
+	let killed = false;
+	const kill = () => {
+		killed = true;
+		if (current && !current.killed) {
+			try {
+				current.kill('SIGTERM');
+			} catch {
+				/* ignore */
+			}
+		}
+	};
+
+	const promise = (async (): Promise<MergedDownloadResult> => {
+		const ffmpegPath = findFfmpegPath();
+		if (!ffmpegPath) {
+			return {
+				ok: false,
+				error:
+					'ffmpeg not found. Expected backend/bin/ffmpeg (copied from @ffmpeg-installer/ffmpeg). Re-run: cd backend && pnpm add @ffmpeg-installer/ffmpeg && cp "$(node -e "console.log(require(\'@ffmpeg-installer/ffmpeg\').path)")" bin/ffmpeg && chmod +x bin/ffmpeg'
+			};
+		}
+		fs.mkdirSync(path.dirname(savePath), { recursive: true });
+		let lastErr = '';
+		for (const cookieArgs of strategies) {
+			if (killed) return { ok: false, error: 'cancelled' };
+			const browser = cookieArgs[1] || '';
+			if (browser && cookieBrowserSkip.has(browser)) continue;
+
+			const args = [
+				...ytdlpSharedArgs(),
+				...cookieArgs,
+				'--ffmpeg-location',
+				ffmpegPath,
+				'-f',
+				YTDLP_MERGE_FORMAT,
+				'--merge-output-format',
+				'mp4',
+				// Instagram DASH often has ~ms length skew (audio shorter) and sometimes
+				// non-zero start PTS. Keep timestamps + end on the shorter stream.
+				'--postprocessor-args',
+				'Merger:-copyts -shortest',
+				'--fixup',
+				'force',
+				'--no-playlist',
+				'--no-warnings',
+				'--no-progress',
+				'--socket-timeout',
+				'20',
+				'--retries',
+				'2',
+				'-o',
+				savePath,
+				'--',
+				pageUrl
+			];
+
+			const result = await new Promise<MergedDownloadResult>((resolve) => {
+				const proc = spawn(ytdlpPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+				current = proc;
+				let stderr = '';
+				proc.stderr?.on('data', (chunk) => {
+					stderr += chunk.toString();
+				});
+				const timer = setTimeout(() => {
+					try {
+						proc.kill('SIGKILL');
+					} catch {
+						/* ignore */
+					}
+					resolve({ ok: false, error: `yt-dlp merge timed out after ${Math.round(timeoutMs / 1000)}s` });
+				}, timeoutMs);
+				proc.on('error', (err) => {
+					clearTimeout(timer);
+					resolve({ ok: false, error: err.message });
+				});
+				proc.on('close', (code) => {
+					clearTimeout(timer);
+					if (killed) {
+						resolve({ ok: false, error: 'cancelled' });
+						return;
+					}
+					if (code === 0 && fs.existsSync(savePath) && fs.statSync(savePath).size > 0) {
+						resolve({ ok: true });
+						return;
+					}
+					const errText = stderr.trim().split('\n').pop() || `yt-dlp exited ${code}`;
+					if (browser) markCookieBrowserBad(browser, errText);
+					resolve({ ok: false, error: errText.slice(0, 240) });
+				});
+			});
+
+			if (result.ok) return result;
+			lastErr = result.error;
+			if (result.error === 'cancelled') return result;
+		}
+		return {
+			ok: false,
+			error:
+				lastErr ||
+				'Could not merge video+audio with yt-dlp. Stay logged in (Firefox recommended) and retry.'
+		};
+	})();
+
+	// Proxy ChildProcess so cancel/pause can kill whatever attempt is running.
+	const proxy = {
+		kill: (signal?: NodeJS.Signals) => {
+			kill();
+			if (signal && current) {
+				try {
+					current.kill(signal);
+				} catch {
+					/* ignore */
+				}
+			}
+		},
+		get killed() {
+			return killed || !!current?.killed;
+		}
+	} as ChildProcess;
+
+	return { proc: proxy, promise };
+}
+
+/** One-shot merge download (tests / callers that do not need cancel). */
+export async function downloadMergedWithYtDlp(
+	pageUrl: string,
+	savePath: string,
+	opts?: { timeoutMs?: number }
+): Promise<MergedDownloadResult> {
+	return startMergedYtDlpDownload(pageUrl, savePath, opts).promise;
 }
 
 function normalizeYoutubeWatchUrl(entryUrl: string): string {
@@ -1270,9 +1628,9 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
         const label = cookieArgs.length ? cookieArgs[1] : 'no-cookies';
         const directUrl = await runYtDlp(url, cookieArgs, YTDLP_BEST_FORMAT);
         if (directUrl) {
-            // Cache and return.
-            bestUrlCache.set(normalized, { url: directUrl, ts: Date.now() });
-            return directUrl;
+            const clean = sanitizeDownloadMediaUrl(directUrl);
+            bestUrlCache.set(normalized, { url: clean, ts: Date.now() });
+            return clean;
         }
         console.error(`[Extractor] yt-dlp attempt failed (${label}) for ${url}`);
     }

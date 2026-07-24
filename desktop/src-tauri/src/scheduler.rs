@@ -18,9 +18,9 @@ pub struct JobState {
     pub eta_secs: u64,
     pub is_playlist: bool,
     pub error: Option<String>,
-    /// Engine worker threads for this job (from payload or runtime settings).
+    /// When true, start_engine downloads via yt-dlp merge instead of core_engine.
     #[serde(default)]
-    pub threads: Option<u32>,
+    pub merge_via_ytdlp: bool,
 }
 
 /// The download scheduler with a FIFO queue and concurrency cap.
@@ -139,6 +139,7 @@ mod tests {
             is_playlist: false,
             error: None,
             threads: None,
+            merge_via_ytdlp: false,
         }
     }
 
@@ -267,6 +268,7 @@ mod tests {
                 is_playlist: false,
                 error: None,
                 threads: None,
+                merge_via_ytdlp: false,
             });
             q.push_back(JobState {
                 id: "mf2".into(),
@@ -282,6 +284,7 @@ mod tests {
                 is_playlist: false,
                 error: None,
                 threads: None,
+                merge_via_ytdlp: false,
             });
             q.push_back(JobState {
                 id: "mf3".into(),
@@ -297,6 +300,7 @@ mod tests {
                 is_playlist: false,
                 error: None,
                 threads: None,
+                merge_via_ytdlp: false,
             });
         }
 

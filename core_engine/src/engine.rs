@@ -6,7 +6,10 @@ use crate::io_uring_writer::IoUringEngine;
 use crate::adaptive::{AdaptiveController, FailureKind};
 use crate::args::EngineArgs;
 use crate::discover::{build_http_client, discover, discover_resume_quick, supports_ranges};
-use crate::download::{download_piece, format_bytes, PieceMetrics, IDLE_TIMEOUT, MAX_PIECE_RETRIES};
+use crate::download::{
+    download_piece, failure_kind_from_error, format_bytes, is_range_ignored_error, PieceMetrics,
+    IDLE_TIMEOUT, MAX_PIECE_RETRIES,
+};
 use crate::file_io::{available_space, SharedOutput};
 use crate::piece::{adaptive_piece_size, piece_ranges};
 use crate::profiles::ProfileStore;
@@ -42,6 +45,17 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let mut args = args;
     args.save_path = resolved_save.to_string_lossy().to_string();
 
+    // YouTube/DASH CDNs often embed `range=0-N` in the URL. Discovering against that
+    // URL reports N+1 as total_size → engine "completes" a truncated slice.
+    let normalized = crate::urlutil::normalize_download_url(&args.url);
+    if normalized != args.url {
+        crate::elog!(
+            "   🔧 Stripped embedded range= from URL (was {}…)",
+            args.url.chars().take(96).collect::<String>()
+        );
+        args.url = normalized;
+    }
+
     let start_time = Instant::now();
     let path = Path::new(&args.save_path);
     if let Some(parent) = path.parent() {
@@ -52,15 +66,29 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     crate::elog!("━━━ [1/5] Initializing ───────────────────────────── +0.00s");
 
     let profiles = ProfileStore::load(args.profiles_path.as_deref().map(Path::new));
+    let host_profile = profiles.match_host(&args.url);
     let thread_ceiling = profiles.thread_ceiling(&args.url, args.threads) as usize;
-    crate::elog!(
-        "   📋 Thread ceiling: {} (from {})",
+    let url_host = url::Url::parse(&args.url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "?".into());
+    crate::atune_log!(
+        start_time.elapsed(),
+        "INIT host={} cli_threads={} profile_threads={:?} profile_piece_mb={:?} effective_ceiling={} auto_tune={} no_auto_tune={} quiet={}",
+        url_host,
+        args.threads,
+        host_profile.threads,
+        host_profile.piece_mb,
         thread_ceiling,
-        if args.profiles_path.is_some() {
-            "host profile"
-        } else {
-            "args"
-        }
+        args.auto_tune,
+        args.no_auto_tune,
+        args.quiet
+    );
+    crate::elog!(
+        "   📋 Thread ceiling: {} (cli={}, profile={:?})",
+        thread_ceiling,
+        args.threads,
+        host_profile.threads
     );
 
     let client = Arc::new(build_http_client(
@@ -160,11 +188,14 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         t_discover.as_secs(), t_discover.subsec_millis() / 10
     );
 
-    let ranges_ok = thread_ceiling > 1
-        && match discovery.ranges_hint {
-            Some(v) => v,
-            None => supports_ranges(&client, &args.url).await,
-        };
+    // Ranges are independent of worker count: 1 connection can still fetch
+    // many small pieces sequentially (critical for MediaFire resume). Never
+    // gate ranges_ok on thread_ceiling — that forced one giant piece when
+    // the MediaFire profile set threads=1.
+    let ranges_ok = match discovery.ranges_hint {
+        Some(v) => v,
+        None => supports_ranges(&client, &args.url).await,
+    };
 
     let piece_size: u64;
     let completed_init: Vec<bool>;
@@ -205,7 +236,18 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         };
         let _ = std::fs::remove_file(state_path);
 
-        eprintln!("   📐 Range requests: {}", if ranges_ok { "supported ✓" } else { "NOT supported — single connection only" });
+        eprintln!(
+            "   📐 Range requests: {}",
+            if ranges_ok {
+                if thread_ceiling <= 1 {
+                    "supported ✓ (1 connection, multi-piece sequential)"
+                } else {
+                    "supported ✓"
+                }
+            } else {
+                "NOT supported — single full-file stream"
+            }
+        );
 
         let profile_piece = profiles.piece_bytes(&args.url);
         piece_size = if args.piece_size_bytes > 0 {
@@ -278,15 +320,58 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     eprintln!("   🧩 Pieces:     {} total ({} bytes each)", num_pieces, piece_size);
 
     let mut effective_ceiling = std::cmp::min(thread_ceiling.max(1), pieces.len().max(1));
-    let auto_tune = args.auto_tune && !args.no_auto_tune;
+    // Defense in depth: MediaFire / signed CDNs must not run mid-download AIMD
+    // even if the coordinator forgot --no-auto-tune.
+    let host_blocks_auto_tune = url_host.contains("mediafire.com");
+    let auto_tune = args.auto_tune && !args.no_auto_tune && !host_blocks_auto_tune;
+    if host_blocks_auto_tune && (args.auto_tune && !args.no_auto_tune) {
+        crate::atune_log!(
+            start_time.elapsed(),
+            "FORCE_NO_AUTO_TUNE host={} reason=mediafire_cdn_range_tokens",
+            url_host
+        );
+    }
+    crate::atune_log!(
+        start_time.elapsed(),
+        "PREPARE pieces={} piece_size={}B profile_ceiling={} piece_capped_ceiling={} auto_tune_enabled={}",
+        num_pieces,
+        piece_size,
+        thread_ceiling,
+        effective_ceiling,
+        auto_tune
+    );
     if auto_tune && effective_ceiling > 1 && pieces.len() > 1 {
-        let tuned = probe_optimal_threads(&client, &args.url, effective_ceiling, piece_size).await;
+        let before = effective_ceiling;
+        let tuned = probe_optimal_threads(
+            &client,
+            &args.url,
+            effective_ceiling,
+            piece_size,
+            start_time,
+        )
+        .await;
         eprintln!("   📊 Auto-tune selected {tuned} connections (ceiling {effective_ceiling}).");
         effective_ceiling = tuned.max(1).min(effective_ceiling);
+        crate::atune_log!(
+            start_time.elapsed(),
+            "PROBE_DONE probed_ceiling={} selected={} (below_ceiling={})",
+            before,
+            effective_ceiling,
+            effective_ceiling < before
+        );
     } else if !auto_tune {
         eprintln!("   ⏭  Auto-tune disabled, using {} connection(s)", effective_ceiling);
+        crate::atune_log!(
+            start_time.elapsed(),
+            "PROBE_SKIP reason=disabled fixed_connections={} (stay_at_ceiling=true)",
+            effective_ceiling
+        );
     } else if pieces.len() <= 1 {
         eprintln!("   ⏭  Only 1 piece, using 1 connection");
+        crate::atune_log!(
+            start_time.elapsed(),
+            "PROBE_SKIP reason=single_piece fixed_connections=1"
+        );
     }
 
     let piece_metrics: Arc<SegQueue<PieceMetrics>> = Arc::new(SegQueue::new());
@@ -322,6 +407,10 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
     let retry_count = Arc::new(AtomicU64::new(0));
     let stall_count = Arc::new(AtomicU64::new(0));
     let busy_count = Arc::new(AtomicU64::new(0)); // 429/503
+    let range_ignored_count = Arc::new(AtomicU64::new(0));
+    /// After this many "ignored Range" failures, abort — CDN token is dead.
+    const RANGE_IGNORED_ABORT_AFTER: u64 = 3;
+    let abort_download = Arc::new(AtomicBool::new(false));
     let peak_speed_bps = Arc::new(AtomicU64::new(0));
     let worker_partial: Arc<Vec<AtomicU64>> =
         Arc::new((0..effective_ceiling).map(|_| AtomicU64::new(0)).collect());
@@ -407,6 +496,8 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let retry_count = Arc::clone(&retry_count);
         let stall_count = Arc::clone(&stall_count);
         let busy_count = Arc::clone(&busy_count);
+        let range_ignored_count = Arc::clone(&range_ignored_count);
+        let abort_download = Arc::clone(&abort_download);
         let worker_partial = Arc::clone(&worker_partial);
         let piece_written = Arc::clone(&piece_written);
         let conn_bars = Arc::clone(&conn_bars);
@@ -414,6 +505,7 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
         let notify = Arc::clone(&notify);
         let slot_notify = Arc::clone(&slot_notify);
         let stagger = !args.no_stagger;
+        let download_start = start_time;
 
         handles.push(tokio::spawn(async move {
             if stagger {
@@ -429,10 +521,15 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 .flatten();
 
             loop {
+                if abort_download.load(Ordering::Acquire) {
+                    break;
+                }
                 let idx = match queue.pop() {
                     Some(i) => i,
                     None => {
-                        if remaining.load(Ordering::Acquire) == 0 {
+                        if remaining.load(Ordering::Acquire) == 0
+                            || abort_download.load(Ordering::Acquire)
+                        {
                             break;
                         }
                         // Zero-wait blocking: notify_one() from re-pushed pieces
@@ -446,11 +543,38 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     }
                 };
 
+                let wait_limit = adaptive.current_limit();
+                let mut wait_ticks = 0u32;
                 while !adaptive.try_acquire_slot() {
+                    wait_ticks += 1;
+                    if wait_ticks == 1 || wait_ticks % 20 == 0 {
+                        crate::atune_log!(
+                            download_start.elapsed(),
+                            "SLOT_WAIT worker={} piece={} limit={} active={} ceiling={} waited_ms~{}",
+                            w,
+                            idx,
+                            adaptive.current_limit(),
+                            adaptive.active_slots(),
+                            adaptive.ceiling(),
+                            wait_ticks * 1000
+                        );
+                    }
                     tokio::select! {
                         _ = slot_notify.notified() => {},
                         _ = sleep(Duration::from_millis(1000)) => {},
                     }
+                }
+                if wait_ticks > 0 {
+                    crate::atune_log!(
+                        download_start.elapsed(),
+                        "SLOT_GOT worker={} piece={} after_waits={} limit_was={} limit_now={} (below_ceiling={})",
+                        w,
+                        idx,
+                        wait_ticks,
+                        wait_limit,
+                        adaptive.current_limit(),
+                        adaptive.current_limit() < adaptive.ceiling()
+                    );
                 }
 
                 let (start, end) = pieces[idx];
@@ -500,7 +624,18 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                         notify.notify_waiters();
                     }
                     completed_count.fetch_add(1, Ordering::Relaxed);
-                    adaptive.on_success();
+                    if let Some((old, new)) = adaptive.on_success() {
+                        crate::atune_log!(
+                            download_start.elapsed(),
+                            "AIMD_UP reason=piece_ok worker={} piece={} limit {}→{} ceiling={} (recovered_toward_ceiling={})",
+                            w,
+                            idx,
+                            old,
+                            new,
+                            adaptive.ceiling(),
+                            new == adaptive.ceiling()
+                        );
+                    }
                 } else {
                     let n = attempts[idx].fetch_add(1, Ordering::Relaxed) as usize + 1;
                     retry_count.fetch_add(1, Ordering::Relaxed);
@@ -511,11 +646,41 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                     if err_s.contains("429") || err_s.contains("503") || err_s.contains("server busy") {
                         busy_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    let kind = if err_s.contains("403") || err_s.contains("416") {
-                        FailureKind::Permanent
-                    } else {
-                        FailureKind::Transient
-                    };
+                    let range_ignored = is_range_ignored_error(&err_s);
+                    if range_ignored {
+                        let n_ign = range_ignored_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        crate::atune_log!(
+                            download_start.elapsed(),
+                            "RANGE_IGNORED worker={} piece={} count={}/{} — CDN likely expired token / stopped ranges",
+                            w,
+                            idx,
+                            n_ign,
+                            RANGE_IGNORED_ABORT_AFTER
+                        );
+                        if n_ign >= RANGE_IGNORED_ABORT_AFTER
+                            && !abort_download.swap(true, Ordering::SeqCst)
+                        {
+                            eprintln!(
+                                "   ❌ Aborting: server ignored Range {}× (CDN token expired or ranges disabled). Cancel and retry so Veloce can refresh the download URL.",
+                                n_ign
+                            );
+                            crate::atune_log!(
+                                download_start.elapsed(),
+                                "ABORT reason=range_ignored_storm count={}",
+                                n_ign
+                            );
+                            // Drop queued work as failed so remaining can reach 0.
+                            while queue.pop().is_some() {
+                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                if remaining.fetch_sub(1, Ordering::Release) == 1 {
+                                    notify.notify_waiters();
+                                }
+                            }
+                            had_failure.store(true, Ordering::Relaxed);
+                            notify.notify_waiters();
+                        }
+                    }
+                    let kind = failure_kind_from_error(&err_s);
 
                     if let Err(e) = &res {
                         eprintln!("[C{w}] piece {idx} failed (attempt {n}/{MAX_PIECE_RETRIES}): {e}");
@@ -523,17 +688,60 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                         eprintln!("[C{w}] piece {idx} short read (attempt {n}/{MAX_PIECE_RETRIES})");
                     }
 
-                    if n >= MAX_PIECE_RETRIES {
-                        eprintln!("[C{w}] piece {idx} permanently failed");
+                    // Range-ignored: do not retry the same dead CDN URL 10×.
+                    let give_up = n >= MAX_PIECE_RETRIES
+                        || range_ignored
+                        || abort_download.load(Ordering::Acquire);
+
+                    if give_up {
+                        if range_ignored && n < MAX_PIECE_RETRIES {
+                            eprintln!(
+                                "[C{w}] piece {idx} permanently failed (Range ignored — no retry)"
+                            );
+                        } else if n >= MAX_PIECE_RETRIES {
+                            eprintln!("[C{w}] piece {idx} permanently failed");
+                        }
                         had_failure.store(true, Ordering::Relaxed);
                         failed_count.fetch_add(1, Ordering::Relaxed);
                         if remaining.fetch_sub(1, Ordering::Release) == 1 {
                             notify.notify_waiters();
                         }
-                        adaptive.on_failure(FailureKind::Permanent);
+                        if let Some((old, new)) = adaptive.on_failure(FailureKind::Permanent) {
+                            crate::atune_log!(
+                                download_start.elapsed(),
+                                "AIMD_DOWN reason=piece_permanent_fail worker={} piece={} err={} limit {}→{} ceiling={} BELOW_CEILING",
+                                w,
+                                idx,
+                                err_s.chars().take(80).collect::<String>(),
+                                old,
+                                new,
+                                adaptive.ceiling()
+                            );
+                        }
+                        if abort_download.load(Ordering::Acquire) {
+                            break;
+                        }
                     } else {
-                        adaptive.on_failure(kind);
+                        if let Some((old, new)) = adaptive.on_failure(kind) {
+                            crate::atune_log!(
+                                download_start.elapsed(),
+                                "AIMD_DOWN reason=piece_{:?}_fail worker={} piece={} attempt={}/{} err={} limit {}→{} ceiling={} BELOW_CEILING={}",
+                                kind,
+                                w,
+                                idx,
+                                n,
+                                MAX_PIECE_RETRIES,
+                                err_s.chars().take(120).collect::<String>(),
+                                old,
+                                new,
+                                adaptive.ceiling(),
+                                new < adaptive.ceiling()
+                            );
+                        }
                         sleep(Duration::from_millis(300 * n as u64)).await;
+                        if abort_download.load(Ordering::Acquire) {
+                            break;
+                        }
                         queue.push(idx);
                         notify.notify_one();
                     }
@@ -648,59 +856,237 @@ pub async fn run_download(args: EngineArgs) -> Result<(), Box<dyn std::error::Er
                 };
 
                 // Adaptive tuning every 2 seconds (was 5s — too slow to recover).
-                if auto_tune && last_tune.elapsed().as_secs() >= 2 {
+                // Also heartbeat when auto-tune is off but AIMD dropped us below ceiling.
+                let tune_due = last_tune.elapsed().as_secs() >= 2;
+                if tune_due && !auto_tune {
                     let limit = adaptive.current_limit();
                     let ceiling = adaptive.ceiling();
+                    if limit < ceiling {
+                        crate::atune_log!(
+                            start_time.elapsed(),
+                            "HEARTBEAT auto_tune=off limit={}/{} active={} BELOW_CEILING — caused by AIMD piece failures (see AIMD_DOWN)",
+                            limit,
+                            ceiling,
+                            adaptive.active_slots()
+                        );
+                    }
+                    last_tune = Instant::now();
+                } else if auto_tune && tune_due {
+                    let limit = adaptive.current_limit();
+                    let ceiling = adaptive.ceiling();
+                    let active = adaptive.active_slots();
+                    let below = limit < ceiling;
+                    let speed_s = crate::logutil::fmt_speed(smoothed_speed);
+                    let instant_s = crate::logutil::fmt_speed(instant);
+                    let last_s = crate::logutil::fmt_speed(last_tune_speed);
+                    let lock_s = crate::logutil::fmt_speed(locked_optimum_speed);
 
                     if smoothed_speed > max_speed_reached {
-                        max_speed_reached = smoothed_speed;
+                        // Cap per-tick hist growth so one piece-completion burst
+                        // cannot invent a 6 MB/s "historic max" on a slow link.
+                        let new_max = if max_speed_reached < 1024.0 {
+                            smoothed_speed
+                        } else {
+                            (max_speed_reached * 1.25).min(smoothed_speed)
+                        };
+                        if new_max > max_speed_reached + 1.0 {
+                            crate::atune_log!(
+                                start_time.elapsed(),
+                                "HIST_MAX_UPDATE prev={} → new={} (instant={}) capped_from_raw={}",
+                                crate::logutil::fmt_speed(max_speed_reached),
+                                crate::logutil::fmt_speed(new_max),
+                                instant_s,
+                                speed_s
+                            );
+                        }
+                        max_speed_reached = new_max;
                     }
+                    let max_s = crate::logutil::fmt_speed(max_speed_reached);
+
+                    let need_plus5 = last_tune_speed > 1024.0
+                        && smoothed_speed > (last_tune_speed * 1.05);
+                    let pct_vs_last = if last_tune_speed > 1.0 {
+                        (smoothed_speed / last_tune_speed - 1.0) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    crate::atune_log!(
+                        start_time.elapsed(),
+                        "TICK limit={}/{} active={} locked={} below_ceiling={} speed={} instant={} last={} hist_max={} lock_opt={} drops={} reprobe_ticks={} delta_vs_last={:+.1}% need_+5%={}",
+                        limit,
+                        ceiling,
+                        active,
+                        locked,
+                        below,
+                        speed_s,
+                        instant_s,
+                        last_s,
+                        max_s,
+                        lock_s,
+                        consecutive_drops,
+                        re_probe_ticks,
+                        pct_vs_last,
+                        need_plus5
+                    );
 
                     if !locked {
-                        if smoothed_speed > (last_tune_speed * 1.05) && last_tune_speed > 1024.0 {
+                        if need_plus5 {
                             if limit < ceiling {
-                                adaptive.set_limit(limit + 1);
-                                slot_notify.notify_waiters();
-                                eprintln!("   📈 Auto-tune: Speed increased to {:.1} MB/s. Probing {} -> {} connections.", smoothed_speed / 1_048_576.0, limit, limit + 1);
+                                if let Some((old, new)) = adaptive.set_limit(limit + 1) {
+                                    slot_notify.notify_waiters();
+                                    crate::atune_log!(
+                                        start_time.elapsed(),
+                                        "ACTION PROBE_UP {}→{} reason=speed_up_{:.1}%_vs_last ceiling={} speed={}",
+                                        old,
+                                        new,
+                                        pct_vs_last,
+                                        ceiling,
+                                        speed_s
+                                    );
+                                    eprintln!(
+                                        "   📈 Auto-tune: Speed increased to {:.1} MB/s. Probing {} -> {} connections.",
+                                        smoothed_speed / 1_048_576.0,
+                                        old,
+                                        new
+                                    );
+                                }
+                            } else {
+                                crate::atune_log!(
+                                    start_time.elapsed(),
+                                    "ACTION HOLD_AT_CEILING limit={} reason=already_at_ceiling speed_up_ok",
+                                    limit
+                                );
+                                locked = true;
+                                locked_optimum_speed = smoothed_speed.max(last_tune_speed);
+                                consecutive_drops = 0;
+                                re_probe_ticks = 0;
                             }
                         } else {
-                            if limit > 1 {
-                                adaptive.set_limit(limit - 1);
-                            }
+                            // Flat or unknown speed: LOCK at current limit — do NOT
+                            // cut connections. Old logic always did limit-1 on flat
+                            // links and collapsed MediaFire 2→1 immediately.
+                            let reason = if last_tune_speed <= 1024.0 {
+                                "calibrating_or_near_zero_hold"
+                            } else {
+                                "flat_vs_last_hold_no_cut"
+                            };
                             locked = true;
                             locked_optimum_speed = smoothed_speed.max(last_tune_speed);
                             consecutive_drops = 0;
                             re_probe_ticks = 0;
-                            eprintln!("   🔒 Auto-tune: Locked optimal connections at {} (Speed: {:.1} MB/s).", limit.saturating_sub(1).max(1), locked_optimum_speed / 1_048_576.0);
+                            crate::atune_log!(
+                                start_time.elapsed(),
+                                "ACTION LOCK_HOLD limit={}/{} reason={} speed={} last={} (stay_at_ceiling={})",
+                                limit,
+                                ceiling,
+                                reason,
+                                speed_s,
+                                last_s,
+                                limit == ceiling
+                            );
+                            eprintln!(
+                                "   🔒 Auto-tune: Locked optimal connections at {} (Speed: {:.1} MB/s).",
+                                limit,
+                                locked_optimum_speed / 1_048_576.0
+                            );
                         }
                     } else {
-                        if smoothed_speed < (locked_optimum_speed * 0.85) && locked_optimum_speed > 1024.0 {
+                        let drop_threshold = locked_optimum_speed * 0.85;
+                        let is_drop = smoothed_speed < drop_threshold && locked_optimum_speed > 1024.0;
+                        if is_drop {
                             consecutive_drops += 1;
+                            crate::atune_log!(
+                                start_time.elapsed(),
+                                "LOCKED_DROP_SIGNAL consecutive={}/2 speed={} < 85% of lock_opt={} ({})",
+                                consecutive_drops,
+                                speed_s,
+                                lock_s,
+                                crate::logutil::fmt_speed(drop_threshold)
+                            );
                         } else {
                             consecutive_drops = 0;
                         }
 
                         if consecutive_drops >= 2 {
                             if limit > 1 {
-                                adaptive.set_limit(limit - 1);
-                                locked_optimum_speed = smoothed_speed;
-                                consecutive_drops = 0;
-                                re_probe_ticks = 0;
-                                eprintln!("   📉 Auto-tune: Speed degraded to {:.1} MB/s. Reducing to {} connections.", smoothed_speed / 1_048_576.0, limit - 1);
+                                if let Some((old, new)) = adaptive.set_limit(limit - 1) {
+                                    locked_optimum_speed = smoothed_speed;
+                                    consecutive_drops = 0;
+                                    re_probe_ticks = 0;
+                                    crate::atune_log!(
+                                        start_time.elapsed(),
+                                        "ACTION DEGRADE_DOWN {}→{} reason=two_consecutive_drops BELOW_CEILING speed={}",
+                                        old,
+                                        new,
+                                        speed_s
+                                    );
+                                    eprintln!(
+                                        "   📉 Auto-tune: Speed degraded to {:.1} MB/s. Reducing to {} connections.",
+                                        smoothed_speed / 1_048_576.0,
+                                        new
+                                    );
+                                }
                             } else {
                                 locked_optimum_speed = smoothed_speed;
                                 consecutive_drops = 0;
+                                crate::atune_log!(
+                                    start_time.elapsed(),
+                                    "ACTION DEGRADE_STAY limit=1 reason=already_min_after_drops speed={}",
+                                    speed_s
+                                );
                             }
                         } else {
                             re_probe_ticks += 1;
-                            if re_probe_ticks >= 15 && limit < ceiling {
-                                if smoothed_speed < (max_speed_reached * 0.90) {
-                                    eprintln!("   🔍 Auto-tune: Re-probing for more bandwidth to reach historic max {:.1} MB/s...", max_speed_reached / 1_048_576.0);
+                            // Do NOT chase historic max spikes (ghost 6 MB/s on a
+                            // 5 Mbps link). Only unlock to try +1 when below ceiling
+                            // and speed is healthy enough to measure a gain.
+                            let can_reprobe = limit < ceiling && smoothed_speed > 50_000.0;
+                            crate::atune_log!(
+                                start_time.elapsed(),
+                                "LOCKED_HOLD limit={}/{} reprobe={}/15 can_reprobe={} hist={} speed={}",
+                                limit,
+                                ceiling,
+                                re_probe_ticks,
+                                can_reprobe,
+                                crate::logutil::fmt_speed(max_speed_reached),
+                                speed_s
+                            );
+                            if re_probe_ticks >= 15 {
+                                if can_reprobe {
+                                    crate::atune_log!(
+                                        start_time.elapsed(),
+                                        "ACTION UNLOCK_REPROBE reason=below_ceiling_healthy_speed speed={} will_test_+5pct",
+                                        speed_s
+                                    );
+                                    eprintln!(
+                                        "   🔍 Auto-tune: Re-probing upward from {} toward ceiling {}...",
+                                        limit, ceiling
+                                    );
                                     locked = false;
+                                } else {
+                                    crate::atune_log!(
+                                        start_time.elapsed(),
+                                        "ACTION SKIP_REPROBE reason=at_ceiling_or_speed_too_low limit={}/{} speed={}",
+                                        limit,
+                                        ceiling,
+                                        speed_s
+                                    );
                                 }
                                 re_probe_ticks = 0;
                             }
                         }
+                    }
+
+                    if adaptive.current_limit() < ceiling {
+                        crate::atune_log!(
+                            start_time.elapsed(),
+                            "STATE NOT_AT_CEILING limit={}/{} locked={} active={} — cause logged in ACTION/AIMD above",
+                            adaptive.current_limit(),
+                            ceiling,
+                            locked,
+                            adaptive.active_slots()
+                        );
                     }
 
                     last_tune = Instant::now();

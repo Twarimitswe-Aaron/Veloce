@@ -2,15 +2,21 @@ use std::path::{Path, PathBuf};
 
 /// Sanitize a filename by removing dangerous characters and limiting length.
 pub fn sanitize_filename(name: &str) -> String {
-    let mut out: String = name.chars()
+    let decoded = decode_remote_filename(name);
+    let mut out: String = decoded
+        .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
             c if c.is_control() => '_',
             c => c,
         })
         .collect();
+    out = out.split_whitespace().collect::<Vec<_>>().join(" ");
     if out.len() > 200 {
-        let ext = Path::new(&out).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let ext = Path::new(&out)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
         let stem_len = 200 - ext.len();
         if stem_len > 0 {
             let stem: String = out.chars().take(stem_len).collect();
@@ -23,6 +29,45 @@ pub fn sanitize_filename(name: &str) -> String {
         out = "download".to_string();
     }
     out
+}
+
+/// Decode CDN / MediaFire names: `Let%2CS+Fight.mp4` → `Let,S Fight.mp4`.
+pub fn decode_remote_filename(raw: &str) -> String {
+    let s = raw.trim().replace('+', "%20");
+    match urlencoding_decode(&s) {
+        Some(d) => d,
+        None => raw.trim().replace('+', " ").to_string(),
+    }
+}
+
+fn urlencoding_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let h = from_hex(bytes[i + 1])?;
+                let l = from_hex(bytes[i + 2])?;
+                out.push((h << 4) | l);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Securely join a base directory with a relative path, ensuring the result
@@ -248,6 +293,37 @@ pub fn is_safe_download_url(url: &str) -> bool {
         }
     }
     true
+}
+
+/// Strip CDN `range=` query params that pin a URL to a byte slice.
+/// YouTube googlevideo URLs often include `range=0-N`; discovering against that
+/// makes Content-Length = N+1 and the engine "completes" a truncated file.
+pub fn sanitize_download_media_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let had_range = parsed
+        .query_pairs()
+        .any(|(k, _)| k.eq_ignore_ascii_case("range"));
+    if !had_range {
+        return url.to_string();
+    }
+    let mut out = parsed;
+    if pairs.is_empty() {
+        out.set_query(None);
+    } else {
+        let mut ser = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in &pairs {
+            ser.append_pair(k, v);
+        }
+        out.set_query(Some(&ser.finish()));
+    }
+    out.to_string()
 }
 
 /// Get bytes available at or above a given path, walking up to root.
@@ -675,6 +751,21 @@ mod tests {
     #[test]
     fn test_is_safe_download_url_rejects_no_protocol() {
         assert!(!is_safe_download_url("just/a/path.mp4"));
+    }
+
+    #[test]
+    fn test_sanitize_download_media_url_strips_range() {
+        let raw = "https://rr1---sn-abc.googlevideo.com/videoplayback?id=1&range=0-9999999&clen=500000000&expire=99";
+        let out = sanitize_download_media_url(raw);
+        assert!(!out.contains("range="));
+        assert!(out.contains("clen=500000000"));
+        assert!(out.contains("expire=99"));
+    }
+
+    #[test]
+    fn test_sanitize_download_media_url_unchanged_without_range() {
+        let raw = "https://example.com/a.mp4?token=abc";
+        assert_eq!(sanitize_download_media_url(raw), raw);
     }
 }
 
