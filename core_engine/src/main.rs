@@ -1,6 +1,7 @@
 use clap::Parser;
 use core_engine::args::EngineArgs;
 use core_engine::run_download;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,5 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
-    run_download(args).await
+    if let Err(e) = run_download(args).await {
+        // Coordinators parse stdout JSON — surface discovery/engine failures in the UI
+        // instead of a bare "Engine exited with code 1".
+        println!(
+            "{}",
+            json!({
+                "type": "fatal",
+                "error": e.to_string(),
+            })
+        );
+        std::process::exit(1);
+    }
+    Ok(())
 }

@@ -727,6 +727,7 @@ async fn download_track(
         }
     };
 
+    let last_err = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let base_dir = std::path::Path::new(save_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned());
@@ -742,13 +743,19 @@ async fn download_track(
         referer,
         base_dir.as_deref(),
         on_progress,
+        Some(last_err.clone()),
     ) {
         Ok((engine, _reader)) => {
             let code = engine.blocking_wait();
             if code == Some(0) {
                 (true, None)
             } else {
-                (false, Some(format!("Engine exited with code {}", code.unwrap_or(-1))))
+                let detail = last_err
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| format!("Engine exited with code {}", code.unwrap_or(-1)));
+                (false, Some(detail))
             }
         }
         Err(e) => (false, Some(e)),

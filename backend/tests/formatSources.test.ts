@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
 	detectMediaSource,
 	failReasonForSource,
+	isInstagramMediaPageUrl,
 	isManifestFormatUrl
 } from '../src/lib/server/formatSources';
 
@@ -35,6 +36,21 @@ describe('isManifestFormatUrl', () => {
 	it('detects HLS and DASH manifests', () => {
 		expect(isManifestFormatUrl('https://cdn.example.com/stream.m3u8?sig=1')).toBe(true);
 		expect(isManifestFormatUrl('https://cdn.example.com/manifest.mpd')).toBe(true);
+		expect(
+			isManifestFormatUrl(
+				'https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/id/x'
+			)
+		).toBe(true);
 		expect(isManifestFormatUrl('https://googlevideo.com/videoplayback?id=1&itag=22')).toBe(false);
+	});
+});
+
+describe('isInstagramMediaPageUrl', () => {
+	it('accepts post/reel/story paths and rejects homepage', () => {
+		expect(isInstagramMediaPageUrl('https://www.instagram.com/reel/AbCd/')).toBe(true);
+		expect(isInstagramMediaPageUrl('https://www.instagram.com/p/AbCd/')).toBe(true);
+		expect(isInstagramMediaPageUrl('https://www.instagram.com/stories/user/123')).toBe(true);
+		expect(isInstagramMediaPageUrl('https://www.instagram.com/')).toBe(false);
+		expect(isInstagramMediaPageUrl('https://www.instagram.com/someuser/')).toBe(false);
 	});
 });

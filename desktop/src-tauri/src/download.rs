@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -275,11 +275,12 @@ pub async fn resolve_download_url(
     }
 
     if let Some(direct) = direct_url.filter(|u| !u.is_empty()) {
-        if !formats::is_manifest_format_url(direct) {
-            if ytdlp::is_instagram_silent_dash_url(direct) {
-                log::info!(" -> Direct URL is silent Instagram DASH; will merge via yt-dlp");
-                return Ok(ResolvedFetch::Merge);
-            }
+        if formats::is_manifest_format_url(direct) {
+            log::info!(" -> Omitting manifest/HLS direct URL; will re-extract or merge");
+        } else if ytdlp::is_instagram_silent_dash_url(direct) {
+            log::info!(" -> Direct URL is silent Instagram DASH; will merge via yt-dlp");
+            return Ok(ResolvedFetch::Merge);
+        } else {
             if !util::is_safe_download_url(direct) {
                 return Err("Blocked: direct URL points to a private or local network address".to_string());
             }
@@ -307,7 +308,10 @@ pub async fn resolve_download_url(
     let source = formats::detect_source(page_url);
     let normalized = formats::normalize_url(page_url);
     if let Some(cached) = state.best_url_cache.get(&normalized) {
-        if !ytdlp::is_instagram_silent_dash_url(&cached) && util::is_safe_download_url(&cached) {
+        if !formats::is_manifest_format_url(&cached)
+            && !ytdlp::is_instagram_silent_dash_url(&cached)
+            && util::is_safe_download_url(&cached)
+        {
             log::info!(" -> Using cached extraction for {}", normalized);
             return Ok(ResolvedFetch::Url(cached));
         }
@@ -323,7 +327,9 @@ pub async fn resolve_download_url(
     .map_err(|e| format!("yt-dlp task failed: {}", e))?;
 
     if let Ok(extracted) = muxed {
-        if !ytdlp::is_instagram_silent_dash_url(&extracted) && util::is_safe_download_url(&extracted)
+        if !formats::is_manifest_format_url(&extracted)
+            && !ytdlp::is_instagram_silent_dash_url(&extracted)
+            && util::is_safe_download_url(&extracted)
         {
             log::info!(" -> yt-dlp muxed extraction successful");
             state.best_url_cache.set(&normalized, &extracted);
@@ -335,6 +341,14 @@ pub async fn resolve_download_url(
         source,
         formats::MediaSource::Instagram | formats::MediaSource::YouTube
     ) {
+        if source == formats::MediaSource::Instagram
+            && !formats::is_instagram_media_page_url(page_url)
+        {
+            return Err(
+                "Instagram download needs a post, reel, or story URL (/p/…, /reel/…, /stories/…), not the homepage. Open the video and use the Veloce badge."
+                    .to_string(),
+            );
+        }
         log::info!(" -> No muxed URL; will merge via yt-dlp+ffmpeg ({:?})", source);
         return Ok(ResolvedFetch::Merge);
     }
@@ -347,6 +361,12 @@ pub async fn resolve_download_url(
     }).await.map_err(|e| format!("yt-dlp task failed: {}", e))??;
 
     log::info!(" -> yt-dlp extraction successful");
+    if formats::is_manifest_format_url(&extracted) {
+        return Err(
+            "Cannot download a stream manifest as a file. Open the video page and retry from the Veloce badge."
+                .to_string(),
+        );
+    }
     if !util::is_safe_download_url(&extracted) {
         return Err("Blocked: extracted media URL points to a private or local network address".to_string());
     }
@@ -631,6 +651,14 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
 
     // Instagram/YouTube DASH split — yt-dlp + ffmpeg (core_engine cannot mux two URLs).
     if merge_via_ytdlp {
+        if formats::detect_source(&job.url) == formats::MediaSource::Instagram
+            && !formats::is_instagram_media_page_url(&job.url)
+        {
+            return Err(
+                "Instagram download needs a post, reel, or story URL (/p/…, /reel/…, /stories/…), not the homepage. Open the video and use the Veloce badge."
+                    .to_string(),
+            );
+        }
         let _ = state.db.update_download_status(&download_id, "downloading");
         let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -709,6 +737,12 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         job.direct_url.unwrap_or(job.url.clone())
     };
     let download_url = util::sanitize_download_media_url(&download_url);
+    if formats::is_manifest_format_url(&download_url) {
+        return Err(
+            "Cannot download a stream manifest as a file. Open the video page and retry from the Veloce badge."
+                .to_string(),
+        );
+    }
     let save_path_str = job.save_path;
 
     let _ = state.db.update_download_status(&download_id, "downloading");
@@ -721,11 +755,19 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
 
     let state_spawn = state.clone();
     let id_spawn = download_id.clone();
+    let last_engine_error = Arc::new(Mutex::new(None::<String>));
 
     let on_progress = {
         let state_prog = state.clone();
         let id_prog = download_id.clone();
+        let last_err = last_engine_error.clone();
         move |prog: crate::engine::EngineProgress| {
+            if prog.msg_type == "fatal" {
+                if let Some(ref e) = prog.error {
+                    *last_err.lock().unwrap() = Some(e.clone());
+                }
+                return;
+            }
             if prog.msg_type == "done" || prog.msg_type == "already_exists" {
                 let total = prog.total.or(prog.downloaded).unwrap_or(0);
                 let downloaded = prog.downloaded.unwrap_or(total).max(total);
@@ -797,6 +839,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
         referer.as_deref(),
         Some(&base_dir),
         on_progress,
+        Some(last_engine_error.clone()),
     ) {
         Ok((engine, _reader)) => {
             log::info!("[Step 4: Spawn Engine] Engine spawned for ID: {}", download_id);
@@ -810,6 +853,7 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
             let cancel_mon = cancel_flag.clone();
             let runtime_handle = state_spawn.runtime_handle.clone();
             let save_path_mon = save_path_str.clone();
+            let last_err_mon = last_engine_error.clone();
 
             std::thread::spawn(move || {
                 let waiter = {
@@ -889,14 +933,15 @@ async fn start_engine_for_job(state: Arc<AppState>, job: crate::scheduler::JobSt
                                 ("completed".to_string(), None)
                             }
                         } else {
-                            log::error!("[Step 5: Engine Exit] {} failed with code {:?}", id_mon, code);
-                            (
-                                "failed".to_string(),
-                                Some(format!(
-                                    "Engine exited with code {}",
-                                    code.unwrap_or(-1)
-                                )),
-                            )
+                            let detail = last_err_mon
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    format!("Engine exited with code {}", code.unwrap_or(-1))
+                                });
+                            log::error!("[Step 5: Engine Exit] {} failed: {}", id_mon, detail);
+                            ("failed".to_string(), Some(detail))
                         }
                     }
                     None => {

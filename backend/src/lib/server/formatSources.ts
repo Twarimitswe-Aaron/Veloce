@@ -25,6 +25,15 @@ export function detectMediaSource(url: string): MediaSource {
 export function isManifestFormatUrl(url: string): boolean {
 	if (!url) return false;
 	const u = url.toLowerCase();
+	try {
+		const host = new URL(url).hostname.toLowerCase();
+		// YouTube HLS/DASH host — playlist body must never be fed to core_engine as a file.
+		if (host === 'manifest.googlevideo.com' || host.endsWith('.manifest.googlevideo.com')) {
+			return true;
+		}
+	} catch {
+		/* ignore */
+	}
 	return (
 		u.includes('.m3u8') ||
 		u.includes('.mpd') ||
@@ -32,6 +41,17 @@ export function isManifestFormatUrl(url: string): boolean {
 		u.includes('playlist_type') ||
 		/\bformat=m3u8/i.test(u)
 	);
+}
+
+/** True for /p/, /reel/, /tv/, /stories/… — not the Instagram homepage or profile root. */
+export function isInstagramMediaPageUrl(url: string): boolean {
+	try {
+		const u = new URL(url);
+		if (!u.hostname.toLowerCase().includes('instagram.com')) return false;
+		return /\/(p|reel|reels|tv|stories)\//i.test(u.pathname);
+	} catch {
+		return false;
+	}
 }
 
 export function inferFormatKind(formatUrl: string, protocol?: string): FormatKind {

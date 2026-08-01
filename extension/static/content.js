@@ -1557,10 +1557,19 @@
 	}
 
 	function isManifestFormat(fmt) {
+		const u = fmt.url || '';
+		let googlevideoManifest = false;
+		try {
+			const host = new URL(u).hostname.toLowerCase();
+			googlevideoManifest =
+				host === 'manifest.googlevideo.com' || host.endsWith('.manifest.googlevideo.com');
+		} catch { /* ignore */ }
 		return fmt.kind === 'manifest' ||
 			fmt.kind === 'adaptive' ||
-			/\.m3u8(\?|$)/i.test(fmt.url || '') ||
-			/\.mpd(\?|$)/i.test(fmt.url || '');
+			googlevideoManifest ||
+			/\/manifest\//i.test(u) ||
+			/\.m3u8(\?|$)/i.test(u) ||
+			/\.mpd(\?|$)/i.test(u);
 	}
 
 	/** Build a save name from a format row — never use the "Direct" prefix as the stem. */

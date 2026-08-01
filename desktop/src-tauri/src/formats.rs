@@ -266,12 +266,33 @@ pub fn is_manifest_format_url(url: &str) -> bool {
     if url.is_empty() {
         return false;
     }
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed.host_str().unwrap_or("").to_lowercase();
+        // YouTube HLS/DASH host — playlist body must never be fed to core_engine as a file.
+        if host == "manifest.googlevideo.com" || host.ends_with(".manifest.googlevideo.com") {
+            return true;
+        }
+    }
     let lower = url.to_lowercase();
     lower.contains(".m3u8")
         || lower.contains(".mpd")
         || lower.contains("/manifest/")
         || lower.contains("playlist_type")
         || lower.contains("format=m3u8")
+}
+
+/// True for /p/, /reel/, /tv/, /stories/… — not the Instagram homepage or profile root.
+pub fn is_instagram_media_page_url(url: &str) -> bool {
+    static RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)/(p|reel|reels|tv|stories)/").expect("ig media path"));
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if !host.contains("instagram.com") {
+        return false;
+    }
+    RE.is_match(parsed.path())
 }
 
 /// OmniSave / MovieBox / netfilm catalog pages — media URLs come from site API intercept only.
@@ -801,8 +822,26 @@ mod tests {
         assert!(is_manifest_format_url(
             "https://cdn.example.com/play?format=m3u8&token=1"
         ));
+        assert!(is_manifest_format_url(
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/id/x"
+        ));
         assert!(!is_manifest_format_url(
             "https://googlevideo.com/videoplayback?id=1&itag=22"
+        ));
+    }
+
+    #[test]
+    fn test_is_instagram_media_page_url() {
+        assert!(is_instagram_media_page_url(
+            "https://www.instagram.com/reel/AbCd/"
+        ));
+        assert!(is_instagram_media_page_url("https://www.instagram.com/p/AbCd/"));
+        assert!(is_instagram_media_page_url(
+            "https://www.instagram.com/stories/user/123"
+        ));
+        assert!(!is_instagram_media_page_url("https://www.instagram.com/"));
+        assert!(!is_instagram_media_page_url(
+            "https://www.instagram.com/someuser/"
         ));
     }
 

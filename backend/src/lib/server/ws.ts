@@ -22,7 +22,7 @@ console.log = (...args) => logWithTime(origLog, ...args);
 console.error = (...args) => logWithTime(origError, ...args);
 console.warn = (...args) => logWithTime(origWarn, ...args);
 
-import { extractMediaUrl, extractMediaWithFormat, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl, startMergedYtDlpDownload, isInstagramSilentDashUrl } from './extractor';
+import { extractMediaUrl, extractMediaWithFormat, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl, isInstagramMediaPageUrl, startMergedYtDlpDownload, isInstagramSilentDashUrl } from './extractor';
 import { detectMediaSource } from './formatSources';
 import {
 	defaultPlaylistFormatSettings,
@@ -387,6 +387,24 @@ async function markError(id: string, error: string) {
 	broadcast({ type: 'DOWNLOAD_ERROR', downloadId: id, error });
 }
 
+/** Prefer a human-readable discovery/fatal line from engine stderr over bare exit codes. */
+function pickEngineErrorFromLog(log: string): string | undefined {
+	if (!log) return undefined;
+	const lines = log
+		.split(/\r?\n/)
+		.map((l) => l.replace(/\x1b\[[0-9;]*m/g, '').trim())
+		.filter(Boolean);
+	const interesting = lines.filter(
+		(l) =>
+			/could not discover|discovered file size is zero|insufficient disk|file too large|blocked|✗|error:|fatal/i.test(
+				l
+			) && !/^\s*│/.test(l)
+	);
+	const pick = interesting.at(-1) || lines.at(-1);
+	if (!pick) return undefined;
+	return pick.replace(/^[✗✅⚠️🔍📦]*\s*/u, '').slice(0, 280);
+}
+
 function specFromRow(row: typeof downloads.$inferSelect): JobSpec {
 	// savePath layout is `${baseDir}/${category}/${fileName}`.
 	const category = path.basename(path.dirname(row.savePath));
@@ -424,6 +442,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			console.warn(`[Veloce] Ignoring page-like directUrl for ${pageSource}: ${directUrl.slice(0, 80)}`);
 			directUrl = undefined;
 		}
+		// HLS/DASH / manifest.googlevideo — never feed playlist bodies to core_engine.
+		if (directUrl && isManifestFormatUrl(directUrl)) {
+			console.warn(
+				`[Veloce] Omitting manifest directUrl (will re-extract/merge): ${directUrl.slice(0, 100)}`
+			);
+			directUrl = undefined;
+		}
 		// Instagram CDN often has no Content-Length — core_engine discovery fails.
 		// Silent DASH / video CDN → merge. Audio-only (.m4a) keeps a direct CDN path.
 		const igCdn =
@@ -440,17 +465,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 		let finalUrl = directUrl || spec.pageUrl;
 
-		if (directUrl && isManifestFormatUrl(directUrl)) {
-			const extracted = await extractMediaUrl(spec.pageUrl);
-			if (!extracted) {
-				await markError(
-					id,
-					'Stream manifest format — yt-dlp could not resolve a direct file. Open the video page in Chrome, then retry from the Veloce badge.'
-				);
-				return;
-			}
-			finalUrl = extracted;
-		} else if (finalUrl.includes('mediafire.com')) {
+		if (finalUrl.includes('mediafire.com')) {
 			const fresh = await extractMediaUrl(finalUrl);
 			if (!fresh) {
 				console.error(`❌ Mediafire link expired or unavailable: ${finalUrl}`);
@@ -472,6 +487,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			const source = pageSource;
 			// Instagram: always merge via yt-dlp+ffmpeg when no usable engine URL.
 			if (source === 'instagram' && (forceIgMerge || !directUrl)) {
+				if (!isInstagramMediaPageUrl(spec.pageUrl)) {
+					await markError(
+						id,
+						'Instagram download needs a post, reel, or story URL (/p/…, /reel/…, /stories/…), not the homepage. Open the video and use the Veloce badge.'
+					);
+					return;
+				}
 				const freeMerge = await freeSpaceFor(path.dirname(savePath));
 				if (freeMerge !== null && freeMerge < MIN_FREE_BYTES) {
 					console.error('❌ Insufficient disk space!');
@@ -522,7 +544,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				spec.pageUrl,
 				'best[vcodec!=none][acodec!=none]'
 			);
-			if (muxed?.url) {
+			if (muxed?.url && !isManifestFormatUrl(muxed.url)) {
 				finalUrl = muxed.url;
 			} else if (source === 'youtube') {
 				// DASH split A/V — yt-dlp + ffmpeg merge (core_engine cannot mux two URLs).
@@ -571,7 +593,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 				return;
 			} else {
 				const extracted = await extractMediaUrl(spec.pageUrl);
-				if (!extracted) {
+				if (!extracted || isManifestFormatUrl(extracted)) {
 					console.error(`❌ Could not extract a direct media URL for ${spec.pageUrl}. Aborting.`);
 					await markError(id, 'Could not extract a downloadable media URL (the site may require login, or yt-dlp/cookies failed).');
 					return;
@@ -612,6 +634,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 		await setStatus(id, 'downloading');
 		finalUrl = sanitizeDownloadMediaUrl(finalUrl);
+		if (isManifestFormatUrl(finalUrl)) {
+			await markError(
+				id,
+				'Cannot download a stream manifest as a file. Open the video page and retry from the Veloce badge.'
+			);
+			return;
+		}
 		const referer = refererForDownload(spec.pageUrl, finalUrl, spec.referer);
 		if (!referer && isSignedCdnUrl(finalUrl)) {
 			await markError(
@@ -636,7 +665,7 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			referer: referer || undefined,
 			pageUrl: spec.pageUrl
 		});
-		const rustProcess = spawn(bin, engineArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
+		const rustProcess = spawn(bin, engineArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 		running.set(id, { proc: rustProcess, intent: 'normal' });
 
 		let resolveProc!: () => void;
@@ -703,6 +732,13 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 
 		let lineBuffer = '';
 		let lastDbWrite = 0;
+		let lastEngineError: string | undefined;
+		let stderrTail = '';
+		rustProcess.stderr?.on('data', (chunk: Buffer | string) => {
+			const text = chunk.toString();
+			process.stderr.write(text);
+			stderrTail = (stderrTail + text).slice(-8192);
+		});
 		rustProcess.stdout?.on('data', async (chunk) => {
 			lineBuffer += chunk.toString();
 			const lines = lineBuffer.split('\n');
@@ -732,8 +768,9 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 					} else if (progress.type === 'already_exists') {
 						await settle('completed');
 					} else if (progress.type === 'fatal') {
-						console.error(`\n[Veloce] Engine fatal: ${progress.error}`);
-						await settle('error', progress.error || 'Engine fatal error');
+						lastEngineError = progress.error || 'Engine fatal error';
+						console.error(`\n[Veloce] Engine fatal: ${lastEngineError}`);
+						await settle('error', lastEngineError);
 					}
 				} catch { /* non-JSON engine line */ }
 			}
@@ -752,7 +789,12 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 			} else if (intent === 'paused') {
 				await settle('paused');
 			} else {
-				await settle(code === 0 ? 'completed' : 'error', `Engine exited with code ${code}`);
+				const fromStderr = pickEngineErrorFromLog(stderrTail);
+				const errMsg =
+					code === 0
+						? undefined
+						: lastEngineError || fromStderr || `Engine exited with code ${code}`;
+				await settle(code === 0 ? 'completed' : 'error', errMsg);
 			}
 		});
 

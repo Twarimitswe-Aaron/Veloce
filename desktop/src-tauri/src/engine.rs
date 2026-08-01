@@ -100,6 +100,9 @@ impl EngineProcess {
     /// `on_progress` is called from the reader thread each time the engine emits
     /// a JSON progress line on stdout. `AppHandle` is `Send + Sync` so Tauri
     /// events can be emitted directly from the callback.
+    ///
+    /// When `last_error` is provided, fatal JSON lines and interesting stderr
+    /// (discovery failures) are stored there for the coordinator UI.
     pub fn spawn<F>(
         download_id: String,
         url: &str,
@@ -112,6 +115,7 @@ impl EngineProcess {
         referer: Option<&str>,
         base_dir: Option<&str>,
         on_progress: F,
+        last_error: Option<Arc<Mutex<Option<String>>>>,
     ) -> Result<(Self, std::thread::JoinHandle<()>), String>
     where
         F: Fn(EngineProgress) + Send + 'static,
@@ -171,16 +175,60 @@ impl EngineProcess {
         let mut child = Command::new(&engine_path)
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn engine: {} (path: {:?})", e, engine_path))?;
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_clone = cancelled.clone();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
         let child_arc = Arc::new(Mutex::new(Some(child)));
 
+        if let (Some(stderr), Some(err_slot)) = (stderr, last_error.clone()) {
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    eprintln!("{line}");
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let lower = trimmed.to_lowercase();
+                    let interesting = lower.contains("could not discover")
+                        || lower.contains("discovered file size is zero")
+                        || lower.contains("insufficient disk")
+                        || lower.contains("file too large")
+                        || trimmed.contains('✗');
+                    if interesting {
+                        let clean: String = trimmed
+                            .trim_start_matches(|c: char| {
+                                c.is_whitespace()
+                                    || "✗✅⚠🔍📦️".contains(c)
+                            })
+                            .chars()
+                            .take(280)
+                            .collect();
+                        if !clean.is_empty() {
+                            *err_slot.lock().unwrap() = Some(clean);
+                        }
+                    }
+                }
+            });
+        } else if let Some(stderr) = stderr {
+            // Keep journal visibility when no error slot was provided.
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    eprintln!("{line}");
+                }
+            });
+        }
+
         // Background thread reads JSON progress lines from the engine
+        let err_for_stdout = last_error;
         let reader_thread = std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
             let mut line = String::new();
@@ -193,7 +241,16 @@ impl EngineProcess {
                         let trimmed = line.trim();
                         if trimmed.is_empty() { continue; }
                         match serde_json::from_str::<EngineProgress>(trimmed) {
-                            Ok(progress) => on_progress(progress),
+                            Ok(progress) => {
+                                if progress.msg_type == "fatal" {
+                                    if let (Some(slot), Some(e)) =
+                                        (err_for_stdout.as_ref(), progress.error.as_ref())
+                                    {
+                                        *slot.lock().unwrap() = Some(e.clone());
+                                    }
+                                }
+                                on_progress(progress);
+                            }
                             Err(e) => {
                                 if trimmed.starts_with('{') {
                                     log::warn!("[EngineReader] Failed to parse JSON progress: {} (line: {})", e, trimmed);

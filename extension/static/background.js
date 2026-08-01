@@ -1302,8 +1302,27 @@ function needsFormatPicker(url) {
 	}
 }
 
+function isManifestMediaUrl(url) {
+	if (!url || !/^https?:/i.test(url)) return false;
+	try {
+		const host = new URL(url).hostname.toLowerCase();
+		if (host === 'manifest.googlevideo.com' || host.endsWith('.manifest.googlevideo.com')) {
+			return true;
+		}
+	} catch { /* ignore */ }
+	const u = url.toLowerCase();
+	return (
+		u.includes('.m3u8') ||
+		u.includes('.mpd') ||
+		u.includes('/manifest/') ||
+		u.includes('playlist_type') ||
+		/\bformat=m3u8/i.test(u)
+	);
+}
+
 function shouldUseDirectUrl(url) {
 	if (!url || !/^https?:/i.test(url)) return false;
+	if (isManifestMediaUrl(url)) return false;
 	if (needsFormatPicker(url)) return false;
 	try {
 		const u = new URL(url);

@@ -282,7 +282,7 @@ export function isExtractorDomain(url: string): boolean {
 	}
 }
 
-export { detectMediaSource, isManifestFormatUrl } from './formatSources';
+export { detectMediaSource, isManifestFormatUrl, isInstagramMediaPageUrl } from './formatSources';
 
 function formatBytes(n: number): string {
 	if (!n) return '';

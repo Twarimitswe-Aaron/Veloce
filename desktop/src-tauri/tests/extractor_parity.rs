@@ -2,7 +2,7 @@ mod common;
 
 use veloce_desktop_lib::formats::{
     detect_source, instagram_url_variants, is_direct_file_url, is_extractor_domain,
-    is_manifest_format_url, normalize_url, MediaFormat, MediaSource,
+    is_instagram_media_page_url, is_manifest_format_url, normalize_url, MediaFormat, MediaSource,
 };
 use veloce_desktop_lib::ytdlp;
 
@@ -107,7 +107,14 @@ fn extractor_domains_and_manifests() {
     assert!(is_extractor_domain("https://www.youtube.com/watch?v=x"));
     assert!(!is_extractor_domain("https://example.com/a.mp4"));
     assert!(is_manifest_format_url("https://cdn.example.com/stream.m3u8?sig=1"));
+    assert!(is_manifest_format_url(
+        "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/id/x"
+    ));
     assert!(!is_manifest_format_url("https://googlevideo.com/videoplayback?id=1"));
+    assert!(is_instagram_media_page_url(
+        "https://www.instagram.com/reel/AbCd/"
+    ));
+    assert!(!is_instagram_media_page_url("https://www.instagram.com/"));
 }
 
 #[tokio::test]
