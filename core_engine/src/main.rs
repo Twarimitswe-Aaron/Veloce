@@ -25,8 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Err(e) = run_download(args).await {
-        // Coordinators parse stdout JSON — surface discovery/engine failures in the UI
-        // instead of a bare "Engine exited with code 1".
+        // Emit fatal JSON on stdout so coordinators can show discovery/merge errors
+        // in the UI instead of a bare "Engine exited with code 1".
         println!(
             "{}",
             json!({
