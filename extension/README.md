@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 extension: in-page badges, format picker, download intercept, and popup UI.
 
-**Project docs:** [../README.md](../README.md) · [../CONTRIBUTING.md](../CONTRIBUTING.md) · [../AGENTS.md](../AGENTS.md)
+**Project docs:** [../README.md](../README.md) · [../doc/CONTRIBUTING.md](../doc/CONTRIBUTING.md) · [../AGENTS.md](../AGENTS.md)
 
 ## Develop
 

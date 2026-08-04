@@ -2,7 +2,7 @@
 
 Native desktop app with an embedded Rust coordinator and WebSocket server for the Chrome extension.
 
-**Project docs:** [../README.md](../README.md) · [../SESSION_NEXT_PLAN.md](../SESSION_NEXT_PLAN.md)
+**Project docs:** [../README.md](../README.md) · [../doc/SESSION_NEXT_PLAN.md](../doc/SESSION_NEXT_PLAN.md)
 
 ## Run 
 

@@ -82,7 +82,7 @@ We need help when:
 **Quick start for contributors:**
 
 1. Fork / clone, run `./scripts/linux/setup.sh`
-2. Read **[CONTRIBUTING.md](./CONTRIBUTING.md)** — reporting bugs, which file to edit, site handler patterns
+2. Read **[CONTRIBUTING.md](./doc/CONTRIBUTING.md)** — reporting bugs, which file to edit, site handler patterns
 3. For format/extraction deep dives, see **[AGENTS.md](./AGENTS.md)** — platform signatures, cache rules, DOM tables
 4. Open a PR with a test URL, before/after notes, and tests if you touch `backend/` or `core_engine/`
 

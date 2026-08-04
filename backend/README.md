@@ -2,7 +2,7 @@
 
 SvelteKit app: WebSocket server, download queue (SQLite), yt-dlp extraction, Rust engine orchestration, web dashboard at `http://localhost:14921`.
 
-**Project docs:** [../README.md](../README.md) · [../CONTRIBUTING.md](../CONTRIBUTING.md) · [../AGENTS.md](../AGENTS.md)
+**Project docs:** [../README.md](../README.md) · [../doc/CONTRIBUTING.md](../doc/CONTRIBUTING.md) · [../AGENTS.md](../AGENTS.md)
 
 ## Develop
 
